@@ -33,7 +33,12 @@ runs (and never fails) on a standard runner by accident.
 > regenerates `system.img` via `snod` (~10-20 min) on a self-hosted runner that
 > persists the tree + `out/`.  It cannot replace the first full build -- see
 > [`INCREMENTAL_BUILD.md`](INCREMENTAL_BUILD.md) for the evidence-based analysis
-> of why "compile only our parts and drop them on a prebuilt 8.1" does not work.
+> of the "compile only our parts" idea: a full 8.1 base still needs one big
+> build, but the patched native stack **does compile standalone** on a stock
+> runner -- `scripts/bt_standalone_build.sh` + the `bt-compile.yml` workflow
+> prove 451/451 TUs on every patch change.  The deployable variant of the idea
+> (swap our stack into the official 7.0 firmware) is planned in
+> [`NOUGAT_BT_SWAP.md`](NOUGAT_BT_SWAP.md).
 
 What CI *can* prove on every push, without a big machine, is the **entire
 packaging path against the real device layout** -- see "What CI verifies" below.

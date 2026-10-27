@@ -67,6 +67,7 @@ jobs:
 
       - name: CLI smoke tests (--help exits 0)
         run: |
+          bash scripts/bt_standalone_build.sh --help >/dev/null
           python3 scripts/make_logo.py --help >/dev/null
           python3 scripts/mtk_sparse2raw.py --help >/dev/null
           python3 scripts/gen-vendor-mk.py --help >/dev/null

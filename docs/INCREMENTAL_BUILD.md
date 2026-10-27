@@ -22,6 +22,20 @@ We therefore wired the *valid* form of the idea into the pipeline:
 `build_mode` input on `build.yml`, intended to run on a **self-hosted runner that
 persists the tree + `out/`** between runs.
 
+> **2026-10-28 experiment update — reason (2) was HALF wrong.**  We built a
+> standalone compile environment (NDK r25c clang + blobless/sparse header
+> checkouts of 11 AOSP repos, ~90 MB of sources) and compiled the **entire
+> patched r80 `system/bt` stack + external/aac + external/libldac for
+> ARM/bionic API 26: 451/451 TUs green in ~10 min on a 2-core/1 GB sandbox**,
+> and it links into ELF artifacts.  See `scripts/bt_standalone_build.sh` and
+> `.github/workflows/bt-compile.yml` (runs on every patch change on a stock
+> runner).  What remains true: platform deps are *shared* libraries, so the
+> resulting `.so` still needs a **matching 8.1 system image at runtime** —
+> standalone compilation gives compile/link **validation**, not a drop-in module
+> for a foreign base.  That insight unlocked the deployable variant of this
+> whole idea: port the patches to the **7.0 baseline's own stack** and swap the
+> modules into the official firmware — plan in `docs/NOUGAT_BT_SWAP.md`.
+
 ## What our patches actually compile into
 
 Inspecting the real `android-8.1.0_r80` build files (`system/bt`, `packages/apps/
@@ -38,6 +52,16 @@ enum) is a **header** -- it has no artifact of its own; it changes how the three
 modules above compile.
 
 ## Why the three modules cannot be compiled "standalone"
+
+> **Correction (2026-10-28):** the claim below holds for producing **deployable**
+> modules and for the **APK**, but the native stack CAN be compiled (and
+> stub-linked) outside the tree: all its platform dependencies are *shared*
+> libraries, so the compiler only needs their **headers** (cheap sparse
+> checkouts) and the linker may leave those symbols undefined — exactly like the
+> real `-shared` link does.  Proven by `scripts/bt_standalone_build.sh`
+> (451/451 TUs, incl. all patched files).  The APK still genuinely needs the
+> hidden-API `framework.jar`, and a *runnable* module still needs a matching
+> system image.
 
 Every non-trivial dependency above is a **platform-internal** library or the
 **hidden-API framework**:
@@ -117,11 +141,14 @@ cheap -- which is the real, achievable win from the incremental idea.
 
 | Sub-idea | Feasible? | Why |
 |---|---|---|
-| Compile our modules with **no** AOSP tree (NDK/standalone) | **No** | They link `libandroid_runtime`, `libchrome`, `libFraunhoferAAC`, `libaudioclient`, hidden-API `framework.jar` -- platform-internal, tree-only |
+| Compile our native modules with **no** AOSP tree (NDK/standalone) — as **validation** | **Yes** (proven 2026-10-28) | Headers-only deps + `-shared` link tolerating undefined platform symbols; `scripts/bt_standalone_build.sh`, 451/451 TUs, runs on a stock CI runner |
+| Produce **deployable** 8.1 modules with no AOSP tree | **No** | Runtime still needs matching `libchrome`/`libcutils`/`libaudioclient`/… from the same 8.1 build |
+| Compile the **APK** with no AOSP tree | **No** | hidden-API `framework.jar` (workaround for 7.0: extract from baseline — see `NOUGAT_BT_SWAP.md` R3) |
 | Drop them onto a **prebuilt generic 8.1** system | **No** | Generic/GSI 8.1 is Treble/emulator; won't boot non-Treble MT6735M |
-| Drop them onto the **7.0 baseline** system | **No** | 7.0 vs 8.1 ABI/API mismatch |
+| Drop **8.1** modules onto the **7.0 baseline** system | **No** | 7.0 vs 8.1 ABI/API mismatch |
+| Port patches to **7.0** and swap into the **official firmware** | **Yes — active plan** | Same standalone-compile method against 7.0 sources, link against device-extracted libs; `docs/NOUGAT_BT_SWAP.md` |
 | Incremental rebuild **on a persisted full build** (`m … snod`) | **Yes** | Standard AOSP flow; wired as `build.sh --incremental` |
-| Avoid the **first** full build entirely | **No** | A bootable U2 8.1 base can only come from one full build |
+| Avoid the **first** full build entirely | **No** (for an 8.1 base) | A bootable U2 8.1 base can only come from one full build |
 
 So: keep the hybrid-repack pipeline, and use incremental builds to make
 *revisions* cheap on a self-hosted runner -- but budget for one full build (big
