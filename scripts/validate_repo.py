@@ -324,6 +324,7 @@ REQUIRED = [
     ".gitignore",
     "docs/DEVELOPMENT_PLAN.md",
     "docs/FIRMWARE_BUILD.md",
+    "docs/INCREMENTAL_BUILD.md",
     "scripts/apply-patches.sh",
     "scripts/build.sh",
     "scripts/measure.sh",

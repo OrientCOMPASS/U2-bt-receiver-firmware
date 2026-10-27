@@ -23,6 +23,16 @@ on:
         description: 'Runner label to build on (self-hosted or a larger-runner label)'
         required: true
         default: 'self-hosted'
+      build_mode:
+        description: 'full = repo sync + whole build; incremental = rebuild only BT modules + snod (needs a persisted tree+out/)'
+        required: true
+        default: 'full'
+        type: choice
+        options: ['full', 'incremental']
+      workdir:
+        description: 'AOSP workdir (empty = auto: full->$RUNNER_TEMP/aosp, incremental->$HOME/u2-aosp persisted)'
+        required: false
+        default: ''
       release_tag:
         description: 'Release tag (empty = auto: u2-aosp81-<date>-<sha>)'
         required: false
@@ -85,7 +95,8 @@ jobs:
             sudo apt-get install -y -qq e2fsprogs binutils unzip || true
           fi
 
-      - name: Download baseline firmware and extract system.img
+      - name: Download baseline firmware and extract system.img (full build only)
+        if: github.event.inputs.build_mode == 'full'
         run: |
           set -e
           cd "$RUNNER_TEMP"
@@ -97,14 +108,23 @@ jobs:
           echo "SYSIMG=$SYSIMG" >> "$GITHUB_ENV"
           ls -la "$SYSIMG"
 
-      - name: Build AOSP 8.1 (repo sync + patches + blobs + make)
+      - name: Build AOSP 8.1 (full sync+make, or incremental BT modules + snod)
         run: |
           set -e
-          bash scripts/build.sh \
-            --workdir "$RUNNER_TEMP/aosp" \
-            --system-image "$SYSIMG" \
-            --sync --make --jobs "$(nproc)"
-          OUT="$RUNNER_TEMP/aosp/out/target/product/u2"
+          MODE="${{ github.event.inputs.build_mode }}"
+          WD="${{ github.event.inputs.workdir }}"
+          if [ -z "$WD" ]; then
+            if [ "$MODE" = "incremental" ]; then WD="$HOME/u2-aosp"; else WD="$RUNNER_TEMP/aosp"; fi
+          fi
+          echo "WORKDIR=$WD" >> "$GITHUB_ENV"
+          if [ "$MODE" = "incremental" ]; then
+            echo "[*] incremental rebuild (expects a persisted tree+out/ at $WD)"
+            bash scripts/build.sh --workdir "$WD" --incremental --jobs "$(nproc)"
+          else
+            bash scripts/build.sh --workdir "$WD" --system-image "$SYSIMG" \
+                 --sync --make --jobs "$(nproc)"
+          fi
+          OUT="$WD/out/target/product/u2"
           echo "OUT=$OUT" >> "$GITHUB_ENV"
           ls -la "$OUT"/system.img "$OUT"/boot.img "$OUT"/recovery.img
 

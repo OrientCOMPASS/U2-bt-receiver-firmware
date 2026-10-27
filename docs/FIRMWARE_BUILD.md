@@ -28,6 +28,13 @@ The build workflow ([`.github/workflows/build.yml`](../.github/workflows/build.y
 is `workflow_dispatch`-only and `runs-on` the runner label you supply, so it never
 runs (and never fails) on a standard runner by accident.
 
+> **Faster iteration.** After the first full build, `build_mode: incremental`
+> (or `scripts/build.sh --incremental`) rebuilds only the Bluetooth modules and
+> regenerates `system.img` via `snod` (~10-20 min) on a self-hosted runner that
+> persists the tree + `out/`.  It cannot replace the first full build -- see
+> [`INCREMENTAL_BUILD.md`](INCREMENTAL_BUILD.md) for the evidence-based analysis
+> of why "compile only our parts and drop them on a prebuilt 8.1" does not work.
+
 What CI *can* prove on every push, without a big machine, is the **entire
 packaging path against the real device layout** -- see "What CI verifies" below.
 

@@ -2,7 +2,8 @@
 # build.sh -- end-to-end build wrapper for the KeenPlus U2 AOSP 8.1 firmware.
 #
 # THIS DOES NOT RUN IN CI.  A full AOSP 8.1 build needs >=8 cores, >=32 GB RAM,
-# >=600 GB SSD and JDK 8 (plan section 11).  This script automates the sequence
+# >=300 GB SSD with the default shallow sync (>=600 GB for full history) and
+# JDK 8 (plan section 11).  This script automates the sequence
 # on a properly provisioned build host:
 #
 #   1. check prerequisites
@@ -14,10 +15,15 @@
 #
 # Usage:
 #   build.sh --workdir <dir> --system-image <baseline-system.img> [--jobs N]
-#            [--lunch u2-userdebug|u2-user] [--sync] [--make]
+#            [--lunch u2-userdebug|u2-user] [--sync] [--make] [--deep]
+#   build.sh --workdir <dir> --incremental    # rebuild BT modules + snod only
 #
-# Pass --sync to (re)download sources, --make to build.  Without them the script
-# only checks prerequisites and prints the plan (dry run).
+# Full build:  --sync (re)downloads sources (shallow by default; --deep for full
+#              history), --make builds everything.  Without them the script only
+#              checks prerequisites and prints the plan (dry run).
+# Incremental: --incremental rebuilds ONLY the Bluetooth modules + system.img
+#              (m bluetooth.default libbluetooth_jni Bluetooth snod) on top of an
+#              existing full build's tree+out/.  See docs/INCREMENTAL_BUILD.md.
 
 set -euo pipefail
 
@@ -31,6 +37,10 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 LUNCH="u2-userdebug"
 DO_SYNC=0
 DO_MAKE=0
+DO_INCREMENTAL=0
+SHALLOW=1   # --depth=1 repo sync (smaller checkout); pass --deep for full history
+# Modules our patches touch; incremental rebuild recompiles just these + system.img.
+BT_MODULES=(bluetooth.default libbluetooth_jni Bluetooth)
 
 usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 log()  { printf '[build] %s\n' "$*"; }
@@ -44,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --lunch)         LUNCH="$2"; shift 2 ;;
         --sync)          DO_SYNC=1; shift ;;
         --make)          DO_MAKE=1; shift ;;
+        --incremental)   DO_INCREMENTAL=1; shift ;;
+        --deep)          SHALLOW=0; shift ;;
         -h|--help)       usage ;;
         *) err "unknown arg: $1"; usage ;;
     esac
@@ -79,12 +91,19 @@ check_prereqs() {
 do_sync() {
     [[ -n "${WORKDIR}" ]] || { err "--workdir required for --sync"; exit 1; }
     mkdir -p "${WORKDIR}"; cd "${WORKDIR}"
+    # Shallow (--depth=1) + current-branch-only (-c) + --no-tags keeps the
+    # checkout at ~60-80 GB instead of ~100 GB+ (full history).  A buildable
+    # tree still needs the platform + prebuilts toolchain, so this is the floor,
+    # not "a few GB" -- but it lets the build fit on a smaller large-runner.
+    local -a depth_arg=(--depth=1)
+    [[ "${SHALLOW}" == "1" ]] || depth_arg=()
     if [[ ! -d .repo ]]; then
-        log "repo init -b ${MANIFEST_BRANCH}"
-        repo init -u https://android.googlesource.com/platform/manifest -b "${MANIFEST_BRANCH}"
+        log "repo init -b ${MANIFEST_BRANCH} (shallow=${SHALLOW})"
+        repo init -u https://android.googlesource.com/platform/manifest \
+            -b "${MANIFEST_BRANCH}" "${depth_arg[@]}" --no-tags
     fi
-    log "repo sync -c -j${JOBS} --no-tags --no-clone-bundle  (this takes a while)"
-    repo sync -c -j"${JOBS}" --no-tags --no-clone-bundle
+    log "repo sync -c -j${JOBS} --no-tags --no-clone-bundle --optimized-fetch (this takes a while)"
+    repo sync -c -j"${JOBS}" --no-tags --no-clone-bundle --optimized-fetch
 }
 
 link_trees() {
@@ -127,7 +146,34 @@ make_images() {
     log "images under ${WORKDIR}/out/target/product/u2/"
 }
 
+make_incremental() {
+    # Rebuild ONLY the modules our patches touch, then regenerate system.img with
+    # 'snod' (Systemimage, NO Dependencies) -- ~10-20 min vs a full build.  This
+    # requires a prior FULL build's tree + out/ to exist (see docs/INCREMENTAL_BUILD.md).
+    # NOTE: it rebuilds the tree AS-IS.  If you changed the patches, refresh them
+    # first (scripts/apply-patches.sh --aosp-root <workdir> after a git reset of
+    # the patched projects) -- this step does not manage patch state.
+    [[ -n "${WORKDIR}" ]] || { err "--workdir required for --incremental"; exit 1; }
+    local sysdir="${WORKDIR}/out/target/product/u2/system"
+    if [[ ! -d "${sysdir}" ]]; then
+        err "no prior full build found (${sysdir} missing)."
+        err "run a full build first: build.sh --workdir ${WORKDIR} --sync --make"
+        exit 1
+    fi
+    cd "${WORKDIR}"
+    log "incremental: m ${BT_MODULES[*]} snod  (reusing existing out/)"
+    # shellcheck disable=SC1091
+    source build/envsetup.sh
+    lunch "${LUNCH}"
+    m -j"${JOBS}" "${BT_MODULES[@]}" snod
+    log "regenerated ${WORKDIR}/out/target/product/u2/system.img"
+}
+
 check_prereqs
+if [[ "${DO_INCREMENTAL}" == "1" ]]; then
+    make_incremental
+    exit 0
+fi
 [[ "${DO_SYNC}" == "1" ]] && do_sync
 if [[ -n "${WORKDIR}" && -d "${WORKDIR}/system/bt" ]]; then
     apply
