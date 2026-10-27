@@ -12,14 +12,19 @@ transmit), within a tight RAM/latency budget.
 
 [![CI](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/actions/workflows/ci.yml/badge.svg)](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/actions/workflows/ci.yml)
 
-> **Status / scope.**  This repository contains the *firmware engineering*:
+> **Status / scope.**  This repository contains the *firmware engineering*: the
 > device tree, resource overlays, SEPolicy, kernel-config contract, the AOSP
 > source **patches** that add the missing Bluetooth codecs, and the tooling to
-> apply/verify/measure them.  It does **not** contain a prebuilt image, the
-> AOSP tree, or the proprietary blobs (extracted at build time).  A full AOSP
-> build cannot run in CI (it needs ~250 GiB and the vendor toolchain); CI instead
-> proves the patches apply to the pristine AOSP tag and lints/tests everything
-> else.  Hardware metrics (R3/R8/R11-R15) require a real device -- see
+> apply / verify / build / **repack into an SP_Flash_Tool package** / publish a
+> release / measure.  It does **not** commit a prebuilt image, the AOSP tree, or
+> the proprietary blobs (extracted at build time).  A full AOSP 8.1 build needs
+> ~100-190 GB disk and >= 32 GB RAM, so it cannot run on a standard GitHub runner
+> (14 GB); the real build + release is therefore a **gated workflow**
+> ([`build.yml`](.github/workflows/build.yml)) that runs on a self-hosted or larger
+> runner.  What CI proves on *every* push, with no big machine, is the patch
+> series **and** the whole packaging path against the *real* device layout (see
+> [`docs/FIRMWARE_BUILD.md`](docs/FIRMWARE_BUILD.md)).  Hardware metrics
+> (R3/R8/R11-R15) and final flashability need a physical U2 -- see
 > [`scripts/measure.sh`](scripts/measure.sh).
 
 ---
@@ -58,7 +63,9 @@ kernel build, no camera, no multi-stream mixing, no LDAC *receive*.
 
 ```
 .
-├── docs/DEVELOPMENT_PLAN.md      full specification (features, resources, decisions)
+├── docs/
+│   ├── DEVELOPMENT_PLAN.md       full specification (features, resources, decisions)
+│   └── FIRMWARE_BUILD.md         build -> repack -> SP_Flash_Tool package -> release
 ├── device/keenplus/u2/           AOSP device tree (product + board config)
 │   ├── BoardConfig.mk            partition sizes, kernel args, non-Treble, verity off
 │   ├── device.mk / u2.mk         package whitelist, copy-files, board properties
@@ -77,8 +84,10 @@ kernel build, no camera, no multi-stream mixing, no LDAC *receive*.
 │   ├── system_bt/                AAC sink codec + decoder backport, SBC-XQ bitpool
 │   └── packages_apps_Bluetooth/  per-device StreamHandler binding (+ MULTIDEVICE.md)
 ├── vendor/keenplus/u2/           generated prebuilt makefiles (blobs gitignored)
-├── scripts/                      build/apply/measure/logo + Python tooling & tests
-└── .github/workflows/ci.yml      CI: lint, unit tests, patch verification
+├── scripts/                      apply/build/measure/logo/repack/publish + tests
+└── .github/workflows/
+    ├── ci.yml                    every push: lint, unit tests, patch + package verify
+    └── build.yml                 gated: AOSP build -> repack -> publish release
 ```
 
 ---
@@ -133,16 +142,48 @@ scripts/measure.sh          # collects R1-R15 over adb from a booted device
 
 ---
 
+## Firmware build & release (SP_Flash_Tool)
+
+The flashable package is a **hybrid repack**: the MTK-private partitions
+(`preloader`, `lk`, `logo`, `secro`, `trustzone`) and the **official scatter** are
+reused from the baseline firmware (range-fetched, ~1 MB -- never the 2.46 GiB
+stock `system`), while `system.img`, `boot.img` and `recovery.img` come from this
+repo's AOSP 8.1 build.  The result is validated against the official scatter and
+zipped so SP_Flash_Tool can load it directly.
+
+```bash
+# after an AOSP build has produced out/target/product/u2/{system,boot,recovery}.img
+python3 scripts/repack_firmware.py --baseline-url "<official zip url>" \
+        --build-out out/target/product/u2 --out U2_AOSP81.zip --pkg-name U2_AOSP81
+python3 scripts/publish_release.py --tag u2-aosp81-<ver> --files U2_AOSP81.zip
+```
+
+The AOSP **compile** is the only step that needs a big machine, so it lives in the
+gated [`build.yml`](.github/workflows/build.yml) (`workflow_dispatch`, runs on a
+self-hosted / larger runner) and publishes the Release automatically.  Full
+details, the real partition table, and SP_Flash_Tool flashing steps are in
+[`docs/FIRMWARE_BUILD.md`](docs/FIRMWARE_BUILD.md).
+
+---
+
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs two jobs on every
 push / PR to `main`:
 
-- **Lint & unit tests** (offline) -- `scripts/validate_repo.py` (XML well-formed,
-  `bash -n`, Python compile, patch/SEPolicy/fstab format, CRLF, conflict markers),
-  `gen-vendor-mk.py --check` (no drift), the Python unit-test suite
-  (`scripts/tests/`), `shellcheck`, `xmllint`, and CLI smoke tests.
-- **Verify patches against AOSP 8.1** (network) -- `apply-patches.sh --verify`.
+- **Lint & unit tests** (offline) -- `scripts/validate_repo.py` (XML/YAML
+  well-formed, `bash -n`, Python compile, patch/SEPolicy/fstab format, CRLF,
+  conflict markers), `gen-vendor-mk.py --check` (no drift), the Python unit-test
+  suite (`scripts/tests/`, 89 tests), `shellcheck`, `xmllint`, and CLI smokes.
+- **Verify patches & package firmware** (network) -- `apply-patches.sh --verify`
+  (all series `git am` onto fresh `android-8.1.0_r80` clones) **plus** a
+  `repack_firmware.py --dry-run` that range-fetches the *real* baseline scatter +
+  MTK-private partitions, substitutes placeholder built images, and validates the
+  package with `mtk_scatter.py`.  This proves the SP_Flash_Tool packaging path on
+  every push without needing a build host.
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) is manual-only and
+does the real AOSP build -> repack -> Release publish on a capable runner.
 
 Run the offline checks locally with:
 

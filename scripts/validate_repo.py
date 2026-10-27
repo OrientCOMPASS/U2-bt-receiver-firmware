@@ -36,6 +36,11 @@ import sys
 import xml.etree.ElementTree as ET
 from typing import Callable, List, Tuple
 
+try:
+    import yaml as _yaml  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    _yaml = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 
@@ -109,6 +114,32 @@ def check_xml(rel: str, rep: Report) -> None:
         rep.tick()
     except ET.ParseError as e:
         rep.err(f"{rel}: XML not well-formed: {e}")
+
+
+def check_yaml(rel: str, rep: Report) -> None:
+    if _yaml is None:
+        rep.warn("PyYAML not installed; skipped YAML validation for " + rel)
+        return
+    full = os.path.join(REPO_ROOT, rel)
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            docs = list(_yaml.safe_load_all(f))
+        rep.tick()
+        # GitHub Actions workflows must define jobs with runs-on + steps.
+        if rel.startswith(".github/workflows/"):
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                jobs = d.get("jobs")
+                if jobs is None:
+                    rep.err(f"{rel}: workflow has no 'jobs:'")
+                    continue
+                for jn, jv in jobs.items():
+                    if not isinstance(jv, dict) or "runs-on" not in jv \
+                            or "steps" not in jv:
+                        rep.err(f"{rel}: job '{jn}' missing runs-on/steps")
+    except _yaml.YAMLError as e:  # type: ignore[attr-defined]
+        rep.err(f"{rel}: YAML parse error: {e}")
 
 
 def check_python_compiles(rel: str, rep: Report) -> None:
@@ -250,6 +281,8 @@ UNIVERSAL: List[Callable[[str, Report], None]] = [
 
 BY_EXT: dict = {
     ".xml": [check_xml],
+    ".yml": [check_yaml],
+    ".yaml": [check_yaml],
     ".py": [check_python_compiles],
     ".sh": [check_shell_syntax, check_shell_shebang],
     ".patch": [check_patch_format],
@@ -290,11 +323,16 @@ REQUIRED = [
     "README.md",
     ".gitignore",
     "docs/DEVELOPMENT_PLAN.md",
+    "docs/FIRMWARE_BUILD.md",
     "scripts/apply-patches.sh",
     "scripts/build.sh",
     "scripts/measure.sh",
     "scripts/make_logo.py",
     "scripts/mtk_sparse2raw.py",
+    "scripts/mtk_scatter.py",
+    "scripts/mtk_fw_zip.py",
+    "scripts/repack_firmware.py",
+    "scripts/publish_release.py",
     "scripts/gen-vendor-mk.py",
     "scripts/validate_repo.py",
     "kernel/u2_8.1_config.fragment",
@@ -318,6 +356,7 @@ REQUIRED = [
     "vendor/keenplus/u2/README.md",
     "patches/README.md",
     ".github/workflows/ci.yml",
+    ".github/workflows/build.yml",
 ]
 
 
