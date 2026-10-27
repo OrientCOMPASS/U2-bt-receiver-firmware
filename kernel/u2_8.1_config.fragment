@@ -1,0 +1,79 @@
+# KeenPlus U2 -- kernel config fragment for running AOSP 8.1 userspace on the
+# stock MT6735M Linux 3.18.35 kernel (plan section 13 / decision D3).
+#
+# The kernel itself is REUSED (not rebuilt from scratch): we keep the baseline
+# 3.18.35 image + appended DTB (63,240 B, FDT v17) which already contains the
+# st7701s_fw_dsi_vdo_boe panel timing, i2s1 GPIOs, msdc0..3, mt6311/mt6328
+# regulators, keypad, usb0_base and bat_meter.  This fragment lists the options
+# that AOSP 8.1 userspace REQUIRES; verify each is present in the kernel .config
+# and add any that are missing, then rebuild with ARCH=arm64 + gcc 4.9 (to match
+# the baseline) and re-append the baseline DTB:
+#
+#     cat Image.gz u2.dtb > kernel        # dt_size stays 0 in the boot header
+#
+# Run scripts/check-kernel-config.py <.config> to audit this list automatically.
+
+# ---- cgroups / memcg (LMK, per-uid accounting; R3/R4) ----
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_BLK_CGROUP=y
+CONFIG_FAIR_GROUP_SCHED=y
+
+# ---- namespaces ----
+CONFIG_NAMESPACES=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+
+# ---- core syscall/ABI surface 8.1 expects ----
+CONFIG_FHANDLE=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EPOLL=y
+CONFIG_UNIX=y
+
+# ---- Android kernel drivers ----
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ASHMEM=y
+CONFIG_ION=y
+CONFIG_SYNC=y
+CONFIG_SYNC_FILE=y
+
+# ---- zram swap (enableswap.sh sets 768 MiB lz4; R4) ----
+CONFIG_ZRAM=y
+CONFIG_ZRAM_LZ4_COMPRESS=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_DM=y
+# dm-verity is disabled on this port (D5) but keep the driver for completeness.
+CONFIG_DM_VERITY=m
+
+# ---- networking used by netd / tethering-free STA ----
+CONFIG_TUN=y
+CONFIG_PPP=y
+CONFIG_PPPOLAC=y
+CONFIG_PPPOPNS=y
+CONFIG_NETFILTER=y
+CONFIG_NF_CONNTRACK=y
+CONFIG_IP_NF_IPTABLES=y
+CONFIG_IP6_NF_IPTABLES=y
+
+# ---- instrumentation the framework queries ----
+CONFIG_SCHED_DEBUG=y
+CONFIG_PROC_PAGE_MONITOR=y
+CONFIG_PAGE_IDLE_FLAG=y
+CONFIG_MEMBARRIER=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_AUDIT=y
+
+# ---- binder multi-context (8.1 wants /dev/binder, and hwbinder/vndbinder under
+#      Treble; non-Treble needs at least /dev/binder, and 3.18 supports multi-
+#      context).  Confirm the three nodes or at least /dev/binder. ----
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+
+# ---- NOT required for a self-built, non-VTS firmware (plan D3) ----
+# CONFIG_STRICT_KERNEL_RWX is a VTS nicety; leaving it off is acceptable here.

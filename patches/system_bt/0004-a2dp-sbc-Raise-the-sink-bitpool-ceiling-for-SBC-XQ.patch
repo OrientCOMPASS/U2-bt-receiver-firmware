@@ -1,0 +1,52 @@
+From 7f326125773c1c3c77c5183c53bc3629657850b7 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:57:33 +0000
+Subject: [PATCH 4/4] a2dp: sbc: Raise the sink bitpool ceiling for SBC-XQ
+
+The 8.1 SBC sink caps already advertise DualChannel mode and a max
+bitpool of 53, which covers the usual SBC-XQ profile (dual channel,
+bitpool 45 ~= 529 kbps).  Give the sink modest headroom by introducing a
+sink-specific A2DP_SBC_SINK_MAX_BITPOOL (58) so a Linux/PipeWire source
+can negotiate the ~450-550 kbps SBC-XQ profile.  The Source transmit caps
+keep A2DP_SBC_MAX_BITPOOL (53), so this does not change what the device
+sends when acting as an A2DP source.
+
+Plan section 16.5 / feature F5.  Phones will not select SBC-XQ on their
+own; this only takes effect when the sender is Linux/PipeWire.
+---
+ stack/a2dp/a2dp_sbc.cc | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/stack/a2dp/a2dp_sbc.cc b/stack/a2dp/a2dp_sbc.cc
+index cfdaad4..cc7ea5e 100644
+--- a/stack/a2dp/a2dp_sbc.cc
++++ b/stack/a2dp/a2dp_sbc.cc
+@@ -40,6 +40,16 @@
+ 
+ #define A2DP_SBC_MAX_BITPOOL 53
+ 
++// SBC-XQ (plan section 16.5): the sink advertises DualChannel mode (already in
++// a2dp_sbc_sink_caps) plus a raised bitpool ceiling so a Linux/PipeWire source
++// can negotiate the ~450-550 kbps SBC-XQ profile.  53 already covers the usual
++// SBC-XQ bitpool of 45 in dual mode (~529 kbps); 58 gives modest headroom while
++// staying far below the A2DP spec ceiling of 250 and inside what the OI SBC
++// decoder accepts.  Kept separate from A2DP_SBC_MAX_BITPOOL so the Source
++// transmit caps are unaffected.  Phones will not pick SBC-XQ on their own --
++// this only takes effect when the sender is Linux/PipeWire.
++#define A2DP_SBC_SINK_MAX_BITPOOL 58
++
+ /* data type for the SBC Codec Information Element */
+ typedef struct {
+   uint8_t samp_freq;    /* Sampling frequency */
+@@ -75,7 +85,7 @@ static const tA2DP_SBC_CIE a2dp_sbc_sink_caps = {
+     (A2DP_SBC_IE_SUBBAND_4 | A2DP_SBC_IE_SUBBAND_8),   /* num_subbands */
+     (A2DP_SBC_IE_ALLOC_MD_L | A2DP_SBC_IE_ALLOC_MD_S), /* alloc_method */
+     A2DP_SBC_IE_MIN_BITPOOL,                           /* min_bitpool */
+-    A2DP_SBC_MAX_BITPOOL,                              /* max_bitpool */
++    A2DP_SBC_SINK_MAX_BITPOOL,                         /* max_bitpool (SBC-XQ) */
+     BTAV_A2DP_CODEC_BITS_PER_SAMPLE_16                 /* bits_per_sample */
+ };
+ 
+-- 
+2.39.5
+

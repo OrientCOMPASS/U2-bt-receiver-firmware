@@ -1,0 +1,9 @@
+# init.te -- extra init permissions for the U2 platform.
+#
+# The AOSP init domain is already broad enough to start the helper declared in
+# u2_btaudio.te via init_daemon_domain().  No additional init rules are required
+# for the current design.  If a real build surfaces an `avc: denied` against init
+# (e.g. mounting a custom fstab entry), add the narrowly-scoped allow rule HERE
+# after review -- do not grant init broad filesystem access.
+#
+# This file is intentionally empty of rules.

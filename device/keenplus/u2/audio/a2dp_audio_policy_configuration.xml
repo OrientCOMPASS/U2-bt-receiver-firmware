@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  a2dp_audio_policy_configuration.xml - KeenPlus U2 (plan sections 2.2 and 16.4)
+
+  Based on the baseline /system/etc/a2dp_audio_policy_configuration.xml, with the
+  ONE change the plan mandates for AAC sink: the A2DP input profile accepts both
+  44100 and 48000 Hz.  The baseline declared samplingRates="44100" only, which
+  forces AudioFlinger to resample (extra latency) or reject a 48 kHz AAC stream.
+
+  Included from audio_policy_configuration.xml via:
+    <xi:include href="a2dp_audio_policy_configuration.xml"/>
+
+  NOTE: the A2DP *sink* PCM is written through btif_avrcp_audio_track (AudioTrack)
+  to the normal media output; it does NOT traverse the AUDIO_DEVICE_IN_BLUETOOTH_
+  A2DP input device below.  The input device is retained for completeness and for
+  any source-side capture path.
+-->
+<module name="a2dp" halVersion="2.0">
+    <mixPorts>
+        <mixPort name="a2dp input" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="44100,48000"
+                     channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+        </mixPort>
+    </mixPorts>
+    <devicePorts>
+        <devicePort tagName="BT A2DP In" type="AUDIO_DEVICE_IN_BLUETOOTH_A2DP" role="source">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="44100,48000"
+                     channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+        </devicePort>
+    </devicePorts>
+    <routes>
+        <route type="mix" sink="a2dp input"
+               sources="BT A2DP In"/>
+    </routes>
+</module>

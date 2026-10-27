@@ -1,0 +1,19 @@
+# init.zygote32.rc -- single 32-bit zygote for the KeenPlus U2 (decision D2).
+#
+# The baseline shipped both init.zygote32.rc and init.zygote64_32.rc and ran the
+# dual-architecture zygote64_32.  For a 32-bit-only userspace we keep ONLY this
+# file and set ro.zygote=zygote32, which saves 60-100 MiB (no second zygote).
+
+service zygote /system/bin/app_process32 -Xzygote /system/bin --zygote --start-system-server
+    class main
+    priority -20
+    user root
+    group root readproc reserved_disk
+    socket zygote stream 660 root system
+    onrestart write /sys/android_power/request_state wake
+    onrestart write /sys/power/state on
+    onrestart restart audioserver
+    onrestart restart media
+    onrestart restart netd
+    onrestart restart wificond
+    writepid /dev/cpuset/foreground/tasks

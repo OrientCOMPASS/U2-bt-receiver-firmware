@@ -1,0 +1,163 @@
+From ed125334bce8869a09dbe56ba4e65564951ff482 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:53:19 +0000
+Subject: [PATCH 3/4] btif: a2dp_sink: Dispatch SBC/AAC decoding by codec type
+
+8.1's btif_a2dp_sink hard-codes the OI SBC decoder.  Record the peer
+codec type (A2DP_GetCodecType) at decoder-update time and branch:
+  * SBC keeps the existing OI_CODEC_SBC_DecodeFrame path;
+  * AAC initialises the backported Fraunhofer decoder and, per packet,
+    calls a2dp_aac_decoder_decode_packet(); decoded PCM reaches the
+    AudioTrack through a decode callback.
+
+Matching pie, the AAC payload is passed from its first byte (the SBC
+leading frame-count octet does not exist for AAC), and each AAC packet is
+decoded whole (num_frames_to_be_processed = 1) so the decode timer
+processes one packet per tick.  The AAC decoder is cleaned up when
+decoding stops.
+
+Part of the KeenPlus U2 A2DP sink work (plan section 16.4).  NOTE: the
+exact AAC payload offset and rx-queue pacing are the tuning points
+flagged as risks R8/R12/R13 and must be confirmed against a real capture
+during hardware bring-up.
+---
+ btif/src/btif_a2dp_sink.cc | 78 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 62 insertions(+), 16 deletions(-)
+
+diff --git a/btif/src/btif_a2dp_sink.cc b/btif/src/btif_a2dp_sink.cc
+index 4ccf39f..5506474 100644
+--- a/btif/src/btif_a2dp_sink.cc
++++ b/btif/src/btif_a2dp_sink.cc
+@@ -36,6 +36,11 @@
+ #include "oi_codec_sbc.h"
+ #include "oi_status.h"
+ 
++// A2DP AAC sink backport (plan section 16.4): codec-type dispatch + decoder.
++#include "a2dp_aac_decoder.h"
++#include "a2dp_codec_api.h"
++#include "a2dp_constants.h"
++
+ /**
+  * The receiving queue buffer size.
+  */
+@@ -88,6 +93,7 @@ typedef struct {
+   uint8_t frames_to_process;
+   tA2DP_SAMPLE_RATE sample_rate;
+   tA2DP_CHANNEL_COUNT channel_count;
++  uint8_t peer_codec_type; /* A2DP_MEDIA_CT_SBC or A2DP_MEDIA_CT_AAC */
+   btif_a2dp_sink_focus_state_t rx_focus_state; /* audio focus state */
+   void* audio_track;
+ } tBTIF_A2DP_SINK_CB;
+@@ -288,6 +294,9 @@ static void btif_a2dp_sink_audio_handle_stop_decoding(void) {
+ 
+   alarm_free(btif_a2dp_sink_cb.decode_alarm);
+   btif_a2dp_sink_cb.decode_alarm = NULL;
++  if (btif_a2dp_sink_cb.peer_codec_type == A2DP_MEDIA_CT_AAC) {
++    a2dp_aac_decoder_cleanup();
++  }
+ #ifndef OS_GENERIC
+   BtifAvrcpAudioTrackPause(btif_a2dp_sink_cb.audio_track);
+ #endif
+@@ -327,7 +336,35 @@ static void btif_a2dp_sink_audio_handle_start_decoding(void) {
+             btif_decode_alarm_cb, NULL);
+ }
+ 
++// A2DP AAC sink (plan section 16.4): the Fraunhofer decoder delivers decoded
++// 16-bit PCM through this callback; write it straight to the AudioTrack.
++static void btif_a2dp_sink_aac_decode_callback(uint8_t* buf, uint32_t len) {
++#ifndef OS_GENERIC
++  BtifAvrcpAudioTrackWriteData(btif_a2dp_sink_cb.audio_track, (void*)buf, len);
++#else
++  UNUSED_ATTR uint8_t* unused_buf = buf;
++  UNUSED_ATTR uint32_t unused_len = len;
++#endif
++}
++
+ static void btif_a2dp_sink_handle_inc_media(tBT_SBC_HDR* p_msg) {
++  if ((btif_av_get_peer_sep() == AVDT_TSEP_SNK) ||
++      (btif_a2dp_sink_cb.rx_flush)) {
++    APPL_TRACE_DEBUG("State Changed happened in this tick");
++    return;
++  }
++
++  // AAC path: decode the whole packet.  Unlike SBC, the A2DP AAC media payload
++  // has no leading frame-count octet, so (matching pie) we pass the payload from
++  // its first byte and let the LATM decoder do the framing.
++  if (btif_a2dp_sink_cb.peer_codec_type == A2DP_MEDIA_CT_AAC) {
++    uint8_t* aac_payload = ((uint8_t*)(p_msg + 1) + p_msg->offset);
++    if (!a2dp_aac_decoder_decode_packet(aac_payload, p_msg->len)) {
++      APPL_TRACE_ERROR("%s: AAC decoding failure", __func__);
++    }
++    return;
++  }
++
+   uint8_t* sbc_start_frame = ((uint8_t*)(p_msg + 1) + p_msg->offset + 1);
+   int count;
+   uint32_t pcmBytes, availPcmBytes;
+@@ -338,12 +375,6 @@ static void btif_a2dp_sink_handle_inc_media(tBT_SBC_HDR* p_msg) {
+   uint32_t sbc_frame_len = p_msg->len - 1;
+   availPcmBytes = sizeof(btif_a2dp_sink_pcm_data);
+ 
+-  if ((btif_av_get_peer_sep() == AVDT_TSEP_SNK) ||
+-      (btif_a2dp_sink_cb.rx_flush)) {
+-    APPL_TRACE_DEBUG("State Changed happened in this tick");
+-    return;
+-  }
+-
+   APPL_TRACE_DEBUG("%s Number of SBC frames %d, frame_len %d", __func__,
+                    num_sbc_frames, sbc_frame_len);
+ 
+@@ -473,16 +504,25 @@ static void btif_a2dp_sink_decoder_update_event(
+   btif_a2dp_sink_cb.channel_count = channel_count;
+ 
+   btif_a2dp_sink_cb.rx_flush = false;
+-  APPL_TRACE_DEBUG("%s: Reset to Sink role", __func__);
+-  status = OI_CODEC_SBC_DecoderReset(
+-      &btif_a2dp_sink_context, btif_a2dp_sink_context_data,
+-      sizeof(btif_a2dp_sink_context_data), 2, 2, false);
+-  if (!OI_SUCCESS(status)) {
+-    APPL_TRACE_ERROR("%s: OI_CODEC_SBC_DecoderReset failed with error code %d",
+-                     __func__, status);
++  btif_a2dp_sink_cb.peer_codec_type = A2DP_GetCodecType(p_buf->codec_info);
++  APPL_TRACE_DEBUG("%s: Reset to Sink role, codec_type=0x%x", __func__,
++                   btif_a2dp_sink_cb.peer_codec_type);
++  if (btif_a2dp_sink_cb.peer_codec_type == A2DP_MEDIA_CT_AAC) {
++    if (!a2dp_aac_decoder_init(btif_a2dp_sink_aac_decode_callback)) {
++      APPL_TRACE_ERROR("%s: a2dp_aac_decoder_init failed", __func__);
++    }
++  } else {
++    status = OI_CODEC_SBC_DecoderReset(
++        &btif_a2dp_sink_context, btif_a2dp_sink_context_data,
++        sizeof(btif_a2dp_sink_context_data), 2, 2, false);
++    if (!OI_SUCCESS(status)) {
++      APPL_TRACE_ERROR(
++          "%s: OI_CODEC_SBC_DecoderReset failed with error code %d", __func__,
++          status);
++    }
+   }
+ 
+-  APPL_TRACE_DEBUG("%s: A2dpSink: SBC create track", __func__);
++  APPL_TRACE_DEBUG("%s: A2dpSink: create track", __func__);
+   btif_a2dp_sink_cb.audio_track =
+ #ifndef OS_GENERIC
+       BtifAvrcpAudioTrackCreate(sample_rate, channel_type);
+@@ -521,8 +561,14 @@ uint8_t btif_a2dp_sink_enqueue_buf(BT_HDR* p_pkt) {
+       osi_malloc(sizeof(tBT_SBC_HDR) + p_pkt->offset + p_pkt->len));
+   memcpy((uint8_t*)(p_msg + 1), (uint8_t*)(p_pkt + 1) + p_pkt->offset,
+          p_pkt->len);
+-  p_msg->num_frames_to_be_processed =
+-      (*((uint8_t*)(p_pkt + 1) + p_pkt->offset)) & 0x0f;
++  if (btif_a2dp_sink_cb.peer_codec_type == A2DP_MEDIA_CT_AAC) {
++    // AAC packets are decoded whole (LATM self-framing); the SBC leading
++    // frame-count octet does not exist, so treat each packet as one unit.
++    p_msg->num_frames_to_be_processed = 1;
++  } else {
++    p_msg->num_frames_to_be_processed =
++        (*((uint8_t*)(p_pkt + 1) + p_pkt->offset)) & 0x0f;
++  }
+   p_msg->len = p_pkt->len;
+   p_msg->offset = 0;
+   p_msg->layer_specific = p_pkt->layer_specific;
+-- 
+2.39.5
+

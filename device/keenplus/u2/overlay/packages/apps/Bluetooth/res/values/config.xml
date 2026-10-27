@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bluetooth resource overlay for the KeenPlus U2 (plan section 16.2).
+
+  This is a build-time overlay (DEVICE_PACKAGE_OVERLAYS).  It ONLY overrides
+  resource names that exist in AOSP 8.1 packages/apps/Bluetooth/res/values/
+  config.xml (verified against android-8.1.0_r80).  Two keys that appear in the
+  plan text - "a2dp_sink_automatically_request_audio_focus" and
+  "profile_supported_avrcp_target" - do NOT exist in the 8.1 config.xml, so they
+  are intentionally omitted here (overriding them would be a no-op).
+
+  Product: a Bluetooth audio RECEIVER (A2DP Sink) that can also transmit.
+  Uses the AOSP Bluetooth app, not MTK's MtkBluetooth.apk.
+-->
+<resources>
+
+    <!-- ==== A2DP Sink (F2): the core product feature ==== -->
+    <bool name="profile_supported_a2dp_sink">true</bool>
+    <!-- AVRCP Controller (F8): metadata + play/pause/skip, and the one-to-two
+         switching in F6 relies on sending PASS_THRU PAUSE to the old device. -->
+    <bool name="profile_supported_avrcp_controller">true</bool>
+
+    <!-- ==== Keep A2DP Source (F7): U2 can also transmit to headphones ==== -->
+    <bool name="profile_supported_a2dp">true</bool>
+
+    <!-- ==== OPP kept so files can be pushed to the device over BT ==== -->
+    <bool name="profile_supported_opp">true</bool>
+
+    <!-- ==== Disable profiles this product never uses (matches bdroid_buildcfg.h) ==== -->
+    <bool name="profile_supported_hs_hfp">false</bool>   <!-- no hands-free unit -->
+    <bool name="profile_supported_hfpclient">false</bool>
+    <bool name="profile_supported_hid">false</bool>
+    <bool name="profile_supported_hidd">false</bool>
+    <bool name="profile_supported_hdp">false</bool>
+    <bool name="profile_supported_map">false</bool>
+    <bool name="profile_supported_mapmce">false</bool>
+    <bool name="profile_supported_pbap">false</bool>
+    <bool name="profile_supported_pbapclient">false</bool>
+    <bool name="profile_supported_pan">false</bool>
+    <bool name="profile_supported_sap">false</bool>
+    <!-- BLE/GATT disabled product-wide (bdroid_buildcfg.h: BLE_INCLUDED FALSE).
+         Flip both back if a companion app later needs BLE provisioning. -->
+    <bool name="profile_supported_gatt">false</bool>
+
+    <!-- ==== Sink behaviour ==== -->
+    <integer name="a2dp_sink_duck_percent">25</integer>
+
+    <!-- ==== Source codec priority (F7): LDAC highest, then aptX HD/aptX/AAC/SBC.
+         These are the AOSP 8.1 defaults; listed explicitly so the LDAC transmit
+         path is unambiguously enabled.  aptX/aptX HD additionally require
+         libaptX_encoder.so / libaptXHD_encoder.so (plan section 16.7). ==== -->
+    <integer name="a2dp_source_codec_priority_sbc">1001</integer>
+    <integer name="a2dp_source_codec_priority_aac">2001</integer>
+    <integer name="a2dp_source_codec_priority_aptx">3001</integer>
+    <integer name="a2dp_source_codec_priority_aptx_hd">4001</integer>
+    <integer name="a2dp_source_codec_priority_ldac">5001</integer>
+
+</resources>

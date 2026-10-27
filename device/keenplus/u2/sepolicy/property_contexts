@@ -1,0 +1,3 @@
+# property_contexts -- map property prefixes to their SEPolicy types.
+
+persist.sys.u2.         u:object_r:u2_btaudio_prop:s0

@@ -1,0 +1,28 @@
+# u2_btaudio.te -- domain for the small native helper that bridges the A2DP sink
+# HAL to the platform audio path.  Started by init.rc as a oneshot/long-running
+# service.  Permissions below are the minimal obviously-safe set; expand only from
+# reviewed audit2allow output on a real build.
+
+type u2_btaudio, domain;
+type u2_btaudio_exec, exec_type, file_type;
+
+# init launches the helper and transitions it into its domain.
+init_daemon_domain(u2_btaudio)
+
+# Talk to the audio HAL / AudioFlinger over binder.
+binder_call(u2_btaudio, hal_audio_default)
+binder_call(u2_btaudio, audioserver)
+binder_use(u2_btaudio)
+
+# Read/write its own persist cache.
+allow u2_btaudio u2_btaudio_data_file:dir create_dir_perms;
+allow u2_btaudio u2_btaudio_data_file:file create_file_perms;
+allow u2_btaudio u2_btaudio_runtime_file:dir create_dir_perms;
+allow u2_btaudio u2_btaudio_runtime_file:file create_file_perms;
+
+# Query a few sysfs knobs (CPU freq / thermal) for logging only.
+allow u2_btaudio sysfs:file r_file_perms;
+allow u2_btaudio sysfs:dir r_dir_perms;
+
+# Set its own persist.sys.u2.* properties.
+set_prop(u2_btaudio, u2_btaudio_prop)

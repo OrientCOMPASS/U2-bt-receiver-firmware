@@ -1,0 +1,10 @@
+# genfs_contexts -- label procfs/sysfs nodes this device touches.
+#
+# The helper only reads generic sysfs (allow u2_btaudio sysfs:file r_file_perms),
+# which is already labelled by the platform policy, so no genfscon entries are
+# required today.  Add narrowly-scoped genfscon lines here only if a real build
+# surfaces a denial on a specific proc/sysfs path, e.g.:
+#
+#   genfscon proc /u2/status   u:object_r:proc_u2:s0
+#
+# This file is intentionally empty of entries.

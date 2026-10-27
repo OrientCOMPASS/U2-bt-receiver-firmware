@@ -1,0 +1,32 @@
+From 11524a0edcc367456c85a7ce066a9bb712439b81 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:30:17 +0000
+Subject: [PATCH] bt_av: Add BTAV_A2DP_CODEC_INDEX_SINK_AAC
+
+Backport from Android 9 (pie). AOSP 8.1 only defines a SINK_SBC codec
+index, so the A2DP AAC sink cannot be registered in the codec factory.
+Adding SINK_AAC right after SINK_SBC (before SINK_MAX) lets the 8.1
+a2dp_codec_config create an A2dpCodecConfigAacSink and advertise AAC as
+a sink codec, which is required for iPhone/iPad high-quality streaming
+(iOS only sends SBC/AAC).
+
+Part of the KeenPlus U2 A2DP sink work (plan section 16.4).
+---
+ include/hardware/bt_av.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/hardware/bt_av.h b/include/hardware/bt_av.h
+index 36722d4..eeca02a 100644
+--- a/include/hardware/bt_av.h
++++ b/include/hardware/bt_av.h
+@@ -61,6 +61,7 @@ typedef enum {
+ 
+   // Add an entry for each sink codec here
+   BTAV_A2DP_CODEC_INDEX_SINK_SBC = BTAV_A2DP_CODEC_INDEX_SINK_MIN,
++  BTAV_A2DP_CODEC_INDEX_SINK_AAC,
+ 
+   BTAV_A2DP_CODEC_INDEX_SINK_MAX,
+ 
+-- 
+2.39.5
+

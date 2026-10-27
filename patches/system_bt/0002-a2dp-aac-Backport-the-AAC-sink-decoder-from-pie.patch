@@ -1,0 +1,229 @@
+From 9ac53a18991e7e91f795bf7e61462c37cd6dec91 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:53:19 +0000
+Subject: [PATCH 2/4] a2dp: aac: Backport the AAC sink decoder from pie
+
+Add a2dp_aac_decoder.{h,cc}, backported from Android 9.  It wraps the
+Fraunhofer decoder (aacDecoder_Open with TT_MP4_LATM_MCP1) which is
+statically linked via libFraunhoferAAC -- already a system/bt dependency
+in 8.1, so no new binary dependency is introduced.
+
+Two deliberate deviations from the pie original, because 8.1 differs:
+  * decoded_data_callback_t is defined in the header (8.1's
+    a2dp_codec_api.h does not declare it);
+  * a2dp_aac_decoder_decode_packet() takes (uint8_t* data, uint16_t len)
+    instead of BT_HDR*, to fit 8.1's tBT_SBC_HDR-based sink queue.
+
+Build wiring: add a2dp/a2dp_aac_decoder.cc to srcs and
+external/aac/libAACdec/include to include_dirs in stack/Android.bp.
+---
+ stack/Android.bp                 |   2 +
+ stack/a2dp/a2dp_aac_decoder.cc   | 114 +++++++++++++++++++++++++++++++
+ stack/include/a2dp_aac_decoder.h |  54 +++++++++++++++
+ 3 files changed, 170 insertions(+)
+ create mode 100644 stack/a2dp/a2dp_aac_decoder.cc
+ create mode 100644 stack/include/a2dp_aac_decoder.h
+
+diff --git a/stack/Android.bp b/stack/Android.bp
+index 5cb5678..b8c5868 100644
+--- a/stack/Android.bp
++++ b/stack/Android.bp
+@@ -24,6 +24,7 @@ cc_library_static {
+     ],
+     include_dirs: [
+         "external/aac/libAACenc/include",
++        "external/aac/libAACdec/include",
+         "external/aac/libSYS/include",
+         "external/libldac/inc",
+         "external/libldac/abr/inc",
+@@ -41,6 +42,7 @@ cc_library_static {
+     ],
+     srcs: [
+         "a2dp/a2dp_aac.cc",
++        "a2dp/a2dp_aac_decoder.cc",
+         "a2dp/a2dp_aac_encoder.cc",
+         "a2dp/a2dp_api.cc",
+         "a2dp/a2dp_codec_config.cc",
+diff --git a/stack/a2dp/a2dp_aac_decoder.cc b/stack/a2dp/a2dp_aac_decoder.cc
+new file mode 100644
+index 0000000..e489d46
+--- /dev/null
++++ b/stack/a2dp/a2dp_aac_decoder.cc
+@@ -0,0 +1,114 @@
++/*
++ * Copyright (C) 2016 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Backported from Android 9 (pie) system/bt/stack/a2dp/a2dp_aac_decoder.cc for
++// the KeenPlus U2 A2DP AAC sink.  The Fraunhofer decoder is statically linked
++// via libFraunhoferAAC (already a system/bt dependency in 8.1), so this adds no
++// new binary dependency.  The only interface change from pie is that
++// a2dp_aac_decoder_decode_packet() takes (uint8_t* data, uint16_t len) instead
++// of a BT_HDR*, to fit 8.1's tBT_SBC_HDR-based sink queue.
++
++#define LOG_TAG "a2dp_aac_decoder"
++
++#include "a2dp_aac_decoder.h"
++
++#include <aacdecoder_lib.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "osi/include/allocator.h"
++#include "osi/include/log.h"
++
++#define DECODE_BUF_LEN (8 * 2 * 1024)
++
++typedef struct {
++  HANDLE_AACDECODER aac_handle;
++  bool has_aac_handle;  // True if aac_handle is valid
++  INT_PCM* decode_buf;
++  decoded_data_callback_t decode_callback;
++} tA2DP_AAC_DECODER_CB;
++
++static tA2DP_AAC_DECODER_CB a2dp_aac_decoder_cb;
++
++bool A2DP_LoadDecoderAac(void) {
++  // Nothing to do - the library is statically linked
++  return true;
++}
++
++void A2DP_UnloadDecoderAac(void) { a2dp_aac_decoder_cleanup(); }
++
++bool a2dp_aac_decoder_init(decoded_data_callback_t decode_callback) {
++  a2dp_aac_decoder_cleanup();
++
++  a2dp_aac_decoder_cb.aac_handle =
++      aacDecoder_Open(TT_MP4_LATM_MCP1, 1 /* nrOfLayers */);
++  a2dp_aac_decoder_cb.has_aac_handle = true;
++  a2dp_aac_decoder_cb.decode_buf = static_cast<INT_PCM*>(
++      osi_malloc(sizeof(a2dp_aac_decoder_cb.decode_buf[0]) * DECODE_BUF_LEN));
++  a2dp_aac_decoder_cb.decode_callback = decode_callback;
++  return true;
++}
++
++void a2dp_aac_decoder_cleanup(void) {
++  if (a2dp_aac_decoder_cb.has_aac_handle)
++    aacDecoder_Close(a2dp_aac_decoder_cb.aac_handle);
++  free(a2dp_aac_decoder_cb.decode_buf);
++  memset(&a2dp_aac_decoder_cb, 0, sizeof(a2dp_aac_decoder_cb));
++}
++
++bool a2dp_aac_decoder_decode_packet(uint8_t* p_data, uint16_t len) {
++  UCHAR* pBuffer = reinterpret_cast<UCHAR*>(p_data);
++  UINT bufferSize = len;
++  UINT bytesValid = len;
++  while (bytesValid > 0) {
++    AAC_DECODER_ERROR err = aacDecoder_Fill(a2dp_aac_decoder_cb.aac_handle,
++                                            &pBuffer, &bufferSize, &bytesValid);
++    if (err != AAC_DEC_OK) {
++      LOG_ERROR(LOG_TAG, "%s: aacDecoder_Fill failed: 0x%x", __func__,
++                static_cast<unsigned>(err));
++      return false;
++    }
++
++    while (true) {
++      err = aacDecoder_DecodeFrame(a2dp_aac_decoder_cb.aac_handle,
++                                   a2dp_aac_decoder_cb.decode_buf,
++                                   DECODE_BUF_LEN, 0 /* flags */);
++      if (err == AAC_DEC_NOT_ENOUGH_BITS) {
++        break;
++      }
++      if (err != AAC_DEC_OK) {
++        LOG_ERROR(LOG_TAG, "%s: aacDecoder_DecodeFrame failed: 0x%x", __func__,
++                  static_cast<int>(err));
++        break;
++      }
++
++      CStreamInfo* info =
++          aacDecoder_GetStreamInfo(a2dp_aac_decoder_cb.aac_handle);
++      if (!info || info->sampleRate <= 0) {
++        LOG_ERROR(LOG_TAG, "%s: Invalid stream info", __func__);
++        break;
++      }
++
++      size_t frame_len = info->frameSize * info->numChannels *
++                         sizeof(a2dp_aac_decoder_cb.decode_buf[0]);
++      a2dp_aac_decoder_cb.decode_callback(
++          reinterpret_cast<uint8_t*>(a2dp_aac_decoder_cb.decode_buf),
++          static_cast<uint32_t>(frame_len));
++    }
++  }
++
++  return true;
++}
+diff --git a/stack/include/a2dp_aac_decoder.h b/stack/include/a2dp_aac_decoder.h
+new file mode 100644
+index 0000000..1115305
+--- /dev/null
++++ b/stack/include/a2dp_aac_decoder.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 2016 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++//
++// Interface to the A2DP AAC Decoder.
++//
++// Backported from Android 9 (pie) to AOSP 8.1 for the KeenPlus U2 sink.
++// Two deliberate deviations from the pie original, because 8.1 differs:
++//   1. decoded_data_callback_t is defined here (8.1's a2dp_codec_api.h does not
++//      declare it; pie introduced it together with the decoder interface).
++//   2. a2dp_aac_decoder_decode_packet() takes a (data, len) pair instead of a
++//      BT_HDR*, because 8.1's btif_a2dp_sink queues media in its own
++//      tBT_SBC_HDR structure whose payload is not a BT_HDR flexible array.
++//
++
++#ifndef A2DP_AAC_DECODER_H
++#define A2DP_AAC_DECODER_H
++
++#include <stdint.h>
++
++// Callback invoked with decoded PCM. |buf| holds |len| bytes of 16-bit PCM.
++typedef void (*decoded_data_callback_t)(uint8_t* buf, uint32_t len);
++
++// Loads the A2DP AAC decoder.
++// Return true on success, otherwise false.
++bool A2DP_LoadDecoderAac(void);
++
++// Unloads the A2DP AAC decoder.
++void A2DP_UnloadDecoderAac(void);
++
++// Initialize the A2DP AAC decoder.
++bool a2dp_aac_decoder_init(decoded_data_callback_t decode_callback);
++
++// Cleanup the A2DP AAC decoder.
++void a2dp_aac_decoder_cleanup(void);
++
++// Decodes the AAC payload at |p_data| (|len| bytes).  Calls |decode_callback|
++// passed into |a2dp_aac_decoder_init| for each decoded PCM frame.
++bool a2dp_aac_decoder_decode_packet(uint8_t* p_data, uint16_t len);
++
++#endif  // A2DP_AAC_DECODER_H
+-- 
+2.39.5
+

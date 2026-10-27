@@ -1,0 +1,7 @@
+# device.te -- KeenPlus U2 device-specific type declarations.
+#
+# A single "device" type is enough for this port; it groups the platform files
+# and lets us reference them from other domains without leaking vendor paths.
+
+# Type for the platform device node directory /dev/u2 (if used by the helper).
+type u2_device, dev_type;

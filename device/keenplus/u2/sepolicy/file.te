@@ -1,0 +1,7 @@
+# file.te -- custom file/label types for the U2 BT-audio glue.
+
+# Persist directory holding the last-used A2DP device + codec cache.
+type u2_btaudio_data_file, file_type, data_file_type;
+
+# The helper's own runtime dir under /data (empty-dir-safe label).
+type u2_btaudio_runtime_file, file_type, data_file_type;

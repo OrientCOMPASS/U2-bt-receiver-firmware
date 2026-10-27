@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save Actions minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------- #
+  # Fast, offline: structure/lint, generated-file drift, Python unit tests.
+  # --------------------------------------------------------------------------- #
+  lint-and-test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system tools (shellcheck, xmllint)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck libxml2-utils
+          shellcheck --version | head -2
+          xmllint --version 2>&1 | head -1
+
+      - name: Structural + lint validation
+        run: python3 scripts/validate_repo.py
+
+      - name: Generated vendor makefiles are up to date
+        run: python3 scripts/gen-vendor-mk.py --check
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: shellcheck (all shell scripts)
+        run: |
+          shellcheck -x \
+            scripts/apply-patches.sh \
+            scripts/build.sh \
+            scripts/measure.sh \
+            device/keenplus/u2/extract-files.sh \
+            device/keenplus/u2/rootdir/enableswap.sh
+
+      - name: xmllint (all XML well-formed)
+        run: |
+          find . -name '*.xml' -not -path './.git/*' -print0 \
+            | xargs -0 -n1 xmllint --noout
+
+      - name: Byte-compile all Python
+        run: python3 -m compileall -q scripts kernel
+
+      - name: CLI smoke tests (--help exits 0)
+        run: |
+          python3 scripts/make_logo.py --help >/dev/null
+          python3 scripts/mtk_sparse2raw.py --help >/dev/null
+          python3 scripts/gen-vendor-mk.py --help >/dev/null
+          python3 kernel/check-kernel-config.py --help >/dev/null
+
+  # --------------------------------------------------------------------------- #
+  # Network: prove every patch series applies to the pristine AOSP 8.1 tag with
+  # `git am` on fresh shallow clones.  This is the real correctness gate for the
+  # source changes (the repo cannot compile AOSP -- see patches/README.md).
+  # --------------------------------------------------------------------------- #
+  patches-verify:
+    name: Verify patches against AOSP 8.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git identity (for git am committer)
+        run: |
+          git config --global user.name  "OrientCOMPASS"
+          git config --global user.email "316423573+OrientCOMPASS@users.noreply.github.com"
+
+      - name: Apply every series to android-8.1.0_r80 (fresh clones)
+        run: bash scripts/apply-patches.sh --verify

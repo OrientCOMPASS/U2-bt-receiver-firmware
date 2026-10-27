@@ -1,0 +1,111 @@
+# proprietary-files.txt -- KeenPlus U2 (plan section 14.4)
+#
+# Every blob below is extracted from the BASELINE firmware's /system partition
+# (no root needed: use debugfs, or extract-files.sh which drives
+# scripts/mtk_sparse2raw.py + debugfs).  Lines beginning with '#' and blank lines
+# are ignored.  Paths are relative to the system root.
+#
+# All retained HALs are 32-bit (ELFCLASS32); extract-files.sh runs `readelf -h`
+# on each .so and aborts if a blob is 64-bit only (risk R4 / decision D2).
+
+# ---- Graphics (legacy HAL + HWC2 passthrough) ----
+vendor/lib/hw/hwcomposer.mt6735.so
+vendor/lib/hw/gralloc.mt6735m.so
+vendor/lib/hw/memtrack.mt6737m.so
+vendor/lib/egl/libGLES_mali.so
+vendor/lib/egl/libGLESv1_CM_mali.so
+vendor/lib/egl/libGLESv2_mali.so
+vendor/lib/libged.so
+vendor/lib/libgpu_aux.so
+vendor/lib/libgralloc_extra.so
+vendor/lib/libion.so
+vendor/lib/libion_mtk.so
+vendor/lib/libbwc.so
+vendor/lib/libdpframework.so
+vendor/lib/libm4u.so
+vendor/lib/libpq_prot.so
+vendor/lib/libui_ext.so
+vendor/lib/libgui_ext.so
+vendor/lib/libpower.so
+
+# ---- Audio ----
+vendor/lib/hw/audio.primary.mt6735m.so
+vendor/lib/hw/audio.usb.mt6735m.so
+vendor/lib/hw/audio.r_submix.mt6735m.so
+vendor/lib/libaudio_param_parser.so
+vendor/lib/libaudiocustparam.so
+vendor/lib/libaudiosetting.so
+vendor/lib/libaudiotoolkit.so
+vendor/lib/libaudiocompensationfilter.so
+vendor/lib/libaudiocomponentengine.so
+vendor/lib/libaudiodcrflt.so
+vendor/lib/libaudiomtkdcremoval.so
+vendor/lib/libaed.so
+vendor/lib/libcvsd_mtk.so
+vendor/lib/libmsbc_mtk.so
+vendor/lib/libtinyalsa.so
+vendor/lib/libtinycompress.so
+vendor/lib/libtinyxml.so
+vendor/etc/audio_device.xml
+vendor/etc/audio_em.xml
+# audio_param/ is a directory; extract-files.sh copies it wholesale.
+vendor/etc/audio_param
+
+# ---- Bluetooth (legacy bt_vendor_interface_t; 8.1 loads this directly) ----
+vendor/lib/libbt-vendor.so
+vendor/lib/libbluetooth_mtk.so
+vendor/lib/libbluetooth_mtk_pure.so
+vendor/lib/libbluetooth_relayer.so
+vendor/lib/libbluetoothem_mtk.so
+vendor/lib/libbluetooth_hw_test.so
+etc/firmware/ROMv2_lm_patch_1_0_hdr.bin
+etc/firmware/ROMv2_lm_patch_1_1_hdr.bin
+etc/firmware/WMT_SOC.cfg
+
+# ---- Wi-Fi / FM / GPS (MT6627 combo) ----
+etc/firmware/WIFI_RAM_CODE_6735
+etc/firmware/mt6627_fm_v1_coeff.bin
+etc/firmware/mt6627_fm_v1_patch.bin
+vendor/lib/hw/radio.fm.mt6737m.so
+vendor/lib/hw/flp.mt6737m.so
+vendor/lib/hw/gps.mt6735m.so
+vendor/bin/wmt_loader
+vendor/bin/wmt_launcher
+vendor/bin/stp_dump3
+vendor/bin/mnld
+vendor/bin/MPED
+etc/wifi/wpa_supplicant.conf
+etc/wifi/p2p_supplicant_overlay.conf
+etc/wifi/wpa_supplicant_overlay.conf
+
+# ---- Other HALs ----
+vendor/lib/hw/lights.mt6735m.so
+vendor/lib/hw/sensors.mt6735m.so
+vendor/lib/hw/keystore.mt6735m.so
+vendor/lib/hw/gatekeeper.mt6735m.so
+vendor/lib/hw/power.mt6735m.so
+vendor/lib/libSoftGatekeeper.so
+vendor/lib/libnvram.so
+vendor/lib/libnvram_daemon_callback.so
+vendor/lib/libcustom_prop.so
+vendor/bin/fuelgauged
+vendor/bin/nvram_daemon
+vendor/bin/permission_check
+
+# ---- Touch parameters ----
+vendor/etc/.tp
+
+# --------------------------------------------------------------------------- #
+# EXPLICITLY NOT EXTRACTED (plan sections 9 and 15.1) -- listed here so the
+# omission is deliberate and auditable, not an oversight:
+#   vendor/lib/hw/camera.mt6735m.so and all camera blobs
+#   etc/firmware/modem_1_ltg_n.img / catcher_filter_1_ltg_n.bin /
+#       dsp_1_ltg_n.bin / em_filter_1_ltg_n.bin   (~10 MiB, no modem)
+#   MiraVision / EngineerMode / MTKLogger / Exchange2 / MtkCalendar / Omacp /
+#       AtciService / MDMLSample / LocationEM2 / YGPS / FTPreCheck / SensorHub /
+#       CalendarImporter / DrmProvider
+#   preload/hotapps/*   (993 MiB)
+#   media/1080p.avi     (128 MiB)
+#   lib64/* and vendor/lib64/*   (165 MiB, decision D2)
+#   tts/lang_pico/*     (6.16 MiB)
+# --------------------------------------------------------------------------- #

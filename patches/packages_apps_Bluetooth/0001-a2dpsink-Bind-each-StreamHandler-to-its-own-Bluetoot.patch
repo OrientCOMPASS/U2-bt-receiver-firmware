@@ -1,0 +1,162 @@
+From 363d09b981b021fda1e0f687e802570486166a8d Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:04:26 +0000
+Subject: [PATCH] a2dpsink: Bind each StreamHandler to its own BluetoothDevice
+
+A2dpSinkStreamHandler sent AVRCP pass-through commands to
+AvrcpControllerService.getConnectedDevices().get(0) -- an arbitrary entry
+-- and gated start/stopAvrcpUpdates on getConnectedDevices().size() == 1.
+With a single connected device this happens to work, but it targets the
+wrong peer as soon as more than one AVRCP device is connected, and it is
+the blocker the plan (section 16.6) calls out for one-to-two operation.
+
+Bind the handler to the device it streams for: pass mCurrentDevice into
+the A2dpSinkStreamHandler constructor and use it for every AVRCP command
+and for the start/stop-updates guard (contains(mDevice) instead of
+size() == 1).  Behaviour is unchanged for the single-device case and
+becomes correct once multiple devices are connected.
+
+This is the device-addressing prerequisite for the multi-device (F6)
+work; the per-device state-machine architecture that keeps two ACLs up
+simultaneously is described in patches/packages_apps_Bluetooth/
+MULTIDEVICE.md, since AOSP 8.1 has no in-tree template for it (both the
+8.1 source and sink A2DP profiles use a single-active-device model).
+---
+ .../a2dpsink/A2dpSinkStateMachine.java        |  3 +-
+ .../a2dpsink/A2dpSinkStreamHandler.java       | 60 +++++++++----------
+ 2 files changed, 31 insertions(+), 32 deletions(-)
+
+diff --git a/src/com/android/bluetooth/a2dpsink/A2dpSinkStateMachine.java b/src/com/android/bluetooth/a2dpsink/A2dpSinkStateMachine.java
+index 214db99..f54ff6e 100644
+--- a/src/com/android/bluetooth/a2dpsink/A2dpSinkStateMachine.java
++++ b/src/com/android/bluetooth/a2dpsink/A2dpSinkStateMachine.java
+@@ -498,7 +498,8 @@ public class A2dpSinkStateMachine extends StateMachine {
+                     if(DBG) {
+                         log("Creating New A2dpSinkStreamHandler");
+                     }
+-                    mStreaming = new A2dpSinkStreamHandler(A2dpSinkStateMachine.this, mContext);
++                    mStreaming = new A2dpSinkStreamHandler(A2dpSinkStateMachine.this, mContext,
++                            mCurrentDevice);
+                 }
+             }
+         }
+diff --git a/src/com/android/bluetooth/a2dpsink/A2dpSinkStreamHandler.java b/src/com/android/bluetooth/a2dpsink/A2dpSinkStreamHandler.java
+index dae6df5..06db70f 100644
+--- a/src/com/android/bluetooth/a2dpsink/A2dpSinkStreamHandler.java
++++ b/src/com/android/bluetooth/a2dpsink/A2dpSinkStreamHandler.java
+@@ -29,8 +29,6 @@ import android.util.Log;
+ import com.android.bluetooth.avrcpcontroller.AvrcpControllerService;
+ import com.android.bluetooth.R;
+ 
+-import java.util.List;
+-
+ /**
+  * Bluetooth A2DP SINK Streaming Handler.
+  *
+@@ -74,6 +72,12 @@ public class A2dpSinkStreamHandler extends Handler {
+     // Private variables.
+     private A2dpSinkStateMachine mA2dpSinkSm;
+     private Context mContext;
++    // The remote device this stream handler is bound to.  AVRCP pass-through
++    // commands are sent to THIS device rather than to an arbitrary entry of
++    // AvrcpControllerService.getConnectedDevices() (plan section 16.6).  With a
++    // single connected device the behaviour is unchanged; once multiple devices
++    // are connected each handler keeps targeting its own device.
++    private final BluetoothDevice mDevice;
+     private AudioManager mAudioManager;
+     // Keep track if the remote device is providing audio
+     private boolean mStreamAvailable = false;
+@@ -92,9 +96,11 @@ public class A2dpSinkStreamHandler extends Handler {
+         }
+     };
+ 
+-    public A2dpSinkStreamHandler(A2dpSinkStateMachine a2dpSinkSm, Context context) {
++    public A2dpSinkStreamHandler(A2dpSinkStateMachine a2dpSinkSm, Context context,
++            BluetoothDevice device) {
+         mA2dpSinkSm = a2dpSinkSm;
+         mContext = context;
++        mDevice = device;
+         mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+     }
+ 
+@@ -265,7 +271,7 @@ public class A2dpSinkStreamHandler extends Handler {
+         if (DBG) {
+             Log.d(TAG, "startAvrcpUpdates");
+         }
+-        if (avrcpService != null && avrcpService.getConnectedDevices().size() == 1) {
++        if (avrcpService != null && avrcpService.getConnectedDevices().contains(mDevice)) {
+             avrcpService.startAvrcpUpdates();
+         } else {
+             Log.e(TAG, "startAvrcpUpdates failed because of connection.");
+@@ -279,7 +285,7 @@ public class A2dpSinkStreamHandler extends Handler {
+         if (DBG) {
+             Log.d(TAG, "stopAvrcpUpdates");
+         }
+-        if (avrcpService != null && avrcpService.getConnectedDevices().size() == 1) {
++        if (avrcpService != null && avrcpService.getConnectedDevices().contains(mDevice)) {
+             avrcpService.stopAvrcpUpdates();
+         } else {
+             Log.e(TAG, "stopAvrcpUpdates failed because of connection.");
+@@ -293,20 +299,16 @@ public class A2dpSinkStreamHandler extends Handler {
+         if (DBG) {
+             Log.d(TAG, "sendAvrcpPause");
+         }
+-        if (avrcpService != null) {
+-            List<BluetoothDevice> connectedDevices = avrcpService.getConnectedDevices();
+-            if (!connectedDevices.isEmpty()) {
+-                BluetoothDevice targetDevice = connectedDevices.get(0);
+-                if (DBG) {
+-                    Log.d(TAG, "Pausing AVRCP.");
+-                }
+-                avrcpService.sendPassThroughCmd(targetDevice,
+-                        AvrcpControllerService.PASS_THRU_CMD_ID_PAUSE,
+-                        AvrcpControllerService.KEY_STATE_PRESSED);
+-                avrcpService.sendPassThroughCmd(targetDevice,
+-                        AvrcpControllerService.PASS_THRU_CMD_ID_PAUSE,
+-                        AvrcpControllerService.KEY_STATE_RELEASED);
++        if (avrcpService != null && avrcpService.getConnectedDevices().contains(mDevice)) {
++            if (DBG) {
++                Log.d(TAG, "Pausing AVRCP on " + mDevice);
+             }
++            avrcpService.sendPassThroughCmd(mDevice,
++                    AvrcpControllerService.PASS_THRU_CMD_ID_PAUSE,
++                    AvrcpControllerService.KEY_STATE_PRESSED);
++            avrcpService.sendPassThroughCmd(mDevice,
++                    AvrcpControllerService.PASS_THRU_CMD_ID_PAUSE,
++                    AvrcpControllerService.KEY_STATE_RELEASED);
+         } else {
+             Log.e(TAG, "Passthrough not sent, connection un-available.");
+         }
+@@ -319,20 +321,16 @@ public class A2dpSinkStreamHandler extends Handler {
+         if (DBG) {
+             Log.d(TAG, "sendAvrcpPlay");
+         }
+-        if (avrcpService != null) {
+-            List<BluetoothDevice> connectedDevices = avrcpService.getConnectedDevices();
+-            if (!connectedDevices.isEmpty()) {
+-                BluetoothDevice targetDevice = connectedDevices.get(0);
+-                if (DBG) {
+-                    Log.d(TAG, "Playing AVRCP.");
+-                }
+-                avrcpService.sendPassThroughCmd(targetDevice,
+-                        AvrcpControllerService.PASS_THRU_CMD_ID_PLAY,
+-                        AvrcpControllerService.KEY_STATE_PRESSED);
+-                avrcpService.sendPassThroughCmd(targetDevice,
+-                        AvrcpControllerService.PASS_THRU_CMD_ID_PLAY,
+-                        AvrcpControllerService.KEY_STATE_RELEASED);
++        if (avrcpService != null && avrcpService.getConnectedDevices().contains(mDevice)) {
++            if (DBG) {
++                Log.d(TAG, "Playing AVRCP on " + mDevice);
+             }
++            avrcpService.sendPassThroughCmd(mDevice,
++                    AvrcpControllerService.PASS_THRU_CMD_ID_PLAY,
++                    AvrcpControllerService.KEY_STATE_PRESSED);
++            avrcpService.sendPassThroughCmd(mDevice,
++                    AvrcpControllerService.PASS_THRU_CMD_ID_PLAY,
++                    AvrcpControllerService.KEY_STATE_RELEASED);
+         } else {
+             Log.e(TAG, "Passthrough not sent, connection un-available.");
+         }
+-- 
+2.39.5
+

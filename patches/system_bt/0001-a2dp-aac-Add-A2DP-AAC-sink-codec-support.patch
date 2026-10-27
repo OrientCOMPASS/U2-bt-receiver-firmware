@@ -1,0 +1,273 @@
+From 44fb4557a13286c92d1c976d6e42609eaa430fa5 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:53:19 +0000
+Subject: [PATCH 1/4] a2dp: aac: Add A2DP AAC sink codec support
+
+AOSP 8.1 ships AAC as a Source-only codec: the four sink helpers in
+a2dp_aac.cc (A2DP_IsSinkCodecValidAac, A2DP_IsSinkCodecSupportedAac,
+A2DP_GetSinkTrackChannelTypeAac, A2DP_GetSinkFramesCountToProcessAac)
+are stubs returning false/-1, there is no sink capability struct, and the
+codec factory has no SINK_AAC case.  The dispatch layer in
+a2dp_codec_config.cc already routes A2DP_MEDIA_CT_AAC to these helpers,
+so filling them in is enough to make AAC a usable sink codec.
+
+This backports the sink pieces from Android 9 (pie):
+  * add a2dp_aac_sink_caps (MPEG-2 LC, 44100|48000, mono|stereo, VBR on)
+    so an iOS/macOS 48 kHz stream is neither resampled nor rejected
+    (plan sections 2.2 / 16.4);
+  * implement the four stub sink helpers;
+  * add A2dpCodecConfigAacSink (modelled on A2dpCodecConfigSbcSink),
+    A2DP_InitCodecConfigAacSink and A2DP_CodecIndexStrAacSink;
+  * register BTAV_A2DP_CODEC_INDEX_SINK_AAC in the codec factory and in
+    A2DP_CodecIndexStr / A2DP_InitCodecConfig.  A2dpCodecs::init() then
+    picks it up automatically (it iterates every index below SINK_MAX).
+
+Requires BTAV_A2DP_CODEC_INDEX_SINK_AAC in hardware/bt_av.h (separate
+patch).  Part of the KeenPlus U2 A2DP sink work.
+---
+ stack/a2dp/a2dp_aac.cc          | 119 +++++++++++++++++++++++++++++---
+ stack/a2dp/a2dp_codec_config.cc |   7 ++
+ stack/include/a2dp_aac.h        |  25 +++++++
+ 3 files changed, 143 insertions(+), 8 deletions(-)
+
+diff --git a/stack/a2dp/a2dp_aac.cc b/stack/a2dp/a2dp_aac.cc
+index 730aee3..498af33 100644
+--- a/stack/a2dp/a2dp_aac.cc
++++ b/stack/a2dp/a2dp_aac.cc
+@@ -75,6 +75,25 @@ static const tA2DP_AAC_CIE a2dp_aac_default_config = {
+     BTAV_A2DP_CODEC_BITS_PER_SAMPLE_16    // bits_per_sample
+ };
+ 
++/* AAC Sink codec capabilities (backported from pie for the U2 A2DP sink).
++ * Accept both 44.1 kHz and 48 kHz so an iOS/macOS source that negotiates 48 kHz
++ * is not resampled or rejected (plan sections 2.2 and 16.4).  Mono + Stereo and
++ * variable bit rate are advertised so SBC-XQ-style higher-rate AAC works. */
++static const tA2DP_AAC_CIE a2dp_aac_sink_caps = {
++    // objectType
++    A2DP_AAC_OBJECT_TYPE_MPEG2_LC,
++    // sampleRate
++    A2DP_AAC_SAMPLING_FREQ_44100 | A2DP_AAC_SAMPLING_FREQ_48000,
++    // channelMode
++    A2DP_AAC_CHANNEL_MODE_MONO | A2DP_AAC_CHANNEL_MODE_STEREO,
++    // variableBitRateSupport
++    A2DP_AAC_VARIABLE_BIT_RATE_ENABLED,
++    // bitRate
++    A2DP_AAC_DEFAULT_BITRATE,
++    // bits_per_sample
++    BTAV_A2DP_CODEC_BITS_PER_SAMPLE_16};
++
++
+ static const tA2DP_ENCODER_INTERFACE a2dp_encoder_interface_aac = {
+     a2dp_aac_encoder_init,
+     a2dp_aac_encoder_cleanup,
+@@ -191,7 +210,11 @@ bool A2DP_IsSourceCodecValidAac(const uint8_t* p_codec_info) {
+ }
+ 
+ bool A2DP_IsSinkCodecValidAac(UNUSED_ATTR const uint8_t* p_codec_info) {
+-  return false;
++  tA2DP_AAC_CIE cfg_cie;
++
++  /* Use a liberal check when parsing the codec info */
++  return (A2DP_ParseInfoAac(&cfg_cie, p_codec_info, false) == A2DP_SUCCESS) ||
++         (A2DP_ParseInfoAac(&cfg_cie, p_codec_info, true) == A2DP_SUCCESS);
+ }
+ 
+ bool A2DP_IsPeerSourceCodecValidAac(UNUSED_ATTR const uint8_t* p_codec_info) {
+@@ -206,8 +229,9 @@ bool A2DP_IsPeerSinkCodecValidAac(const uint8_t* p_codec_info) {
+          (A2DP_ParseInfoAac(&cfg_cie, p_codec_info, true) == A2DP_SUCCESS);
+ }
+ 
+-bool A2DP_IsSinkCodecSupportedAac(UNUSED_ATTR const uint8_t* p_codec_info) {
+-  return false;
++bool A2DP_IsSinkCodecSupportedAac(const uint8_t* p_codec_info) {
++  return A2DP_CodecInfoMatchesCapabilityAac(&a2dp_aac_sink_caps, p_codec_info,
++                                            false) == A2DP_SUCCESS;
+ }
+ 
+ bool A2DP_IsPeerSourceCodecSupportedAac(
+@@ -390,14 +414,42 @@ int A2DP_GetTrackChannelCountAac(const uint8_t* p_codec_info) {
+   return -1;
+ }
+ 
+-int A2DP_GetSinkTrackChannelTypeAac(UNUSED_ATTR const uint8_t* p_codec_info) {
++int A2DP_GetSinkTrackChannelTypeAac(const uint8_t* p_codec_info) {
++  tA2DP_AAC_CIE aac_cie;
++
++  // Check whether the codec info contains valid data
++  tA2DP_STATUS a2dp_status = A2DP_ParseInfoAac(&aac_cie, p_codec_info, false);
++  if (a2dp_status != A2DP_SUCCESS) {
++    LOG_ERROR(LOG_TAG, "%s: cannot decode codec information: %d", __func__,
++              a2dp_status);
++    return -1;
++  }
++
++  switch (aac_cie.channelMode) {
++    case A2DP_AAC_CHANNEL_MODE_MONO:
++      return 1;
++    case A2DP_AAC_CHANNEL_MODE_STEREO:
++      return 3;
++  }
++
+   return -1;
+ }
+ 
+-int A2DP_GetSinkFramesCountToProcessAac(
+-    UNUSED_ATTR uint64_t time_interval_ms,
+-    UNUSED_ATTR const uint8_t* p_codec_info) {
+-  return -1;
++int A2DP_GetSinkFramesCountToProcessAac(uint64_t time_interval_ms,
++                                        const uint8_t* p_codec_info) {
++  int sample_rate = A2DP_GetTrackSampleRateAac(p_codec_info);
++  if (sample_rate == -1) {
++    LOG_ERROR(LOG_TAG, "%s: cannot get the track sample rate", __func__);
++    return -1;
++  }
++
++  // One AAC frame carries 1024 samples.  Return how many frames fit into the
++  // tick so the sink decode timer paces the AAC queue correctly.  Never return
++  // 0 (the timer would stall); at least one frame per tick.
++  int frames_to_process =
++      (static_cast<int>(time_interval_ms) * sample_rate) / (1000 * 1024);
++  if (frames_to_process < 1) frames_to_process = 1;
++  return frames_to_process;
+ }
+ 
+ int A2DP_GetObjectTypeCodeAac(const uint8_t* p_codec_info) {
+@@ -650,6 +702,13 @@ bool A2DP_InitCodecConfigAac(tAVDT_CFG* p_cfg) {
+   return true;
+ }
+ 
++const char* A2DP_CodecIndexStrAacSink(void) { return "AAC SINK"; }
++
++bool A2DP_InitCodecConfigAacSink(tAVDT_CFG* p_cfg) {
++  return A2DP_BuildInfoAac(AVDT_MEDIA_TYPE_AUDIO, &a2dp_aac_sink_caps,
++                           p_cfg->codec_info) == A2DP_SUCCESS;
++}
++
+ UNUSED_ATTR static void build_codec_config(const tA2DP_AAC_CIE& config_cie,
+                                            btav_a2dp_codec_config_t* result) {
+   if (config_cie.sampleRate & A2DP_AAC_SAMPLING_FREQ_44100)
+@@ -1263,3 +1322,47 @@ fail:
+          sizeof(ota_codec_peer_config_));
+   return false;
+ }
++
++//
++// A2DP AAC Sink codec configuration (backported from pie for the U2 sink).
++// Modelled after A2dpCodecConfigSbcSink: the sink role does not use the
++// Source-only encoder methods, so they are minimal stubs.
++//
++A2dpCodecConfigAacSink::A2dpCodecConfigAacSink(
++    btav_a2dp_codec_priority_t codec_priority)
++    : A2dpCodecConfig(BTAV_A2DP_CODEC_INDEX_SINK_AAC, "AAC(Sink)",
++                      codec_priority) {}
++
++A2dpCodecConfigAacSink::~A2dpCodecConfigAacSink() {}
++
++bool A2dpCodecConfigAacSink::init() {
++  if (!isValid()) return false;
++
++  return true;
++}
++
++bool A2dpCodecConfigAacSink::useRtpHeaderMarkerBit() const {
++  // TODO: This method applies only to Source codecs
++  return false;
++}
++
++bool A2dpCodecConfigAacSink::setCodecConfig(
++    UNUSED_ATTR const uint8_t* p_peer_codec_info,
++    UNUSED_ATTR bool is_capability,
++    UNUSED_ATTR uint8_t* p_result_codec_config) {
++  // TODO: This method applies only to Source codecs
++  return false;
++}
++
++bool A2dpCodecConfigAacSink::updateEncoderUserConfig(
++    UNUSED_ATTR const tA2DP_ENCODER_INIT_PEER_PARAMS* p_peer_params,
++    UNUSED_ATTR bool* p_restart_input, UNUSED_ATTR bool* p_restart_output,
++    UNUSED_ATTR bool* p_config_updated) {
++  // TODO: This method applies only to Source codecs
++  return false;
++}
++
++period_ms_t A2dpCodecConfigAacSink::encoderIntervalMs() const {
++  // TODO: This method applies only to Source codecs
++  return 0;
++}
+diff --git a/stack/a2dp/a2dp_codec_config.cc b/stack/a2dp/a2dp_codec_config.cc
+index 0bf5985..07654ca 100644
+--- a/stack/a2dp/a2dp_codec_config.cc
++++ b/stack/a2dp/a2dp_codec_config.cc
+@@ -108,6 +108,9 @@ A2dpCodecConfig* A2dpCodecConfig::createCodec(
+     case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+       codec_config = new A2dpCodecConfigSbcSink(codec_priority);
+       break;
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++      codec_config = new A2dpCodecConfigAacSink(codec_priority);
++      break;
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_AAC:
+       codec_config = new A2dpCodecConfigAac(codec_priority);
+       break;
+@@ -1221,6 +1224,8 @@ const char* A2DP_CodecIndexStr(btav_a2dp_codec_index_t codec_index) {
+       return A2DP_CodecIndexStrSbc();
+     case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+       return A2DP_CodecIndexStrSbcSink();
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++      return A2DP_CodecIndexStrAacSink();
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_AAC:
+       return A2DP_CodecIndexStrAac();
+     default:
+@@ -1247,6 +1252,8 @@ bool A2DP_InitCodecConfig(btav_a2dp_codec_index_t codec_index,
+       return A2DP_InitCodecConfigSbc(p_cfg);
+     case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+       return A2DP_InitCodecConfigSbcSink(p_cfg);
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++      return A2DP_InitCodecConfigAacSink(p_cfg);
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_AAC:
+       return A2DP_InitCodecConfigAac(p_cfg);
+     default:
+diff --git a/stack/include/a2dp_aac.h b/stack/include/a2dp_aac.h
+index 43f7965..7b593b4 100644
+--- a/stack/include/a2dp_aac.h
++++ b/stack/include/a2dp_aac.h
+@@ -44,6 +44,24 @@ class A2dpCodecConfigAac : public A2dpCodecConfig {
+   void debug_codec_dump(int fd) override;
+ };
+ 
++class A2dpCodecConfigAacSink : public A2dpCodecConfig {
++ public:
++  A2dpCodecConfigAacSink(btav_a2dp_codec_priority_t codec_priority);
++  virtual ~A2dpCodecConfigAacSink();
++
++  bool init() override;
++  period_ms_t encoderIntervalMs() const override;
++  bool setCodecConfig(const uint8_t* p_peer_codec_info, bool is_capability,
++                      uint8_t* p_result_codec_config) override;
++
++ private:
++  bool useRtpHeaderMarkerBit() const override;
++  bool updateEncoderUserConfig(
++      const tA2DP_ENCODER_INIT_PEER_PARAMS* p_peer_params,
++      bool* p_restart_input, bool* p_restart_output,
++      bool* p_config_updated) override;
++};
++
+ // Checks whether the codec capabilities contain a valid A2DP AAC Source
+ // codec.
+ // NOTE: only codecs that are implemented are considered valid.
+@@ -226,4 +244,11 @@ const char* A2DP_CodecIndexStrAac(void);
+ // configuration entry pointed by |p_cfg|.
+ bool A2DP_InitCodecConfigAac(tAVDT_CFG* p_cfg);
+ 
++// Gets the A2DP AAC Sink codec name.
++const char* A2DP_CodecIndexStrAacSink(void);
++
++// Initializes A2DP AAC Sink codec information into |tAVDT_CFG|
++// configuration entry pointed by |p_cfg|.
++bool A2DP_InitCodecConfigAacSink(tAVDT_CFG* p_cfg);
++
+ #endif  // A2DP_AAC_H
+-- 
+2.39.5
+
