@@ -48,6 +48,7 @@ jobs:
           git config --global user.email "316423573+OrientCOMPASS@users.noreply.github.com"
 
       - name: Compile patched BT modules in the standalone environment
+        shell: bash   # -eo pipefail: script failures must not be masked by `| tee`
         run: |
           chmod +x scripts/bt_standalone_build.sh
           ./scripts/bt_standalone_build.sh \

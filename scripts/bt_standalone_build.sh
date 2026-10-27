@@ -199,6 +199,54 @@ apply_patches() {
   fi
 }
 
+# Sentinel headers/files that MUST exist for the compile environment to be
+# complete.  Different git versions have shown subtle sparse-checkout
+# differences (a top-level "include" cone once failed to materialize on the
+# CI runners), so verify and self-heal instead of failing deep inside clang
+# with a confusing "file not found".
+SENTINELS=(
+  "bt/stack/a2dp/a2dp_aac_decoder.cc"
+  "libhardware/include/hardware/bt_av.h"
+  "libchrome/base/logging.h"
+  "gtest/googletest/include/gtest/gtest_prod.h"
+  "core/libcutils/include/cutils/properties.h"
+  "core/libutils/include/utils/RefBase.h"
+  "core/liblog/include/log/log.h"
+  "core/libsystem/include/system/graphics.h"
+  "core/base/include/android-base/unique_fd.h"
+  "native/libs/binder/include/binder/Parcel.h"
+  "av/media/libaudioclient/include/media/AudioTrack.h"
+  "av/include/media/AudioResamplerPublic.h"
+  "sysmedia/audio/include/system/audio.h"
+  "tinyxml2/tinyxml2.h"
+  "aac/libAACdec/include/aacdecoder_lib.h"
+  "libldac/inc/ldacBT.h"
+)
+
+verify_headers() {
+  local s repo missing=0
+  for s in "${SENTINELS[@]}"; do
+    if [ ! -f "$SRC/$s" ]; then
+      repo="${s%%/*}"
+      echo "[verify] MISSING $s -- healing $repo with a full checkout"
+      git -C "$SRC/$repo" sparse-checkout disable >/dev/null 2>&1 || true
+      git -C "$SRC/$repo" checkout -f HEAD >/dev/null 2>&1 || true
+      if [ ! -f "$SRC/$s" ]; then
+        echo "[verify] still missing after heal:" >&2
+        ls "$SRC/$repo" >&2 || true
+        git -C "$SRC/$repo" sparse-checkout list >&2 || true
+        die "environment verification failed for $s"
+      fi
+      missing=$((missing+1))
+    fi
+  done
+  if grep -q 'BTAV_A2DP_CODEC_INDEX_SINK_AAC' "$SRC/libhardware/include/hardware/bt_av.h"; then
+    echo "[verify] all ${#SENTINELS[@]} sentinels present ($missing healed); patches in place"
+  else
+    die "libhardware patch marker missing (bt_av.h)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Stage 3: compile environment (mirrors fluoride_defaults + module include_dirs)
 # ---------------------------------------------------------------------------
@@ -405,6 +453,7 @@ else
   NDK="$(find "$WORKDIR" -maxdepth 5 -type d -path '*/toolchains/llvm/prebuilt/linux-x86_64' | head -1)"
   [ -n "$NDK" ] || die "--skip-setup but no NDK found under $WORKDIR"
 fi
+verify_headers
 write_env
 build_tu_list
 if compile_all && { [ "$LINK" = 0 ] || link_artifacts; }; then
