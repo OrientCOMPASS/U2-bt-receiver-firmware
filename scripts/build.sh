@@ -142,6 +142,10 @@ make_images() {
     [[ -n "${WORKDIR}" ]] || { err "--workdir required for --make"; exit 1; }
     cd "${WORKDIR}"
     log "source build/envsetup.sh && lunch ${LUNCH} && make -j${JOBS}"
+    # AOSP envsetup.sh trips bash < 4.4 under `set -u` (empty-array expansion
+    # like LUNCH_MENU_CHOICES[@] counts as unbound on 4.3, e.g. Ubuntu 16.04).
+    # Relax nounset for the whole make phase; errexit/pipefail stay on.
+    set +u
     # shellcheck disable=SC1091
     source build/envsetup.sh
     lunch "${LUNCH}"
@@ -165,6 +169,8 @@ make_incremental() {
     fi
     cd "${WORKDIR}"
     log "incremental: m ${BT_MODULES[*]} snod  (reusing existing out/)"
+    # see make_images(): bash < 4.4 + `set -u` cannot source envsetup.sh
+    set +u
     # shellcheck disable=SC1091
     source build/envsetup.sh
     lunch "${LUNCH}"
