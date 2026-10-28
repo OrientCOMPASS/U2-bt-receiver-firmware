@@ -105,9 +105,12 @@ BOARD_USES_ALSA_AUDIO := false
 # --------------------------------------------------------------------------- #
 # SELinux
 # --------------------------------------------------------------------------- #
-BOARD_SEPOLICY_DIRS += device/keenplus/u2/sepolicy
-# Debug only: append "androidboot.selinux=permissive" to BOARD_KERNEL_CMDLINE.
-# Shipping builds MUST be enforcing.
+# The v0 starter sepolicy (u2_btaudio helper domain) was removed: it tripped
+# 8.1 Treble neverallow checks (nonplat domains may not use their own exec
+# entrypoints / servicemanager binder), and the helper itself is obsolete --
+# v1 runs the patched AOSP Bluetooth stack (bluetooth.default.so + APK).
+# v1 bring-up runs permissive (see BOARD_KERNEL_CMDLINE); a shipping build
+# must add a compliant device policy and re-enable enforcing.
 
 # --------------------------------------------------------------------------- #
 # Misc
