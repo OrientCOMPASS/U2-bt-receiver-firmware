@@ -53,15 +53,24 @@ BOARD_USES_LEGACY_MKBOOTIMG := true
 # --------------------------------------------------------------------------- #
 # Partitions: reuse the baseline 26-partition layout, do NOT touch the GPT (D4)
 # --------------------------------------------------------------------------- #
-BOARD_BOOTIMAGE_PARTITION_SIZE     := 0x1000000      # 16 MiB
-BOARD_RECOVERYIMAGE_PARTITION_SIZE := 0x1000000      # 16 MiB
-BOARD_SYSTEMIMAGE_PARTITION_SIZE   := 0xB8800000     # 2952 MiB
-BOARD_USERDATAIMAGE_PARTITION_SIZE := 0xC0000000     # 3 GiB
-BOARD_CACHEIMAGE_PARTITION_SIZE    := 0x19000000     # 400 MiB
-BOARD_FLASH_BLOCK_SIZE             := 0x20000        # scatter block_size (128 KiB)
+# DECIMAL values only: make_ext4fs parses `-l` with a base-10 strtoull and
+# chokes on 0x... ("filesystem size too small"); inline comments are also
+# banned here because make keeps the trailing whitespace in the value.
+# boot / recovery: 16 MiB
+BOARD_BOOTIMAGE_PARTITION_SIZE     := 16777216
+BOARD_RECOVERYIMAGE_PARTITION_SIZE := 16777216
+# system: 2952 MiB (0xB8800000)
+BOARD_SYSTEMIMAGE_PARTITION_SIZE   := 3095396352
+# userdata: 3 GiB (0xC0000000)
+BOARD_USERDATAIMAGE_PARTITION_SIZE := 3221225472
+# cache: 400 MiB (0x19000000)
+BOARD_CACHEIMAGE_PARTITION_SIZE    := 419430400
+# scatter block_size 128 KiB (0x20000)
+BOARD_FLASH_BLOCK_SIZE             := 131072
 TARGET_USERIMAGES_USE_EXT4 := true
 BOARD_CACHEIMAGE_FILE_SYSTEM_TYPE := ext4
-BOARD_SYSTEMIMAGE_JOURNAL_SIZE := 0                  # save space
+# save space:
+BOARD_SYSTEMIMAGE_JOURNAL_SIZE := 0
 # Goal: actual /system content <= 620 MiB (R1).  A small inode count keeps the
 # ext4 metadata overhead down for a trimmed system.
 BOARD_SYSTEMIMAGE_EXT4_INODE_COUNT := 65536
@@ -69,7 +78,8 @@ BOARD_SYSTEMIMAGE_EXT4_INODE_COUNT := 65536
 # --------------------------------------------------------------------------- #
 # Non-Treble (D4)
 # --------------------------------------------------------------------------- #
-TARGET_NO_VENDOR_IMAGE := true                       # vendor lives under system/vendor
+# vendor lives under system/vendor:
+TARGET_NO_VENDOR_IMAGE := true
 BOARD_VNDK_VERSION :=                                # empty == non-Treble
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +92,8 @@ TARGET_HW_DISK_ENCRYPTION := false
 # Graphics: legacy HAL + HWC2 passthrough (D3)
 # --------------------------------------------------------------------------- #
 TARGET_USES_HWC2 := true
-NUM_FRAMEBUFFER_SURFACE_BUFFERS := 2                 # 3 wastes ~8 MiB/frame; 2 is enough for a 3" panel
+# 3 buffers waste ~8 MiB/frame; 2 is enough for a 3" panel:
+NUM_FRAMEBUFFER_SURFACE_BUFFERS := 2
 TARGET_FORCE_HWC_FOR_VIRTUAL_DISPLAYS := false
 TARGET_RUNNING_WITHOUT_SYNC_FRAMEWORK := false
 BOARD_HAS_FLIPPED_SCREEN := false
@@ -94,7 +105,8 @@ MAX_VIRTUAL_DISPLAY_DIMENSION := 0
 BOARD_HAVE_BLUETOOTH := true
 BOARD_HAVE_BLUETOOTH_MTK := true
 BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := device/keenplus/u2
-BOARD_BLUETOOTH_BDROID_HCILP_INCLUDED := 0           # save power (plan section 16.6)
+# save power (plan section 16.6):
+BOARD_BLUETOOTH_BDROID_HCILP_INCLUDED := 0
 
 # --------------------------------------------------------------------------- #
 # Audio (MTK tinyalsa path)
@@ -116,7 +128,8 @@ BOARD_USES_ALSA_AUDIO := false
 # Misc
 # --------------------------------------------------------------------------- #
 TARGET_NO_RECOVERY := false
-TARGET_NO_RADIOIMAGE := true                         # no modem (non-goal, plan section 9)
+# no modem (non-goal, plan section 9):
+TARGET_NO_RADIOIMAGE := true
 BOARD_HAS_NO_SELECT_BUTTON := true
 TARGET_RECOVERY_PIXEL_FORMAT := "RGBA_8888"
 
