@@ -131,7 +131,7 @@ jobs:
           # the stock kernel must survive byte-identical
           rm -rf "$RUNNER_TEMP/nboot"
           python3 scripts/mtk_bootimg.py unpack "$BUILD_OUT/boot.img" "$RUNNER_TEMP/nboot"
-          GOT=$(md5sum "$RUNNER_TEMP/nboot/kernel" | cut -d' ' -f1)
+          GOT=$(md5sum "$RUNNER_TEMP/nboot/kernel.bin" | cut -d' ' -f1)
           echo "kernel md5: $GOT (want $KERNEL_MD5)"
           test "$GOT" = "$KERNEL_MD5"
           rm -rf "$RUNNER_TEMP/nboot"
