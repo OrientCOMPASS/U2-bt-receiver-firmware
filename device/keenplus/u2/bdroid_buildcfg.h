@@ -25,33 +25,21 @@
  */
 #define USE_AUDIO_TRACK
 
-/* ---- Disable unused profiles: saves RAM and startup time (R3/R5/R9) ---- */
-#define BTIF_HF_CLIENT_INCLUDED   FALSE      /* HFP Client (no hands-free) */
-#define BTA_HF_CLIENT_INCLUDED    FALSE
-#define BTIF_HH_INCLUDED          FALSE      /* HID Host */
-#define BTA_HH_INCLUDED           FALSE
-#define BTA_HL_INCLUDED           FALSE      /* Health */
-#define BTIF_HL_INCLUDED          FALSE
-#define BTA_MIP_INCLUDED          FALSE
-#define BTIF_MAP_INCLUDED         FALSE      /* Message Access */
-#define BTA_MAP_INCLUDED          FALSE
-#define BTIF_PAN_INCLUDED         FALSE      /* PAN / BT tethering */
-#define BTA_PAN_INCLUDED          FALSE
-#define SAP_SERVER_INCLUDED       FALSE      /* SIM Access */
-#define BTA_SDP_INCLUDED          FALSE
-#define PBAP_INCLUDED             FALSE      /* Phonebook Access */
-#define BIP_INCLUDED              FALSE      /* Basic Imaging */
-#define DUN_INCLUDED              FALSE      /* Dial-up Networking */
-#define BTA_PR_INCLUDED           FALSE      /* Printer */
-
-/* ---- BLE: not needed by this product; disabling saves ~10-15 MiB + a thread ----
- * If a companion phone app later needs BLE provisioning/remote, flip these back
- * to TRUE and keep GATT.
+/* ---- Profiles: deliberately left at AOSP 8.1 defaults ----
+ * An earlier revision disabled HID Host / HFP Client / Health / MAP / PAN /
+ * PBAP / SDP here.  That does NOT link on 8.1: btif_hh.cc (and friends) have
+ * NO #if guards and reference BTA_Hh* unconditionally, while the bta/hh
+ * sources are internally guarded and compile empty when BTA_HH_INCLUDED is
+ * FALSE -> undefined references at libbluetooth link time (observed on the
+ * real build machine).  BLE_INCLUDED=FALSE is equally unsafe on 8.1 (the
+ * stack only became modular in 9.0).
+ *
+ * Strategy instead: keep the stock compile-time profile set (link-safe,
+ * ~2.1 MiB .so) and disable profiles at RUNTIME through the Bluetooth APK
+ * resource overlay (overlay/packages/apps/Bluetooth/res/values/config.xml)
+ * and bt_stack.conf.  Unused profiles then never start, so the RAM/boot
+ * budgets (R3/R5/R9) are still met.
  */
-#define BLE_INCLUDED              FALSE
-#define BTA_GATT_INCLUDED         FALSE
-#define BTIF_GATT_INCLUDED        FALSE
-#define BTA_BLE_INCLUDED          FALSE
 
 /* ---- Power saving (plan section 16.6) ---- */
 #define BT_HCILP_INCLUDED         FALSE      /* also gated by BOARD_BLUETOOTH_BDROID_HCILP_INCLUDED=0 */
