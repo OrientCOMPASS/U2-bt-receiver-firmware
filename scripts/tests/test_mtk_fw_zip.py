@@ -97,6 +97,30 @@ class TestRemoteZipLocal(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.rz.read_entry("FW/nope.bin")
 
+    def test_extract_stream_deflated(self):
+        dest = os.path.join(self.tmp, "stream_sys.img")
+        n = self.rz.extract_stream("FW/system.img", dest, chunk=4096)
+        self.assertEqual(n, 200000)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"\x00" * 200000)
+
+    def test_extract_stream_stored(self):
+        dest = os.path.join(self.tmp, "stream_lk.bin")
+        n = self.rz.extract_stream("FW/lk.bin", dest, chunk=100)
+        self.assertEqual(n, 600)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"LKDATA" * 100)
+
+    def test_stream_matches_read_entry(self):
+        dest = os.path.join(self.tmp, "stream_scat.txt")
+        self.rz.extract_stream(SCATTER_NAME, dest, chunk=7)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), self.rz.read_entry(SCATTER_NAME))
+
+    def test_extract_stream_missing_raises(self):
+        with self.assertRaises(KeyError):
+            self.rz.extract_stream("FW/nope.bin", os.path.join(self.tmp, "x"))
+
 
 class TestHuman(unittest.TestCase):
     def test_human_sizes(self):

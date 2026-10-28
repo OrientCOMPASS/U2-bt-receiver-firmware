@@ -237,6 +237,58 @@ class RemoteZip:
             f.write(data)
         return len(data)
 
+    def extract_stream(self, name: str, dest: str, chunk: int = 8 << 20) -> int:
+        """Extract an entry to a file with bounded memory.
+
+        Same result as extract(), but reads the compressed stream in chunks
+        and inflates incrementally -- required for multi-gigabyte entries
+        (e.g. the baseline's 2.46 GiB deflated system.img) that must never
+        be held in RAM whole.  Verifies the uncompressed size on completion.
+        """
+        e = self.entries.get(name)
+        if e is None:
+            raise KeyError(f"no such entry: {name}")
+        lfh = self.src.read(e.local_off, 30)
+        sig = struct.unpack("<I", lfh[:4])[0]
+        if sig != LFH_SIG:
+            raise ValueError(f"bad local header for {name}")
+        nlen, elen = struct.unpack("<HH", lfh[26:30])
+        data_off = e.local_off + 30 + nlen + elen
+        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+        written = 0
+        consumed = 0
+        if e.method == 0:
+            with open(dest, "wb") as f:
+                while consumed < e.comp_size:
+                    buf = self.src.read(data_off + consumed,
+                                        min(chunk, e.comp_size - consumed))
+                    if not buf:
+                        raise ValueError(f"unexpected EOF in stored entry {name}")
+                    f.write(buf)
+                    consumed += len(buf)
+                    written += len(buf)
+        elif e.method == 8:
+            d = zlib.decompressobj(-15)
+            with open(dest, "wb") as f:
+                while consumed < e.comp_size:
+                    buf = self.src.read(data_off + consumed,
+                                        min(chunk, e.comp_size - consumed))
+                    if not buf:
+                        raise ValueError(f"unexpected EOF in deflated entry {name}")
+                    consumed += len(buf)
+                    out = d.decompress(buf)
+                    f.write(out)
+                    written += len(out)
+                tail = d.flush()
+                if tail:
+                    f.write(tail)
+                    written += len(tail)
+        else:
+            raise ValueError(f"unsupported compression method {e.method} for {name}")
+        if written != e.uncomp_size:
+            raise ValueError(f"size mismatch for {name}: {written} != {e.uncomp_size}")
+        return written
+
     def find_scatter(self) -> Optional[str]:
         for n in self.names():
             low = n.lower()
