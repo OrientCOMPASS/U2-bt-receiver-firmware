@@ -345,12 +345,19 @@ def check_ext4(raw, block_size_hint: int | None = None) -> dict:
 
 
 def check_ext4_size(raw_path: str, actual_size: int) -> dict:
-    """Validate that the ext4 superblock's block count matches ``actual_size``."""
+    """Validate the ext4 superblock against the container size.
+
+    The filesystem may legitimately be SMALLER than the image: ODM builds
+    pad the partition-sized sparse image with zeros past the end of the
+    fs (the baseline system.img is exactly this shape: fs 3,047,079,936 B
+    inside a 3,095,396,352 B / 2952 MiB partition).  Only an fs LARGER
+    than its container means truncation/corruption.
+    """
     info = check_ext4(raw_path)
-    if info["implied_size"] != actual_size:
+    if info["implied_size"] > actual_size:
         raise ValueError(
-            "ext4 s_blocks_count_lo*block_size = %d != actual output size %d"
-            % (info["implied_size"], actual_size)
+            "ext4 s_blocks_count_lo*block_size = %d > actual output size %d "
+            "(image truncated?)" % (info["implied_size"], actual_size)
         )
     return info
 

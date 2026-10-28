@@ -298,11 +298,18 @@ class TestExt4Validation(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.check_ext4(bytes(raw))
 
-    def test_check_ext4_size_mismatch(self):
+    def test_check_ext4_size_truncated_raises(self):
         raw = self._make_ext4_image(4)
         with self.assertRaises(ValueError):
-            # claim the image is a different size than the superblock implies
-            m.check_ext4_size(io.BytesIO(raw), 999999)
+            # container smaller than the fs implies -> truncated image
+            m.check_ext4_size(io.BytesIO(raw), 4096)
+
+    def test_check_ext4_size_trailing_padding_ok(self):
+        # the real baseline shape: fs smaller than the partition container
+        # (zero padding past the end of the filesystem is legitimate)
+        raw = self._make_ext4_image(4)
+        info = m.check_ext4_size(io.BytesIO(raw), 4 * BLOCK + 1234 * BLOCK)
+        self.assertEqual(info["implied_size"], 4 * BLOCK)
 
     def test_expected_size_enforced(self):
         data = os.urandom(BLOCK * 3)
