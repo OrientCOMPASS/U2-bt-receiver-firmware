@@ -424,6 +424,32 @@ def cmd_disable_verity(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sign(args: argparse.Namespace) -> int:
+    """Append a CMS signature tail (stock shape) to an existing boot image.
+
+    Used for the v1 u2-target build: mkbootimg output carries no signature
+    tail, while the ODM stock boot is CMS-signed with the public AOSP
+    testkey.  If lk enforces signature presence/verification, an unsigned
+    boot would be rejected -- signing reproduces the stock shape.  Any
+    existing tail is stripped first so signing is idempotent.
+    """
+    data = open(args.image, "rb").read()
+    h = parse_boot(data)
+    body = data[:int(h["body_end"])]  # type: ignore[arg-type]
+    tail = sign_body(body, args.pk8, args.x509)
+    out = body + tail
+    h2 = parse_boot(out)
+    assert bytes(h2["kernel"]) == bytes(h["kernel"]), "kernel changed"     # type: ignore
+    assert bytes(h2["ramdisk"]) == bytes(h["ramdisk"]), "ramdisk changed"  # type: ignore
+    assert check_tail_parses(tail), "signature tail not valid DER"
+    with open(args.out, "wb") as f:
+        f.write(out)
+    log(f"wrote {args.out}: {len(out)}B "
+        f"(body={len(body)}B, tail={len(tail)}B, "
+        f"old tail {len(data) - len(body)}B replaced)")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -445,6 +471,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     d.add_argument("--fstab-glob", default="fstab*",
                    help="ramdisk fstab file glob (default: fstab*)")
     d.set_defaults(fn=cmd_disable_verity)
+
+    s = sub.add_parser("sign",
+                       help="append a stock-shape CMS signature tail to a boot image")
+    s.add_argument("image")
+    s.add_argument("out")
+    s.add_argument("--pk8", required=True,
+                   help="signing key (DER PKCS#8, e.g. AOSP testkey.pk8)")
+    s.add_argument("--x509", required=True,
+                   help="signing cert (PEM, e.g. AOSP testkey.x509.pem)")
+    s.set_defaults(fn=cmd_sign)
 
     args = ap.parse_args(argv)
     if args.cmd == "disable-verity" and not args.no_sign:

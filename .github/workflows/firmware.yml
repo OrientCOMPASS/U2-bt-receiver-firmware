@@ -116,6 +116,37 @@ jobs:
           fi
           echo "FW_MODE=$MODE" >> "$GITHUB_ENV"
 
+      - name: Sign the built boot/recovery with the AOSP testkey (v1 only)
+        if: env.FW_MODE == 'v1'
+        run: |
+          set -euo pipefail
+          # The stock boot.img carries a CMS signature tail signed with the
+          # public AOSP testkey (verified against the baseline).  mkbootimg
+          # output from the u2 build has no tail; if lk enforces signature
+          # presence the unsigned boot would be rejected.  Sign with the same
+          # key to reproduce the stock shape.  Best effort for recovery: the
+          # baseline recovery.img is an MTK blob, so only sign if it parses
+          # as an ANDROID! image.
+          mkdir -p "$RUNNER_TEMP/keys"
+          for f in testkey.pk8 testkey.x509.pem; do
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://android.googlesource.com/platform/build/+/refs/tags/android-8.1.0_r80/target/product/security/${f}?format=TEXT" \
+              | base64 -d > "$RUNNER_TEMP/keys/$f"
+          done
+          BO="$RUNNER_TEMP/build_out"
+          python3 scripts/mtk_bootimg.py sign "$BO/boot.img" "$BO/boot.signed" \
+            --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
+            --x509 "$RUNNER_TEMP/keys/testkey.x509.pem"
+          mv "$BO/boot.signed" "$BO/boot.img"
+          if head -c8 "$BO/recovery.img" | grep -q ANDROID!; then
+            python3 scripts/mtk_bootimg.py sign "$BO/recovery.img" "$BO/recovery.signed" \
+              --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
+              --x509 "$RUNNER_TEMP/keys/testkey.x509.pem"
+            mv "$BO/recovery.signed" "$BO/recovery.img"
+          else
+            echo "[fw] recovery.img is not an ANDROID! image; leaving as-is"
+          fi
+
       - name: Hybrid repack (scatter + MTK-private parts + built system)
         run: |
           set -euo pipefail

@@ -146,6 +146,26 @@ class TestDisableVerity(unittest.TestCase):
         self.assertEqual(h["tail"], b"")
         self.assertEqual(h["kernel"], self.kernel)
 
+    def test_sign_subcommand(self):
+        # an unsigned image (like mkbootimg output from the v1 u2 build)
+        # gains a stock-shape CMS tail; kernel/ramdisk untouched; idempotent
+        unsigned = os.path.join(self.tmp, "boot_unsigned.img")
+        self._run_cli("disable-verity", self.boot, unsigned, "--no-sign")
+        signed = os.path.join(self.tmp, "boot_signed.img")
+        self._run_cli("sign", unsigned, signed,
+                      "--pk8", self.pk8, "--x509", self.x509)
+        h = mb.parse_boot(open(signed, "rb").read())
+        self.assertEqual(h["kernel"], self.kernel)
+        self.assertGreater(len(h["tail"]), 0)
+        self.assertTrue(mb.check_tail_parses(bytes(h["tail"])))
+        resigned = os.path.join(self.tmp, "boot_resigned.img")
+        self._run_cli("sign", signed, resigned,
+                      "--pk8", self.pk8, "--x509", self.x509)
+        h2 = mb.parse_boot(open(resigned, "rb").read())
+        self.assertEqual(h2["kernel"], self.kernel)
+        self.assertEqual(h2["ramdisk"], h["ramdisk"])
+        self.assertEqual(len(h2["tail"]), len(h["tail"]))
+
 
 class TestParseGuards(unittest.TestCase):
     def test_rejects_non_boot(self):
