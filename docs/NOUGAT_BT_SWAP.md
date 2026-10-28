@@ -132,6 +132,30 @@ harness 目标一致。
 （92KB：`report.json` + 19 库×导出/未定义符号表 37 份）、
 `baseline-bt-extracted`（16.4MB：B3 真链接输入的全部 .so）。
 
+### 4.2 B4 彩排实测（2026-10-28，run 40713604032）：8.1 产物直接被符号门否决
+
+`swapfw.yml` 全流水线上机彩排（stream 解包 2.46 GiB 基线 system →
+sparse→raw → loop-mount → 符号门 → …）。**boot 重打包链路全绿**：
+`mtk_bootimg.py disable-verity` 在 CI 上与沙箱产出逐字节一致
+（8,746,670 B，kernel md5 与原厂一致，fstab `verify` 旗标移除，CMS
+testkey 重签）；确定性由 `--renumber-inodes` + 归档 mtime 恢复保证。
+
+**符号门按设计拦截了 8.1 通用构建的 `bluetooth.default.so`**：
+
+```
+[gate] FAIL: NEEDED libs absent from baseline /system:
+  ['android.hardware.bluetooth@1.0.so', 'libaudioclient.so',
+   'libhidlbase.so', 'libhidltransport.so', 'libhwbinder.so',
+   'libtinyxml2.so']
+```
+
+即 §3 注意事项的实锤：8.1（Treble 世代）产物 DT_NEEDED 了 HIDL 运行时
+（`android.hardware.bluetooth@1.0` / `libhidl*` / `libhwbinder`）与 8.1 的
+`libaudioclient`，这些在 7.0 基线 `/system` 里**不存在**，dlopen 必失败。
+结论：**full 换芯只能用 B2（7.0 源码移植 + 独立编译）的产物**；`swapfw.yml`
+的 full 模式保留符号门作为强制闸门，`bootonly` 模式（原厂 system +
+verity-off 重签 boot）先行上机验证 lk/init 是否接受重签 boot。
+
 ## 5. 风险与对策
 
 | # | 风险 | 对策 |

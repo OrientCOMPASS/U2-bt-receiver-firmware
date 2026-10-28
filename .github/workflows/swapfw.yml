@@ -1,48 +1,68 @@
 # --------------------------------------------------------------------------- #
-# swapfw.yml -- route ① "nswap": official 7.0 system.img with only the
-#               Bluetooth HAL replaced by the 8.1-built bluetooth.default.so.
+# swapfw.yml -- route ① "nswap" firmware surgery on the official 7.0 image.
 #
-# Pipeline (all in CI, no build machine needed):
-#   * baseline zip (release 'base_firmware') -- range-fetch boot.img,
-#     recovery.img and the 2.46 GiB sparse system.img (streamed, never in RAM)
-#   * boot.img: repack the ramdisk fstab with dm-verity 'verify' removed and
-#     re-sign the CMS tail with the AOSP testkey (the key the stock boot is
-#     already signed with -- scripts/mtk_bootimg.py, 5/5 unit tests green)
-#   * system.img: sparse -> raw -> loop-mount -> swap
-#     /system/lib/hw/bluetooth.default.so (SELinux xattr + mode preserved)
-#     -> symbol gate (every NEEDED lib and every hard undefined symbol of the
-#     8.1 .so must resolve against baseline 7.0 /system libraries)
-#     -> e2fsck -> re-sparsify
-#   * repack_firmware.py: scatter + MTK-private parts from the baseline
-#   * publish to release 'firmware-nswap-v0-<date>' (prerelease)
+# Two modes (workflow_dispatch input):
+#   bootonly -- stock system.img untouched + boot.img repacked with the
+#               dm-verity 'verify' flag removed and re-signed with the AOSP
+#               testkey (the key the stock boot is already signed with).
+#               Device-side proof that lk/init accept the repacked boot.
+#   full     -- additionally loop-mount the system image, symbol-gate a
+#               candidate bluetooth.default.so against the baseline 7.0
+#               libraries and swap it in (SELinux xattr + mode preserved).
+#               The gate run of 2026-10-28 (run 40713604032) PROVED the 8.1
+#               HAL .so cannot load on 7.0: it NEEDs the HIDL runtime
+#               (android.hardware.bluetooth@1.0, libhidlbase, libhwbinder,
+#               libhidltransport) + libaudioclient + libtinyxml2, none of
+#               which exist in the baseline /system. 'full' mode therefore
+#               requires a B2-built (7.0-port) .so; the gate stays in place
+#               to enforce that.
 #
-# Manual trigger only (workflow_dispatch).
+# Shared machinery: stream-extraction of the 2.46 GiB baseline system.img,
+# sparse<->raw conversion, scripts/mtk_bootimg.py boot repack (5/5 unit
+# tests), repack_firmware.py + official scatter validation, release publish.
 # --------------------------------------------------------------------------- #
 name: nswap-firmware
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'bootonly = verity-off boot + stock system; full = also swap the BT HAL (needs a 7.0-compatible .so)'
+        type: choice
+        options:
+          - bootonly
+          - full
+        default: bootonly
       fw_tag:
-        description: 'Release tag to publish the nswap firmware zip under'
-        default: 'firmware-nswap-v0-20261028'
-        required: true
+        description: 'Release tag to publish under (empty = auto: firmware-bootonly-<date> / firmware-nswap-<date>)'
+        required: false
+        default: ''
       pkg_name:
         description: 'Package (folder/zip base) name'
-        default: 'U2_7.0_BTswap_v0'
+        default: 'U2_7.0_nswap'
         required: true
+      bt_so_release:
+        description: 'full mode: release tag holding the candidate bluetooth.default.so'
+        default: 'build-8.1.0_r80-eng-20261028'
+        required: false
+      bt_so_asset:
+        description: 'full mode: asset name of the candidate .so'
+        default: 'bluetooth.default.so'
+        required: false
 
 env:
   BASELINE_URL: >-
     https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/download/base_firmware/B04_35_1.5_8_3inch_M304_ST7701SN_20251016.zip
-  BUILD_RELEASE_TAG: build-8.1.0_r80-eng-20261028
-  FW_TAG: ${{ inputs.fw_tag }}
+  MODE: ${{ inputs.mode }}
+  FW_TAG_IN: ${{ inputs.fw_tag }}
   PKG: ${{ inputs.pkg_name }}
+  BT_RELEASE: ${{ inputs.bt_so_release }}
+  BT_ASSET: ${{ inputs.bt_so_asset }}
   KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
 
 jobs:
   nswap:
-    name: Swap BT HAL into 7.0 system & repack boot
+    name: nswap (${{ inputs.mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -77,15 +97,16 @@ jobs:
           ls -l "$RUNNER_TEMP/keys"
           openssl x509 -in "$RUNNER_TEMP/keys/testkey.x509.pem" -noout -subject
 
-      - name: Download 8.1 bluetooth.default.so from the build release
+      - name: Download candidate bluetooth.default.so (full mode)
+        if: env.MODE == 'full'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/new"
           rel_json=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$BUILD_RELEASE_TAG")
-          id=$(echo "$rel_json" | python3 -c "import json,sys; print(next((a['id'] for a in json.load(sys.stdin)['assets'] if a['name']=='bluetooth.default.so'),0))")
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$BT_RELEASE")
+          id=$(echo "$rel_json" | python3 -c "import json,sys,os; print(next((a['id'] for a in json.load(sys.stdin)['assets'] if a['name']==os.environ['BT_ASSET']),0))")
           test "$id" != "0"
           curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
@@ -95,7 +116,7 @@ jobs:
           md5sum "$RUNNER_TEMP/new/bluetooth.default.so"
           readelf -d "$RUNNER_TEMP/new/bluetooth.default.so" | grep NEEDED
 
-      - name: Stream-extract baseline boot.img + system.img + recovery.img
+      - name: Stream-extract baseline boot.img + recovery.img (+ system.img)
         run: |
           set -euo pipefail
           BASE="$RUNNER_TEMP/baseline"; mkdir -p "$BASE"
@@ -106,13 +127,20 @@ jobs:
           import repack_firmware as rf
           base = os.path.join(os.environ["RUNNER_TEMP"], "baseline")
           rz = mtk_fw_zip.RemoteZip(os.environ["BASELINE_URL"])
-          for fn, dest in (("boot.img", "boot.img"),
-                           ("system.img", "system.sparse.img")):
+          wanted = [("boot.img", "boot.img")]
+          if os.environ["MODE"] == "full":
+              wanted.append(("system.img", "system.sparse.img"))
+          for fn, dest in wanted:
               entry = rf.find_entry_by_basename(rz, fn)
               if entry is None:
                   raise FileNotFoundError(f"baseline zip has no {fn}")
               n = rz.extract_stream(entry, os.path.join(base, dest))
               print(f"[nswap] {fn}: {n} bytes", flush=True)
+          if os.environ["MODE"] == "bootonly":
+              # pass the stock sparse system through untouched
+              entry = rf.find_entry_by_basename(rz, "system.img")
+              n = rz.extract_stream(entry, os.path.join(base, "system.passthrough.img"))
+              print(f"[nswap] system.img (passthrough): {n} bytes", flush=True)
           n = rf.fetch_private(rz, "recovery.img", os.path.join(base, "recovery.img"))
           print(f"[nswap] recovery.img: {n} bytes")
           rz.close()
@@ -135,8 +163,10 @@ jobs:
           echo "kernel md5: $GOT (want $KERNEL_MD5)"
           test "$GOT" = "$KERNEL_MD5"
           rm -rf "$RUNNER_TEMP/nboot"
+          cp "$RUNNER_TEMP/baseline/recovery.img" "$BUILD_OUT/recovery.img"
 
-      - name: Convert sparse system to raw
+      - name: Convert sparse system to raw (full mode)
+        if: env.MODE == 'full'
         run: |
           set -euo pipefail
           python3 scripts/mtk_sparse2raw.py \
@@ -145,7 +175,8 @@ jobs:
           rm -f "$RUNNER_TEMP/baseline/system.sparse.img"
           ls -l "$RUNNER_TEMP/baseline/system.raw.img"
 
-      - name: Loop-mount, symbol-gate, swap bluetooth.default.so
+      - name: Loop-mount, symbol-gate, swap bluetooth.default.so (full mode)
+        if: env.MODE == 'full'
         run: |
           set -euo pipefail
           NEW="$RUNNER_TEMP/new/bluetooth.default.so"
@@ -160,8 +191,8 @@ jobs:
           fi
           ls -l "$OLD"
           LABEL=$(sudo getfattr -n security.selinux --only-values "$OLD" 2>/dev/null || true)
-          MODE=$(stat -c %a "$OLD")
-          echo "[nswap] old mode=$MODE selinux=[$LABEL]"
+          MODEBITS=$(stat -c %a "$OLD")
+          echo "[nswap] old mode=$MODEBITS selinux=[$LABEL]"
 
           # ---- symbol gate (before touching the image) ----
           sudo python3 - "$NEW" /mnt/nswap <<'PY'
@@ -213,7 +244,7 @@ jobs:
           # ---- swap ----
           sudo cp "$NEW" "$OLD"
           sudo chown root:root "$OLD"
-          sudo chmod "$MODE" "$OLD"
+          sudo chmod "$MODEBITS" "$OLD"
           if [ -n "$LABEL" ]; then sudo setfattr -n security.selinux -v "$LABEL" "$OLD"; fi
           GOT=$(md5sum "$OLD" | cut -d' ' -f1)
           WANT=$(md5sum "$NEW" | cut -d' ' -f1)
@@ -223,13 +254,21 @@ jobs:
           sync
           sudo umount /mnt/nswap
 
-      - name: e2fsck + re-sparsify system.img
+      - name: e2fsck + re-sparsify system.img (full mode)
+        if: env.MODE == 'full'
         run: |
           set -euo pipefail
           sudo e2fsck -fn "$RUNNER_TEMP/baseline/system.raw.img" || true
           img2simg "$RUNNER_TEMP/baseline/system.raw.img" "$RUNNER_TEMP/build_out/system.img" 4096
           rm -f "$RUNNER_TEMP/baseline/system.raw.img"
-          cp "$RUNNER_TEMP/baseline/recovery.img" "$RUNNER_TEMP/build_out/recovery.img"
+          ls -l "$RUNNER_TEMP/build_out"
+
+      - name: Pass through the stock system.img (bootonly mode)
+        if: env.MODE == 'bootonly'
+        run: |
+          set -euo pipefail
+          mv "$RUNNER_TEMP/baseline/system.passthrough.img" \
+             "$RUNNER_TEMP/build_out/system.img"
           ls -l "$RUNNER_TEMP/build_out"
 
       - name: Assemble package (scatter + MTK-private parts from baseline)
@@ -252,46 +291,59 @@ jobs:
           ls -l "$CHK/$PKG"
           rm -rf "$CHK"
 
-      - name: Publish the nswap firmware zip
+      - name: Publish the firmware zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/NOTES.md" <<'NOTES'
-          KeenPlus U2 -- **nswap v0** (route ① / B1 swap): official Android 7.0
-          firmware with only the Bluetooth HAL replaced by the AOSP 8.1 build.
+          DATE=$(date +%Y%m%d)
+          if [ "$MODE" = "bootonly" ]; then
+            FW_TAG="${FW_TAG_IN:-firmware-bootonly-$DATE}"
+            NAME="U2 bootonly v0: stock 7.0 + verity-off repacked boot"
+            cat > "$RUNNER_TEMP/NOTES.md" <<'NOTES'
+          KeenPlus U2 -- **bootonly v0**: official Android 7.0 firmware with
+          ONLY the boot image repacked. Purpose: on-device proof that the
+          bootloader (lk) and init accept our repacked + re-signed boot before
+          we invest further in route ① image surgery.
 
-          * `system.img`: baseline 7.0 system, `/system/lib/hw/bluetooth.default.so`
-            swapped with the 8.1-built HAL (release `build-8.1.0_r80-eng-20261028`,
-            carrying system_bt 0001-0005 + hardware/libhardware 0001). SELinux
-            label, mode and ownership preserved; fsck clean; re-sparsified.
-          * Symbol gate (CI): every NEEDED library and every hard undefined
-            symbol of the 8.1 `.so` was verified to resolve against the baseline
-            7.0 `/system/lib*` -- see the run log for the gate output.
-          * `boot.img`: repacked from the stock image -- ramdisk fstab
-            `/system ... ro wait,verify` -> `ro wait` (dm-verity off, required
-            because system was modified), kernel byte-identical to stock
-            (md5 `4128dc54373f68008afd1eb6ed25c105`), CMS signature tail
-            regenerated with the AOSP testkey -- the same public key the stock
-            boot is signed with.
-          * `recovery.img` and all MTK-private parts (preloader/lk/logo/secro/
+          * `boot.img`: rebuilt from the stock image -- ramdisk fstab
+            `/system ... ro wait,verify` -> `ro wait` (dm-verity flag off),
+            kernel byte-identical to stock (md5 `4128dc54373f68008afd1eb6ed25c105`),
+            deterministic cpio repack (archived inodes renumbered, original
+            mtimes restored), CMS signature tail regenerated with the AOSP
+            testkey -- the same public key the stock boot is signed with.
+          * `system.img`: **stock baseline sparse image, byte-for-byte
+            unmodified** (with the verity flag removed from the fstab but the
+            system itself pristine, nothing can fail verification).
+          * `recovery.img` + all MTK-private parts (preloader/lk/logo/secro/
             tee/nvram/...): untouched from the official baseline zip.
-          * scatter: unmodified official MT6735M scatter; package validated
-            against it.
+          * scatter: unmodified official MT6735M scatter; package validated.
+
+          **Expected result:** the device boots normally to the stock 7.0 home
+          screen, Bluetooth included (everything is stock except the boot
+          ramdisk fstab flag and the signature tail).
 
           **Flash:** SP Flash Tool, load the scatter, "Download Only" or
-          "Firmware Upgrade". **Rescue:** reflash the official baseline zip the
-          same way (never Format; never touch nvram).
+          "Firmware Upgrade". **Rescue:** reflash the official baseline zip
+          (never Format; never touch nvram).
 
-          **Caveat:** this release proves the swap pipeline end-to-end and
-          should boot to the stock 7.0 home screen with the 8.1 BT HAL loaded
-          (watch `logcat -b all | grep -i bluetooth`). Full 8.1 framework
-          features remain the goal of route ② (u2 device-target build, v1).
-          If the device hangs at the logo, the likely suspect is the
-          regenerated boot signature tail (openssl CMS vs lk's expectation);
-          a `--no-sign` boot variant is the prepared fallback.
+          **If it hangs at the logo anyway:** the suspect is the regenerated
+          signature tail (openssl CMS shape vs what lk expects). The prepared
+          fallback is a `--no-sign` boot variant (mtk_bootimg.py supports it).
           NOTES
+          else
+            FW_TAG="${FW_TAG_IN:-firmware-nswap-$DATE}"
+            NAME="U2 nswap: 7.0 system + swapped BT HAL"
+            cat > "$RUNNER_TEMP/NOTES.md" <<'NOTES'
+          KeenPlus U2 -- **nswap** (route ①): official Android 7.0 firmware,
+          `/system/lib/hw/bluetooth.default.so` swapped (symbol-gated against
+          the baseline libraries in CI), boot repacked verity-off + re-signed
+          with the AOSP testkey, everything else stock. See the CI run log for
+          the gate output. Flash via SP Flash Tool (scatter, "Download Only");
+          rescue = reflash the baseline zip.
+          NOTES
+          fi
           python3 scripts/publish_release.py \
-            --tag "$FW_TAG" --name "U2 nswap v0: 7.0 system + 8.1 BT HAL" \
+            --tag "$FW_TAG" --name "$NAME" \
             --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
             --files "$RUNNER_TEMP/$PKG.zip"
