@@ -24,13 +24,26 @@ name: firmware
 
 on:
   workflow_dispatch:
+    inputs:
+      build_tag:
+        description: 'Release tag holding the built image assets (system.img.xz [+ boot/recovery.img.xz for v1])'
+        default: 'build-8.1.0_r80-eng-20261028'
+        required: true
+      fw_tag:
+        description: 'Release tag to publish the firmware zip under'
+        default: 'firmware-hybrid-v0-20261028'
+        required: true
+      pkg_name:
+        description: 'Package (folder/zip base) name'
+        default: 'U2_AOSP81_hybrid_v0'
+        required: true
 
 env:
   BASELINE_URL: >-
     https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/download/base_firmware/B04_35_1.5_8_3inch_M304_ST7701SN_20251016.zip
-  BUILD_RELEASE_TAG: build-8.1.0_r80-eng-20261028
-  FW_TAG: firmware-hybrid-v0-20261028
-  PKG: U2_AOSP81_hybrid_v0
+  BUILD_RELEASE_TAG: ${{ inputs.build_tag }}
+  FW_TAG: ${{ inputs.fw_tag }}
+  PKG: ${{ inputs.pkg_name }}
 
 jobs:
   package:
@@ -51,29 +64,44 @@ jobs:
       - name: Disk headroom check
         run: df -h "$RUNNER_TEMP" /
 
-      - name: Download system.img.xz from the build release
+      - name: Download built image assets from the build release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           BUILD_OUT="$RUNNER_TEMP/build_out"; mkdir -p "$BUILD_OUT"
-          ASSET_ID=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$BUILD_RELEASE_TAG" \
-            | python3 -c 'import json,sys; print(next(a["id"] for a in json.load(sys.stdin)["assets"] if a["name"]=="system.img.xz"))')
-          echo "asset id: $ASSET_ID"
-          curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" \
-            -o "$RUNNER_TEMP/system.img.xz" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
-          ls -la "$RUNNER_TEMP/system.img.xz"
+          rel_json=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$BUILD_RELEASE_TAG")
+          fetch_asset() {  # $1 = asset name, $2 = dest file; missing asset -> skip
+            local id
+            id=$(echo "$rel_json" | python3 -c "import json,sys; print(next((a['id'] for a in json.load(sys.stdin)['assets'] if a['name']=='$1'),0))")
+            if [ "$id" = "0" ]; then echo "[fw] asset $1: absent"; return 1; fi
+            curl -sfL -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" -o "$2" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$id"
+            echo "[fw] asset $1: $(stat -c%s "$2") bytes"
+          }
+          fetch_asset system.img.xz "$RUNNER_TEMP/system.img.xz"
+          fetch_asset boot.img.xz "$RUNNER_TEMP/boot.img.xz" || true
+          fetch_asset recovery.img.xz "$RUNNER_TEMP/recovery.img.xz" || true
 
-      - name: Unpack system image; fetch baseline boot/recovery into build_out
+      - name: Unpack system image; get boot/recovery (built if present, else baseline)
         run: |
           set -euo pipefail
           BUILD_OUT="$RUNNER_TEMP/build_out"
           xz -dc "$RUNNER_TEMP/system.img.xz" > "$BUILD_OUT/system.img"
           ls -la "$BUILD_OUT/system.img"
-          python3 - <<'PY'
+          MODE=v0
+          for img in boot recovery; do
+            if [ -f "$RUNNER_TEMP/$img.img.xz" ]; then
+              xz -dc "$RUNNER_TEMP/$img.img.xz" > "$BUILD_OUT/$img.img"
+            fi
+          done
+          if [ -f "$BUILD_OUT/boot.img" ] && [ -f "$BUILD_OUT/recovery.img" ]; then
+            MODE=v1; echo "[fw] boot/recovery come from the u2 build (v1)"
+          else
+            echo "[fw] boot/recovery reused from the baseline (v0)"
+            python3 - <<'PY'
           import os, sys
           sys.path.insert(0, "scripts")
           import mtk_fw_zip
@@ -81,9 +109,12 @@ jobs:
           rz = mtk_fw_zip.RemoteZip(os.environ["BASELINE_URL"])
           out = os.path.join(os.environ["RUNNER_TEMP"], "build_out")
           for fn in ("boot.img", "recovery.img"):
-              n = rf.fetch_private(rz, fn, os.path.join(out, fn))
-              print(f"[fw] baseline {fn}: {n} bytes")
+              if not os.path.isfile(os.path.join(out, fn)):
+                  n = rf.fetch_private(rz, fn, os.path.join(out, fn))
+                  print(f"[fw] baseline {fn}: {n} bytes")
           PY
+          fi
+          echo "FW_MODE=$MODE" >> "$GITHUB_ENV"
 
       - name: Hybrid repack (scatter + MTK-private parts + built system)
         run: |
@@ -110,26 +141,36 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [ "${FW_MODE:-v0}" = "v1" ]; then
+            BOOT_LINE="* boot.img / recovery.img: built from the u2 device target
+            (baseline 3.18.35 MTK kernel + matching 8.1 ramdisk)."
+            CAVEAT="Assembled and scatter-validated in CI; on-device boot
+          verification pending."
+          else
+            BOOT_LINE="* boot.img / recovery.img: reused from the official baseline
+            (7.0 MTK)."
+            CAVEAT="**v0 caveat:** 7.0 MTK boot/recovery + 8.1 generic-eng system.
+          Flashable via SP_Flash_Tool (firmware update) for layout/content
+          verification; a bootable daily image requires the v1 u2
+          device-target build."
+          fi
           cat > "$RUNNER_TEMP/NOTES.md" <<NOTES
-          KeenPlus U2 -- AOSP 8.1 hybrid firmware **v0 (engineering)**.
+          KeenPlus U2 -- AOSP 8.1 hybrid firmware (${FW_MODE:-v0}).
 
-          * system.img: AOSP \`android-8.1.0_r80\` \`aosp_arm-eng\` build from the
-            U2 build machine (release \`$BUILD_RELEASE_TAG\`), carrying the full
-            U2 patch series: system_bt 0001-0005 (A2DP AAC sink + pie decoder
+          * system.img: AOSP \`android-8.1.0_r80\` build from the U2 build
+            machine (release \`$BUILD_RELEASE_TAG\`), carrying the full U2
+            patch series: system_bt 0001-0005 (A2DP AAC sink + pie decoder
             backport + SBC/AAC dispatch + SBC-XQ bitpool + SINK_AAC switches),
             hardware/libhardware 0001 (BTAV_A2DP_CODEC_INDEX_SINK_AAC).
-          * boot.img / recovery.img / preloader / lk / logo / secro / tee /
-            cache / userdata: reused from the official baseline
-            (B04_35_1.5_8_3inch_M304_ST7701SN_20251016).
+          $BOOT_LINE
+          * preloader / lk / logo / secro / tee / cache / userdata: reused from
+            the official baseline (B04_35_1.5_8_3inch_M304_ST7701SN_20251016).
           * scatter: unmodified official MT6735M scatter; package validated
             against it (completeness + partition sizes).
 
-          **v0 caveat:** 7.0 MTK boot/recovery + 8.1 generic-eng system.
-          Flashable via SP_Flash_Tool (firmware update) for layout/content
-          verification; a bootable daily image requires the v1 u2
-          device-target build (prebuilt kernel + matching 8.1 ramdisk).
+          $CAVEAT
           NOTES
           python3 scripts/publish_release.py \
-            --tag "$FW_TAG" --name "U2 AOSP 8.1 hybrid firmware v0 (engineering)" \
+            --tag "$FW_TAG" --name "U2 AOSP 8.1 hybrid firmware ${FW_MODE:-v0}" \
             --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
             --files "$RUNNER_TEMP/$PKG.zip"

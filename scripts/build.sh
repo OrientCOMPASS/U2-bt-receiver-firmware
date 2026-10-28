@@ -16,6 +16,7 @@
 # Usage:
 #   build.sh --workdir <dir> --system-image <baseline-system.img> [--jobs N]
 #            [--lunch u2-userdebug|u2-user] [--sync] [--make] [--deep]
+#            [--no-apply]   # tree already carries the patch series
 #   build.sh --workdir <dir> --incremental    # rebuild BT modules + snod only
 #
 # Full build:  --sync (re)downloads sources (shallow by default; --deep for full
@@ -38,6 +39,7 @@ LUNCH="u2-userdebug"
 DO_SYNC=0
 DO_MAKE=0
 DO_INCREMENTAL=0
+NO_APPLY=0   # tree already carries the patch series (e.g. re-run on the build host)
 SHALLOW=1   # --depth=1 repo sync (smaller checkout); pass --deep for full history
 # Modules our patches touch; incremental rebuild recompiles just these + system.img.
 BT_MODULES=(bluetooth.default libbluetooth_jni Bluetooth)
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --lunch)         LUNCH="$2"; shift 2 ;;
         --sync)          DO_SYNC=1; shift ;;
         --make)          DO_MAKE=1; shift ;;
+        --no-apply)      NO_APPLY=1; shift ;;
         --incremental)   DO_INCREMENTAL=1; shift ;;
         --deep)          SHALLOW=0; shift ;;
         -h|--help)       usage ;;
@@ -176,7 +179,11 @@ if [[ "${DO_INCREMENTAL}" == "1" ]]; then
 fi
 [[ "${DO_SYNC}" == "1" ]] && do_sync
 if [[ -n "${WORKDIR}" && -d "${WORKDIR}/system/bt" ]]; then
-    apply
+    if [[ "${NO_APPLY}" == "1" ]]; then
+        log "skipping patch application (--no-apply; tree assumed patched)"
+    else
+        apply
+    fi
     link_trees
     extract
 fi
