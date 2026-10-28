@@ -10,8 +10,6 @@ PRODUCT_PACKAGES += \
     gralloc.mt6735m \
     memtrack.mt6735m \
     libGLES_mali \
-    libGLESv1_CM_mali \
-    libGLESv2_mali \
     libged \
     libgpu_aux \
     libgralloc_extra \
@@ -68,6 +66,7 @@ PRODUCT_PACKAGES += \
 # ---- data files still needing explicit PRODUCT_COPY_FILES ----
 # (firmware / wifi / audio_param etc.; device.mk already copies the
 #  MT6627 firmware -- confirm each of these is handled):
+#   vendor/lib/egl/egl.cfg
 #   vendor/etc/audio_device.xml
 #   vendor/etc/audio_em.xml
 #   vendor/etc/audio_param

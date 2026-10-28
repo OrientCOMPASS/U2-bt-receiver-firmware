@@ -58,28 +58,6 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libGLESv1_CM_mali
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/egl/libGLESv1_CM_mali.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := libGLESv2_mali
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/egl/libGLESv2_mali.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
 LOCAL_MODULE := libged
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
@@ -664,6 +642,7 @@ include $(BUILD_PREBUILT)
 # The following list entries are firmware/config/data, installed
 # via PRODUCT_COPY_FILES (see device.mk and blobs.mk), not as
 # prebuilt modules:
+#   vendor/lib/egl/egl.cfg
 #   vendor/etc/audio_device.xml
 #   vendor/etc/audio_em.xml
 #   vendor/etc/audio_param

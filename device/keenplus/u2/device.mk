@@ -123,6 +123,7 @@ PRODUCT_COPY_FILES += \
 # --------------------------------------------------------------------------- #
 PRODUCT_COPY_FILES += \
     vendor/keenplus/u2/proprietary/vendor/etc/audio_device.xml:vendor/etc/audio_device.xml \
+    vendor/keenplus/u2/proprietary/vendor/lib/egl/egl.cfg:vendor/lib/egl/egl.cfg \
     vendor/keenplus/u2/proprietary/vendor/etc/audio_em.xml:vendor/etc/audio_em.xml \
     vendor/keenplus/u2/proprietary/etc/wifi/wpa_supplicant.conf:system/etc/wifi/wpa_supplicant.conf \
     vendor/keenplus/u2/proprietary/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf \
@@ -160,6 +161,13 @@ PRODUCT_PROPERTY_OVERRIDES += \
 # FM
 PRODUCT_PROPERTY_OVERRIDES += \
     ro.mtk_fm_support=1
+
+# Graphics: 8.1's EGL loader selects libEGL_<ro.hardware.egl>.so (egl.cfg is
+# ignored); the baseline relied on /vendor/lib/egl/egl.cfg ("0 1 mali").
+# The mali DDK aliases are recreated as symlinks by device/keenplus/u2/Android.mk.
+PRODUCT_PROPERTY_OVERRIDES += \
+    ro.hardware.egl=mali \
+    ro.opengles.version=196609
 
 # Boot animation: replaced with a <=400 KiB custom clip (plan section 15.4).
 # The baseline 4.42 MiB bootanimation.zip and the shutanimation.zip are dropped.

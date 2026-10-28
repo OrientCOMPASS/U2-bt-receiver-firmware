@@ -13,8 +13,11 @@ vendor/lib/hw/hwcomposer.mt6735.so
 vendor/lib/hw/gralloc.mt6735m.so
 vendor/lib/hw/memtrack.mt6735m.so
 vendor/lib/egl/libGLES_mali.so
-vendor/lib/egl/libGLESv1_CM_mali.so
-vendor/lib/egl/libGLESv2_mali.so
+# libGLESv1_CM_mali.so / libGLESv2_mali.so / libEGL_mali.so are NOT in the
+# image: on the stock device they were first-boot symlinks onto the single
+# libGLES_mali.so DDK blob.  device/keenplus/u2/Android.mk recreates them as
+# symlinks in the built image.
+vendor/lib/egl/egl.cfg
 vendor/lib/libged.so
 vendor/lib/libgpu_aux.so
 vendor/lib/libgralloc_extra.so
