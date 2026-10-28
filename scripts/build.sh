@@ -113,6 +113,16 @@ link_trees() {
     [[ -n "${WORKDIR}" ]] || { err "--workdir required"; exit 1; }
     local dev="${WORKDIR}/device/keenplus/u2" ven="${WORKDIR}/vendor/keenplus/u2"
     mkdir -p "$(dirname "${dev}")" "$(dirname "${ven}")"
+    # A pre-existing REAL directory defeats ln -sfn (it would create a nested
+    # link inside, giving kati two u2.mk: "Product u2 ambiguous").  Clear it.
+    if [[ -e "${dev}" && ! -L "${dev}" ]]; then
+        log "removing stale real dir ${dev} (will be replaced by a symlink)"
+        rm -rf "${dev}"
+    fi
+    if [[ -e "${ven}" && ! -L "${ven}" ]]; then
+        log "removing stale real dir ${ven} (will be replaced by a symlink)"
+        rm -rf "${ven}"
+    fi
     log "linking device tree -> ${dev}"
     ln -sfn "${REPO_ROOT}/device/keenplus/u2" "${dev}"
     if [[ -d "${REPO_ROOT}/vendor/keenplus/u2" ]]; then
