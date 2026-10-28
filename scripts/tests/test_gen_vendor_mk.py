@@ -41,13 +41,13 @@ class TestClassify(unittest.TestCase):
         self.assertFalse(e.hw)
 
     def test_colliding_name_is_renamed_with_stem(self):
-        # libpower collides with hardware/libhardware_legacy's AOSP module --
-        # renamed module, original install filename preserved via
+        # libtinyxml collides with external/tinyxml's AOSP module -- renamed
+        # module, original install filename preserved via
         # LOCAL_INSTALLED_MODULE_STEM.
-        e = gv.classify("lib/libpower.so")
+        e = gv.classify("lib/libtinyxml.so")
         self.assertEqual(e.kind, "lib")
-        self.assertEqual(e.module, "libpower_u2")
-        self.assertEqual(e.stem, "libpower.so")
+        self.assertEqual(e.module, "libtinyxml_u2")
+        self.assertEqual(e.stem, "libtinyxml.so")
 
     def test_extraction_renamed_file_keeps_runtime_soname(self):
         # libion_mtk is how extract-files.sh stored the baseline

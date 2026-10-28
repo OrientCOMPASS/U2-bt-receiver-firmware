@@ -30,7 +30,6 @@ PRODUCT_PACKAGES += \
     libvc1dec_sa.ca7 \
     libui_ext \
     libgui_ext \
-    libpower_u2 \
     audio.primary.mt6735m \
     audio.usb.mt6735m \
     audio.r_submix.mt6735m \

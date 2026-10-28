@@ -281,18 +281,6 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libpower_u2
-# renamed from libpower: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
-LOCAL_INSTALLED_MODULE_STEM := libpower.so
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/lib/libpower.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
 LOCAL_MODULE := audio.primary.mt6735m
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so

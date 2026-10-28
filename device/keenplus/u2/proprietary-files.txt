@@ -61,7 +61,11 @@ vendor/lib/libvp8dec_sa.ca7.so
 vendor/lib/libvc1dec_sa.ca7.so
 vendor/lib/libui_ext.so
 vendor/lib/libgui_ext.so
-lib/libpower.so
+# lib/libpower.so is NOT extracted: it is byte-for-byte the AOSP
+# hardware/libhardware_legacy power.c shim (nm -D: identical 7 exports --
+# acquire_wake_lock/release_wake_lock/NEW_PATHS/OLD_PATHS), the AOSP module
+# is built for this product anyway, and a second module installing to
+# /system/lib/libpower.so made the AOSP strip step race/fail ("no symbols").
 
 # ---- Audio ----
 vendor/lib/hw/audio.primary.mt6735m.so
