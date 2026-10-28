@@ -8,7 +8,7 @@
 PRODUCT_PACKAGES += \
     hwcomposer.mt6735 \
     gralloc.mt6735m \
-    memtrack.mt6737m \
+    memtrack.mt6735m \
     libGLES_mali \
     libGLESv1_CM_mali \
     libGLESv2_mali \
@@ -46,15 +46,12 @@ PRODUCT_PACKAGES += \
     libbluetooth_relayer \
     libbluetoothem_mtk \
     libbluetooth_hw_test \
-    radio.fm.mt6737m \
-    flp.mt6737m \
+    radio.fm.mt6735m \
     gps.mt6735m \
     lights.mt6735m \
     sensors.mt6735m \
     keystore.mt6735m \
     gatekeeper.mt6735m \
-    power.mt6735m \
-    libSoftGatekeeper \
     libnvram \
     libnvram_daemon_callback \
     libcustom_nvram \
@@ -65,7 +62,6 @@ PRODUCT_PACKAGES += \
     wmt_launcher \
     stp_dump3 \
     mnld \
-    MPED \
     fuelgauged \
     nvram_daemon
 

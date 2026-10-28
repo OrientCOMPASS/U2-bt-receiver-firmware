@@ -35,10 +35,10 @@ LOCAL_MODULE_RELATIVE_PATH := hw
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := memtrack.mt6737m
+LOCAL_MODULE := memtrack.mt6735m
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/hw/memtrack.mt6737m.so
+LOCAL_SRC_FILES := proprietary/vendor/lib/hw/memtrack.mt6735m.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
@@ -118,11 +118,10 @@ LOCAL_MODULE := libion_u2
 LOCAL_MODULE_STEM := libion.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libion.so
+LOCAL_SRC_FILES := proprietary/lib/libion.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -208,11 +207,10 @@ LOCAL_MODULE := libpower_u2
 LOCAL_MODULE_STEM := libpower.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libpower.so
+LOCAL_SRC_FILES := proprietary/lib/libpower.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -378,11 +376,10 @@ LOCAL_MODULE := libtinycompress_u2
 LOCAL_MODULE_STEM := libtinycompress.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libtinycompress.so
+LOCAL_SRC_FILES := proprietary/lib/libtinycompress.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -391,11 +388,10 @@ LOCAL_MODULE := libtinyxml_u2
 LOCAL_MODULE_STEM := libtinyxml.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libtinyxml.so
+LOCAL_SRC_FILES := proprietary/lib/libtinyxml.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -465,22 +461,10 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := radio.fm.mt6737m
+LOCAL_MODULE := radio.fm.mt6735m
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/hw/radio.fm.mt6737m.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-LOCAL_MODULE_RELATIVE_PATH := hw
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := flp.mt6737m
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/hw/flp.mt6737m.so
+LOCAL_SRC_FILES := proprietary/vendor/lib/hw/radio.fm.mt6735m.so
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
@@ -546,29 +530,6 @@ LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=
 LOCAL_VENDOR_MODULE := true
 LOCAL_MODULE_RELATIVE_PATH := hw
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := power.mt6735m
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/hw/power.mt6735m.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-LOCAL_MODULE_RELATIVE_PATH := hw
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := libSoftGatekeeper
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libSoftGatekeeper.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
@@ -673,16 +634,6 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := mnld
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_SRC_FILES := proprietary/vendor/bin/mnld
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := MPED
-LOCAL_MODULE_CLASS := EXECUTABLES
-LOCAL_SRC_FILES := proprietary/vendor/bin/MPED
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
 LOCAL_STRIP_MODULE :=

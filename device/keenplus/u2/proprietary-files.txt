@@ -11,7 +11,7 @@
 # ---- Graphics (legacy HAL + HWC2 passthrough) ----
 vendor/lib/hw/hwcomposer.mt6735.so
 vendor/lib/hw/gralloc.mt6735m.so
-vendor/lib/hw/memtrack.mt6737m.so
+vendor/lib/hw/memtrack.mt6735m.so
 vendor/lib/egl/libGLES_mali.so
 vendor/lib/egl/libGLESv1_CM_mali.so
 vendor/lib/egl/libGLESv2_mali.so
@@ -33,7 +33,9 @@ vendor/lib/libgralloc_extra.so
 # HAL links against the classic tinyalsa C ABI, which AOSP 8.1 provides;
 # device.mk adds libtinyalsa explicitly and the post-extraction dep scan
 # verifies every UND tinyalsa symbol resolves.
-vendor/lib/libion.so
+# NOTE: the next four live in the baseline /system/lib (image path lib/),
+# not /vendor/lib -- verified with debugfs against the stock image.
+lib/libion.so
 vendor/lib/libion_mtk.so
 vendor/lib/libbwc.so
 vendor/lib/libdpframework.so
@@ -41,7 +43,7 @@ vendor/lib/libm4u.so
 vendor/lib/libpq_prot.so
 vendor/lib/libui_ext.so
 vendor/lib/libgui_ext.so
-vendor/lib/libpower.so
+lib/libpower.so
 
 # ---- Audio ----
 vendor/lib/hw/audio.primary.mt6735m.so
@@ -58,8 +60,8 @@ vendor/lib/libaudiomtkdcremoval.so
 vendor/lib/libaed.so
 vendor/lib/libcvsd_mtk.so
 vendor/lib/libmsbc_mtk.so
-vendor/lib/libtinycompress.so
-vendor/lib/libtinyxml.so
+lib/libtinycompress.so
+lib/libtinyxml.so
 vendor/etc/audio_device.xml
 vendor/etc/audio_em.xml
 # audio_param/ is a directory; extract-files.sh copies it wholesale.
@@ -80,14 +82,12 @@ vendor/firmware/WMT_SOC.cfg
 vendor/firmware/WIFI_RAM_CODE_6735
 vendor/firmware/mt6627_fm_v1_coeff.bin
 vendor/firmware/mt6627_fm_v1_patch.bin
-vendor/lib/hw/radio.fm.mt6737m.so
-vendor/lib/hw/flp.mt6737m.so
+vendor/lib/hw/radio.fm.mt6735m.so
 vendor/lib/hw/gps.mt6735m.so
 vendor/bin/wmt_loader
 vendor/bin/wmt_launcher
 vendor/bin/stp_dump3
 vendor/bin/mnld
-vendor/bin/MPED
 etc/wifi/wpa_supplicant.conf
 etc/wifi/p2p_supplicant_overlay.conf
 etc/wifi/wpa_supplicant_overlay.conf
@@ -97,8 +97,6 @@ vendor/lib/hw/lights.mt6735m.so
 vendor/lib/hw/sensors.mt6735m.so
 vendor/lib/hw/keystore.mt6735m.so
 vendor/lib/hw/gatekeeper.mt6735m.so
-vendor/lib/hw/power.mt6735m.so
-vendor/lib/libSoftGatekeeper.so
 vendor/lib/libnvram.so
 vendor/lib/libnvram_daemon_callback.so
 # nvram_daemon DT_NEEDED closure (verified via readelf on the baseline):

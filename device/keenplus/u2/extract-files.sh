@@ -69,6 +69,7 @@ mkdir -p "${VENDOR_OUT}"
 extracted=0
 skipped=0
 dirs=()
+shim64=()
 
 # Classify an image path by parsing `debugfs stat` output.  DO NOT use the
 # exit status of `ls -d`: e2fsprogs 1.42.13 (Ubuntu 16.04) returns 0 for
@@ -159,14 +160,21 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
             echo "[file] ${line} (symlink dereferenced from ${src})"
         fi
         extracted=$((extracted+1))
-        # 32-bit check for ELF shared objects.  EXCEPTION: the lib64/
-        # runtime shim for the AArch64 wmt tools is 64-bit by design (D2).
+        # 32-bit check for shared objects (decision D2).  Exceptions:
+        #  * lib64/  -- the 64-bit runtime shim, ELF64 by design;
+        #  * executables -- the baseline wmt tools (wmt_loader/wmt_launcher/
+        #    stp_dump3) are AArch64 and run through that shim; they are
+        #    listed in shim64 for the summary instead of aborting.
         if [[ "${line}" != lib64/* ]] && readelf -h "${dst}" >/dev/null 2>&1; then
             class="$(readelf -h "${dst}" | awk -F: '/Class:/ {gsub(/ /,"",$2); print $2}')"
             if [[ "${class}" == "ELF64" ]]; then
-                echo "ERROR: ${line} is ELF64 but this port is 32-bit-only (D2)." >&2
-                echo "       Fall back to D2' (keep 64-bit) for this module or find a 32-bit blob." >&2
-                exit 3
+                if [[ "${dst}" == *.so ]]; then
+                    echo "ERROR: ${line} is ELF64 but this port is 32-bit-only (D2)." >&2
+                    echo "       Fall back to D2' (keep 64-bit) for this module or find a 32-bit blob." >&2
+                    exit 3
+                fi
+                echo "  [shim64] ${line} (AArch64 executable; runs via bin/linker64 + lib64/)"
+                shim64+=("${line}")
             fi
         fi
     else
@@ -180,5 +188,8 @@ echo
 echo "[*] Extracted ${extracted} entries into ${VENDOR_OUT} (${skipped} missing/skipped)."
 if [[ ${#dirs[@]} -gt 0 ]]; then
     echo "[*] Directories copied: ${dirs[*]}"
+fi
+if [[ ${#shim64[@]} -gt 0 ]]; then
+    echo "[*] AArch64 executables (run via the bin/linker64 + lib64/ shim): ${shim64[*]}"
 fi
 echo "[*] Next: review vendor/keenplus/u2/ and add prebuilt module makefiles as needed."
