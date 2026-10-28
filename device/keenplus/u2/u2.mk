@@ -5,9 +5,11 @@
 # full_* / MTK product and subtracting.  Telephony, camera, NFC, print and all
 # MTK bloat are simply never added.
 
-# Inherit the minimal 32-bit AOSP base.  We deliberately do NOT inherit
-# full_base_telephony or any MTK full_* product.
-$(call inherit-product, $(SRC_TARGET_DIR)/product/aosp_arm.mk)
+# Inherit the standard no-telephony AOSP base (full_base.mk).  Deliberately
+# NOT aosp_arm/full (they drag in telephony, NFC -- whose libnfc-nci is the
+# only consumer of AOSP libpower.so, which would fight the MTK libpower blob
+# for /system/lib/libpower.so -- and goldfish/emulator files).
+$(call inherit-product, $(SRC_TARGET_DIR)/product/full_base.mk)
 
 # Core Android services we do want (framework, SystemUI, Settings, media, etc.).
 $(call inherit-product, $(SRC_TARGET_DIR)/product/core.mk)

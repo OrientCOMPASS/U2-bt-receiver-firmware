@@ -19,6 +19,16 @@ PRODUCT_PACKAGES += \
     libdpframework \
     libm4u \
     libpq_prot \
+    libpq_cust \
+    libpqservice \
+    libperfservicenative \
+    libmtk_drvb \
+    libvcodecdrv \
+    libvcodec_utility \
+    libvcodec_oal \
+    libmp4enc_sa.ca7 \
+    libvp8dec_sa.ca7 \
+    libvc1dec_sa.ca7 \
     libui_ext \
     libgui_ext \
     libpower_u2 \
@@ -31,9 +41,14 @@ PRODUCT_PACKAGES += \
     libaudiotoolkit \
     libaudiocompensationfilter \
     libaudiocomponentengine \
+    libbessound_hd_mtk \
+    libblisrc32 \
+    libmtklimiter \
+    libmtkshifter \
     libaudiodcrflt \
     libaudiomtkdcremoval \
     libaed \
+    libmrdump \
     libcvsd_mtk \
     libmsbc_mtk \
     libtinycompress_u2 \
@@ -51,6 +66,9 @@ PRODUCT_PACKAGES += \
     keystore.mt6735m \
     gatekeeper.mt6735m \
     libnvram \
+    libnvram_platform \
+    libnvram_sec \
+    libfs_mgr_mtk \
     libnvram_daemon_callback \
     libcustom_nvram \
     libfile_op \

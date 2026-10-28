@@ -44,6 +44,18 @@ vendor/lib/libbwc.so
 vendor/lib/libdpframework.so
 vendor/lib/libm4u.so
 vendor/lib/libpq_prot.so
+# Transitive closure of the graphics/display stack (readelf DT_NEEDED,
+# verified against the baseline image):
+vendor/lib/libpq_cust.so
+vendor/lib/libpqservice.so
+vendor/lib/libperfservicenative.so
+vendor/lib/libmtk_drvb.so
+vendor/lib/libvcodecdrv.so
+vendor/lib/libvcodec_utility.so
+vendor/lib/libvcodec_oal.so
+vendor/lib/libmp4enc_sa.ca7.so
+vendor/lib/libvp8dec_sa.ca7.so
+vendor/lib/libvc1dec_sa.ca7.so
 vendor/lib/libui_ext.so
 vendor/lib/libgui_ext.so
 lib/libpower.so
@@ -58,9 +70,15 @@ vendor/lib/libaudiosetting.so
 vendor/lib/libaudiotoolkit.so
 vendor/lib/libaudiocompensationfilter.so
 vendor/lib/libaudiocomponentengine.so
+# libaudiocomponentengine DT_NEEDED closure:
+vendor/lib/libbessound_hd_mtk.so
+vendor/lib/libblisrc32.so
+vendor/lib/libmtklimiter.so
+vendor/lib/libmtkshifter.so
 vendor/lib/libaudiodcrflt.so
 vendor/lib/libaudiomtkdcremoval.so
 vendor/lib/libaed.so
+vendor/lib/libmrdump.so
 vendor/lib/libcvsd_mtk.so
 vendor/lib/libmsbc_mtk.so
 lib/libtinycompress.so
@@ -101,6 +119,10 @@ vendor/lib/hw/sensors.mt6735m.so
 vendor/lib/hw/keystore.mt6735m.so
 vendor/lib/hw/gatekeeper.mt6735m.so
 vendor/lib/libnvram.so
+# libnvram DT_NEEDED closure (libfs_mgr lives in the baseline /system/lib):
+vendor/lib/libnvram_platform.so
+vendor/lib/libnvram_sec.so
+lib/libfs_mgr.so
 vendor/lib/libnvram_daemon_callback.so
 # nvram_daemon DT_NEEDED closure (verified via readelf on the baseline):
 vendor/lib/libcustom_nvram.so

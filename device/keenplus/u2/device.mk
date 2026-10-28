@@ -31,7 +31,11 @@ PRODUCT_PACKAGES += \
 # and AOSP's copy is installed for libbootanimation anyway); the AOSP 8.1
 # build provides the classic tinyalsa C ABI the MTK HAL links against.
 # Listed explicitly so it is installed even if bootanimation is ever dropped.
+# libxml2: many MTK blobs (libpq_cust/libperfservicenative/...) DT_NEEDED it;
+# the AOSP 8.1 source build provides the same soname (libc/libm/libz/libdl
+# only) so the baseline copy is deliberately not extracted.
 PRODUCT_PACKAGES += \
+    libxml2 \
     audio.a2dp.default \
     audio.r_submix.default \
     audio.usb.default \
@@ -83,14 +87,20 @@ PRODUCT_COPY_FILES += \
 # system/vendor/firmware on this non-Treble build) because the baseline
 # starts wmt_launcher with `-p /vendor/firmware/`.  Modem/DSP/catcher images
 # are NOT copied (non-goal, plan section 9).
+#
+# Every dest below carries the "system/" prefix on purpose: PRODUCT_COPY_FILES
+# dests resolve against $(PRODUCT_OUT), so a bare "vendor/firmware/x" dest
+# lands in $(PRODUCT_OUT)/vendor/ -- which NO image step packs on this
+# non-Treble product (the v1 image shipped without any of these files).
+# "system/vendor/..." is what ends up inside system.img.
 # --------------------------------------------------------------------------- #
 PRODUCT_COPY_FILES += \
-    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin:vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin \
-    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin:vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin \
-    vendor/keenplus/u2/proprietary/vendor/firmware/WMT_SOC.cfg:vendor/firmware/WMT_SOC.cfg \
-    vendor/keenplus/u2/proprietary/vendor/firmware/WIFI_RAM_CODE_6735:vendor/firmware/WIFI_RAM_CODE_6735 \
-    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_coeff.bin:vendor/firmware/mt6627_fm_v1_coeff.bin \
-    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_patch.bin:vendor/firmware/mt6627_fm_v1_patch.bin
+    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin:system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin:system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/WMT_SOC.cfg:system/vendor/firmware/WMT_SOC.cfg \
+    vendor/keenplus/u2/proprietary/vendor/firmware/WIFI_RAM_CODE_6735:system/vendor/firmware/WIFI_RAM_CODE_6735 \
+    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_coeff.bin:system/vendor/firmware/mt6627_fm_v1_coeff.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_patch.bin:system/vendor/firmware/mt6627_fm_v1_patch.bin
 
 # --------------------------------------------------------------------------- #
 # 64-bit runtime shim (decision D2, corrected): the baseline product is
@@ -122,20 +132,20 @@ PRODUCT_COPY_FILES += \
 # extraction step runs before kati, so the files are present).
 # --------------------------------------------------------------------------- #
 PRODUCT_COPY_FILES += \
-    vendor/keenplus/u2/proprietary/vendor/etc/audio_device.xml:vendor/etc/audio_device.xml \
-    vendor/keenplus/u2/proprietary/vendor/lib/egl/egl.cfg:vendor/lib/egl/egl.cfg \
-    vendor/keenplus/u2/proprietary/vendor/etc/audio_em.xml:vendor/etc/audio_em.xml \
+    vendor/keenplus/u2/proprietary/vendor/etc/audio_device.xml:system/vendor/etc/audio_device.xml \
+    vendor/keenplus/u2/proprietary/vendor/lib/egl/egl.cfg:system/vendor/lib/egl/egl.cfg \
+    vendor/keenplus/u2/proprietary/vendor/etc/audio_em.xml:system/vendor/etc/audio_em.xml \
     vendor/keenplus/u2/proprietary/etc/wifi/wpa_supplicant.conf:system/etc/wifi/wpa_supplicant.conf \
     vendor/keenplus/u2/proprietary/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf \
     vendor/keenplus/u2/proprietary/etc/wifi/wpa_supplicant_overlay.conf:system/etc/wifi/wpa_supplicant_overlay.conf
 
 U2_AUDIO_PARAM_FILES := $(wildcard vendor/keenplus/u2/proprietary/vendor/etc/audio_param/*)
 PRODUCT_COPY_FILES += \
-    $(foreach f,$(U2_AUDIO_PARAM_FILES),$(f):vendor/etc/audio_param/$(notdir $(f)))
+    $(foreach f,$(U2_AUDIO_PARAM_FILES),$(f):system/vendor/etc/audio_param/$(notdir $(f)))
 
 U2_TP_FILES := $(wildcard vendor/keenplus/u2/proprietary/vendor/etc/.tp/*)
 PRODUCT_COPY_FILES += \
-    $(foreach f,$(U2_TP_FILES),$(f):vendor/etc/.tp/$(notdir $(f)))
+    $(foreach f,$(U2_TP_FILES),$(f):system/vendor/etc/.tp/$(notdir $(f)))
 
 # --------------------------------------------------------------------------- #
 # Resource overlay (Bluetooth profile switches + framework config)
