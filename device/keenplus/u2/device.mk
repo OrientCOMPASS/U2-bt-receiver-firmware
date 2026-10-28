@@ -116,6 +116,27 @@ PRODUCT_COPY_FILES += \
     device/keenplus/u2/rootdir/init.u2.connectivity.rc:system/etc/init/init.u2.connectivity.rc
 
 # --------------------------------------------------------------------------- #
+# MTK configuration data extracted alongside the blobs.
+# audio_device.xml / audio_param/ are read by the MTK audio.primary HAL;
+# .tp holds the touch-panel tuning (wildcard-expanded at parse time -- the
+# extraction step runs before kati, so the files are present).
+# --------------------------------------------------------------------------- #
+PRODUCT_COPY_FILES += \
+    vendor/keenplus/u2/proprietary/vendor/etc/audio_device.xml:vendor/etc/audio_device.xml \
+    vendor/keenplus/u2/proprietary/vendor/etc/audio_em.xml:vendor/etc/audio_em.xml \
+    vendor/keenplus/u2/proprietary/etc/wifi/wpa_supplicant.conf:system/etc/wifi/wpa_supplicant.conf \
+    vendor/keenplus/u2/proprietary/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf \
+    vendor/keenplus/u2/proprietary/etc/wifi/wpa_supplicant_overlay.conf:system/etc/wifi/wpa_supplicant_overlay.conf
+
+U2_AUDIO_PARAM_FILES := $(wildcard vendor/keenplus/u2/proprietary/vendor/etc/audio_param/*)
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(U2_AUDIO_PARAM_FILES),$(f):vendor/etc/audio_param/$(notdir $(f)))
+
+U2_TP_FILES := $(wildcard vendor/keenplus/u2/proprietary/vendor/etc/.tp/*)
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(U2_TP_FILES),$(f):vendor/etc/.tp/$(notdir $(f)))
+
+# --------------------------------------------------------------------------- #
 # Resource overlay (Bluetooth profile switches + framework config)
 # --------------------------------------------------------------------------- #
 DEVICE_PACKAGE_OVERLAYS += device/keenplus/u2/overlay
