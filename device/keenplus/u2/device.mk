@@ -26,12 +26,18 @@ PRODUCT_PACKAGES += \
     LatinIME
 
 # Audio/media framework pieces required for the A2DP sink + local playback.
+# libtinyalsa: the MTK audio.primary blob DT_NEEDEDs libtinyalsa.so but the
+# baseline copy is NOT shipped (module-name collision with external/tinyalsa,
+# and AOSP's copy is installed for libbootanimation anyway); the AOSP 8.1
+# build provides the classic tinyalsa C ABI the MTK HAL links against.
+# Listed explicitly so it is installed even if bootanimation is ever dropped.
 PRODUCT_PACKAGES += \
     audio.a2dp.default \
     audio.r_submix.default \
     audio.usb.default \
     libaudioclient \
     libmedia \
+    libtinyalsa \
     tinymix \
     tinyplay
 

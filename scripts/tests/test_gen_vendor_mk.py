@@ -40,6 +40,19 @@ class TestClassify(unittest.TestCase):
         self.assertTrue(e.vendor)
         self.assertFalse(e.hw)
 
+    def test_colliding_name_is_renamed_with_stem(self):
+        # libion collides with system/core/libion -- renamed module, original
+        # install filename preserved via LOCAL_MODULE_STEM.
+        e = gv.classify("vendor/lib/libion.so")
+        self.assertEqual(e.kind, "lib")
+        self.assertEqual(e.module, "libion_u2")
+        self.assertEqual(e.stem, "libion.so")
+
+    def test_non_colliding_name_has_no_stem(self):
+        e = gv.classify("vendor/lib/libaed.so")
+        self.assertEqual(e.module, "libaed")
+        self.assertEqual(e.stem, "")
+
     def test_hw_library(self):
         e = gv.classify("vendor/lib/hw/audio.primary.mt6735m.so")
         self.assertEqual(e.kind, "lib")

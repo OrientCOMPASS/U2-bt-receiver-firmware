@@ -113,7 +113,9 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libion
+LOCAL_MODULE := libion_u2
+# renamed from libion: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
+LOCAL_MODULE_STEM := libion.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
 LOCAL_SRC_FILES := proprietary/vendor/lib/libion.so
@@ -201,7 +203,9 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libpower
+LOCAL_MODULE := libpower_u2
+# renamed from libpower: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
+LOCAL_MODULE_STEM := libpower.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
 LOCAL_SRC_FILES := proprietary/vendor/lib/libpower.so
@@ -369,18 +373,9 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libtinyalsa
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/vendor/lib/libtinyalsa.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
-LOCAL_MODULE := libtinycompress
+LOCAL_MODULE := libtinycompress_u2
+# renamed from libtinycompress: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
+LOCAL_MODULE_STEM := libtinycompress.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
 LOCAL_SRC_FILES := proprietary/vendor/lib/libtinycompress.so
@@ -391,7 +386,9 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libtinyxml
+LOCAL_MODULE := libtinyxml_u2
+# renamed from libtinyxml: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
+LOCAL_MODULE_STEM := libtinyxml.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
 LOCAL_SRC_FILES := proprietary/vendor/lib/libtinyxml.so

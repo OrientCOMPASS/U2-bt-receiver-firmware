@@ -18,6 +18,21 @@ vendor/lib/egl/libGLESv2_mali.so
 vendor/lib/libged.so
 vendor/lib/libgpu_aux.so
 vendor/lib/libgralloc_extra.so
+# Some basenames collide with unguarded AOSP 8.1 source modules
+# (libion: system/core/libion; libtinyxml: external/tinyxml;
+#  libpower: hardware/libhardware_legacy; libtinycompress:
+#  external/tinycompress).  gen-vendor-mk.py RENAMES those prebuilts
+# (<name>_u2) and keeps the original install filename via
+# LOCAL_MODULE_STEM, so the MTK blobs are still what ends up in
+# /system/lib -- see RENAMED in scripts/gen-vendor-mk.py.
+# (libbt-vendor looks risky but every AOSP definer is guarded by
+#  BOARD_HAVE_BLUETOOTH_* which u2 never sets -- verified on the tree.)
+# libtinyalsa.so is NOT taken from the baseline at all: AOSP's own
+# libtinyalsa is unavoidably installed on u2 (libbootanimation needs it)
+# and two modules cannot own /system/lib/libtinyalsa.so.  The MTK audio
+# HAL links against the classic tinyalsa C ABI, which AOSP 8.1 provides;
+# device.mk adds libtinyalsa explicitly and the post-extraction dep scan
+# verifies every UND tinyalsa symbol resolves.
 vendor/lib/libion.so
 vendor/lib/libion_mtk.so
 vendor/lib/libbwc.so
@@ -43,7 +58,6 @@ vendor/lib/libaudiomtkdcremoval.so
 vendor/lib/libaed.so
 vendor/lib/libcvsd_mtk.so
 vendor/lib/libmsbc_mtk.so
-vendor/lib/libtinyalsa.so
 vendor/lib/libtinycompress.so
 vendor/lib/libtinyxml.so
 vendor/etc/audio_device.xml

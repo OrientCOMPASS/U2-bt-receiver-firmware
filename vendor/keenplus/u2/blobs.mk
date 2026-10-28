@@ -15,7 +15,7 @@ PRODUCT_PACKAGES += \
     libged \
     libgpu_aux \
     libgralloc_extra \
-    libion \
+    libion_u2 \
     libion_mtk \
     libbwc \
     libdpframework \
@@ -23,7 +23,7 @@ PRODUCT_PACKAGES += \
     libpq_prot \
     libui_ext \
     libgui_ext \
-    libpower \
+    libpower_u2 \
     audio.primary.mt6735m \
     audio.usb.mt6735m \
     audio.r_submix.mt6735m \
@@ -38,9 +38,8 @@ PRODUCT_PACKAGES += \
     libaed \
     libcvsd_mtk \
     libmsbc_mtk \
-    libtinyalsa \
-    libtinycompress \
-    libtinyxml \
+    libtinycompress_u2 \
+    libtinyxml_u2 \
     libbt-vendor \
     libbluetooth_mtk \
     libbluetooth_mtk_pure \

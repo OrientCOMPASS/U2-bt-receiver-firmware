@@ -62,10 +62,46 @@ else
 fi
 
 # ---- 2. Extract each entry -------------------------------------------------- #
+# Clean generated tree: a previous (possibly broken) extraction must never
+# leave stale entries behind.
+rm -rf "${VENDOR_OUT}"
 mkdir -p "${VENDOR_OUT}"
 extracted=0
 skipped=0
 dirs=()
+
+# Classify an image path by parsing `debugfs stat` output.  DO NOT use the
+# exit status of `ls -d`: e2fsprogs 1.42.13 (Ubuntu 16.04) returns 0 for
+# regular files too, which silently turned every blob into an empty
+# directory.  Prints one of: directory | regular | symlink | unknown.
+inode_kind() {
+    local stat_out type_word
+    stat_out="$(debugfs -R "stat $1" "${RAW_IMG}" 2>/dev/null || true)"
+    # `Type:` shares the `Inode:` line, e.g.
+    #   Inode: 11   Type: directory    Mode: 0755 ...   (e2fsprogs 1.42)
+    #   Inode: 11   Type: 0x4000 (directory) ...         (newer e2fsprogs)
+    type_word="$(grep -m1 -o 'Type:[[:space:]]*[^[:space:]]*' <<<"${stat_out}" \
+                 | awk '{print tolower($2)}' || true)"
+    case "${type_word}" in
+        directory|0x4000)      echo directory ;;
+        symlink|symbolic|0xa000) echo symlink ;;
+        regular|0x8000)        echo regular ;;
+        *)                     echo unknown ;;
+    esac
+}
+
+# Resolve a symlink's target string inside the image.  Slow links: `cat`
+# returns the target.  Fast links: `stat` prints it after "Fast symlink".
+# Echoes '' when the target cannot be determined.
+symlink_target() {
+    local tgt
+    tgt="$(debugfs -R "cat $1" "${RAW_IMG}" 2>/dev/null | head -c 4096 | tr -d '\0\n' || true)"
+    if [[ -z "${tgt}" ]]; then
+        tgt="$(debugfs -R "stat $1" "${RAW_IMG}" 2>/dev/null \
+            | sed -n 's/.*[Ff]ast link[^"]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+    fi
+    echo "${tgt}"
+}
 
 # Read the list, ignoring comments and blank lines.
 while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -76,21 +112,52 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     src="/${line#/}"                          # normalise to a leading slash
     dst="${VENDOR_OUT}/${line}"
 
-    # Is it a directory in the image?  debugfs 'ls -d' returns 0 for dirs.
-    if debugfs -R "ls -d ${src}" "${RAW_IMG}" >/dev/null 2>&1; then
+    kind="$(inode_kind "${src}")"
+
+    # Symlinks are dereferenced: extract the target's bytes as a regular
+    # file (prebuilt modules want real content; image-internal link paths
+    # are meaningless in the vendor tree).
+    if [[ "${kind}" == "symlink" ]]; then
+        tgt="$(symlink_target "${src}")"
+        if [[ -n "${tgt}" ]]; then
+            [[ "${tgt:0:1}" == "/" ]] || tgt="$(dirname "${src}")/${tgt}"
+            tgt="$("$PYTHON3" -c "import posixpath,sys;print(posixpath.normpath(sys.argv[1]))" "${tgt}" 2>/dev/null || echo "${tgt}")"
+            kind="$(inode_kind "${tgt}")"
+            src="${tgt}"
+        fi
+        if [[ "${kind}" != "regular" ]]; then
+            echo "  WARN: ${line}: unresolvable symlink (target '${tgt:-?}'), skipped" >&2
+            skipped=$((skipped+1))
+            continue
+        fi
+    fi
+
+    if [[ "${kind}" == "directory" ]]; then
         echo "[dir] ${src}"
-        mkdir -p "${dst}"
-        # rdump copies a directory tree recursively.
+        # NB: rdump fails with rc=0 ("File exists while making directory")
+        # if the leaf already exists -- create only the parent and let
+        # rdump make the leaf itself.
+        mkdir -p "${dst%/*}"
+        rm -rf "${dst}"
         debugfs -R "rdump ${src} ${dst%/*}" "${RAW_IMG}" >/dev/null 2>&1 || {
-            echo "  WARN: rdump failed for ${src}" >&2; skipped=$((skipped+1)); continue; }
+            echo "  WARN: rdump failed for ${src}" >&2; rm -rf "${dst}"; skipped=$((skipped+1)); continue; }
+        if [[ -z "$(find "${dst}" -type f -size +0c 2>/dev/null | head -1)" ]]; then
+            echo "  WARN: ${src}: directory dump produced no files" >&2
+            rm -rf "${dst}"; skipped=$((skipped+1)); continue
+        fi
         dirs+=("${line}")
         extracted=$((extracted+1))
         continue
     fi
 
     mkdir -p "$(dirname "${dst}")"
-    if debugfs -R "dump ${src} ${dst}" "${RAW_IMG}" >/dev/null 2>&1 && [[ -s "${dst}" ]]; then
-        echo "[file] ${src}"
+    if [[ "${kind}" == "regular" ]] && \
+       debugfs -R "dump ${src} ${dst}" "${RAW_IMG}" >/dev/null 2>&1 && [[ -s "${dst}" ]]; then
+        if [[ "${src}" == "/${line#/}" ]]; then
+            echo "[file] ${src}"
+        else
+            echo "[file] ${line} (symlink dereferenced from ${src})"
+        fi
         extracted=$((extracted+1))
         # 32-bit check for ELF shared objects.
         if readelf -h "${dst}" >/dev/null 2>&1; then
