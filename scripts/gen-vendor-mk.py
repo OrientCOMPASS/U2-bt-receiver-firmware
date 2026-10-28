@@ -68,21 +68,6 @@ RENAMED = {
     "libtinycompress": "libtinycompress_u2",
 }
 
-# extract-files.sh renamed some baseline files on disk to avoid duplicate
-# basenames inside proprietary-files.txt; their RUNTIME soname (what the
-# DT_NEEDED entries of the consumers reference) is still the original one.
-# Map module name -> required install filename.
-STEM_FIXUP = {
-    # baseline /vendor/lib/libion.so, extracted as libion_mtk.so because the
-    # list also carried /system/lib/libion.so (that entry has since been
-    # dropped -- AOSP system/core/libion is symbol-identical, verified with
-    # nm -D: same 12 exports -- and now owns /system/lib/libion.so).  The
-    # vendor copy must still install as /system/vendor/lib/libion.so for the
-    # vendor-side MTK blobs that DT_NEEDED it.
-    "libion_mtk": "libion.so",
-}
-
-
 class Entry:
     __slots__ = ("path", "kind", "module", "relpath", "hw", "egl", "vendor",
                  "stem", "stem_note")
@@ -134,11 +119,6 @@ def classify(path: str) -> Entry:
             stem_note = (f"# renamed from {module}: name collides with an AOSP "
                          "source module (see RENAMED in gen-vendor-mk.py)")
             module = RENAMED[module]
-        if module in STEM_FIXUP:
-            stem = STEM_FIXUP[module]
-            stem_note = ("# install-name fixup: file was renamed during "
-                         "extraction, runtime soname is the original one "
-                         "(see STEM_FIXUP in gen-vendor-mk.py)")
         return Entry(path, "lib", module, p, hw, vendor, stem, egl, stem_note)
 
     # Executables live under a bin/ directory and have no extension.

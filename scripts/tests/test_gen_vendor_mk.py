@@ -49,18 +49,14 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(e.module, "libtinyxml_u2")
         self.assertEqual(e.stem, "libtinyxml.so")
 
-    def test_extraction_renamed_file_keeps_runtime_soname(self):
-        # libion_mtk is how extract-files.sh stored the baseline
-        # /vendor/lib/libion.so; it must still INSTALL as libion.so.
+    def test_libion_mtk_is_a_real_baseline_library(self):
+        # /vendor/lib/libion_mtk.so is NOT an extraction rename: the baseline
+        # genuinely ships it (SONAME libion_mtk.so) and vendor blobs
+        # DT_NEEDED it under that name.  It installs as libion_mtk.so; the
+        # vendor blobs' companion NEEDED libion.so is served by AOSP's
+        # /system/lib/libion.so (symbol-identical to the baseline copy).
         e = gv.classify("vendor/lib/libion_mtk.so")
         self.assertEqual(e.module, "libion_mtk")
-        self.assertEqual(e.stem, "libion.so")
-
-    def test_aosp_symbol_identical_libion_not_extracted(self):
-        # The system-side copy is gone from the list: AOSP system/core/libion
-        # is symbol-identical (verified via nm -D) and owns /system/lib.
-        e = gv.classify("vendor/lib/libion.so")
-        self.assertEqual(e.module, "libion")
         self.assertEqual(e.stem, "")
 
     def test_non_colliding_name_has_no_stem(self):
