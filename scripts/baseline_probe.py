@@ -35,7 +35,13 @@ import sys
 import tempfile
 import zipfile
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import mtk_sparse2raw as m2r  # noqa: E402  (sibling module in scripts/)
+
 EXT4_MAGIC = 0xEF53
+SPARSE_MAGIC = 0xED26FF3A
 S_IFMT = 0xF000
 S_IFDIR = 0x4000
 S_IFREG = 0x8000
@@ -380,6 +386,33 @@ BUILD_PROP_KEYS = (
 )
 
 
+def image_is_sparse(path: str) -> bool:
+    with open(path, "rb") as f:
+        head = f.read(4)
+    return len(head) == 4 and struct.unpack("<I", head)[0] == SPARSE_MAGIC
+
+
+def desparse(path: str) -> tuple:
+    """Convert an Android/MTK sparse image to raw ext4 in a temp file.
+    Returns (raw_path, stats)."""
+    fd, raw = tempfile.mkstemp(prefix="u2_raw_", suffix=".img")
+    os.close(fd)
+    print("[probe] image is Android/MTK sparse; converting to raw...",
+          flush=True)
+    try:
+        with open(path, "rb") as fi, open(raw, "wb") as fo:
+            stats = m2r.sparse_to_raw(fi, fo)
+    except Exception:
+        try:
+            os.unlink(raw)
+        except OSError:
+            pass
+        raise
+    print("[probe] sparse->raw done: %s" % json.dumps(stats, sort_keys=True),
+          flush=True)
+    return raw, stats
+
+
 def open_image(args) -> tuple[str, bool]:
     """Return (image_path, is_temp)."""
     if args.image:
@@ -506,17 +539,29 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     img_path, is_temp = open_image(args)
+    raw_path, raw_is_temp = img_path, False
+    sparse_stats = None
     try:
-        return run_probe(img_path, args)
+        if image_is_sparse(img_path):
+            raw_path, sparse_stats = desparse(img_path)
+            raw_is_temp = True
+            if is_temp:                      # free the sparse temp right away
+                try:
+                    os.unlink(img_path)
+                except OSError:
+                    pass
+                is_temp = False
+        return run_probe(raw_path, args, sparse_stats=sparse_stats)
     finally:
-        if is_temp and not args.keep_image:
-            try:
-                os.unlink(img_path)
-            except OSError:
-                pass
+        for p, t in ((img_path, is_temp), (raw_path, raw_is_temp)):
+            if t and not args.keep_image:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
-def run_probe(img_path: str, args) -> int:
+def run_probe(img_path: str, args, sparse_stats: dict | None = None) -> int:
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
     ext_dir = os.path.join(outdir, "extracted")
@@ -537,6 +582,8 @@ def run_probe(img_path: str, args) -> int:
         "feature_compat": hex(img.feat_compat),
         "feature_incompat": hex(img.feat_incompat),
         "feature_ro_compat": hex(img.feat_ro), "uuid": img.uuid}}
+    if sparse_stats:
+        report["input_was_sparse"] = sparse_stats
 
     # --- build.prop ---------------------------------------------------------
     bp_ino = img.lookup("/build.prop")

@@ -19,10 +19,12 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS = os.path.dirname(_HERE)
-if _SCRIPTS not in sys.path:
-    sys.path.insert(0, _SCRIPTS)
+for _p in (_SCRIPTS, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import baseline_probe as bp  # noqa: E402
+import test_mtk_sparse2raw as tms  # noqa: E402
 
 
 def make_dirent(ino: int, name: str, ftype: int, pad_to: int) -> bytes:
@@ -183,6 +185,35 @@ class TestBtNameRegex(unittest.TestCase):
         for n in ("libcutils.so", "camera.default.so", "gps.mt6735.so",
                   "audio.primary.mt6735.so", "libutils.so"):
             self.assertFalse(bp.BT_NAME_RE.search(n), n)
+
+
+class TestSparseGlue(unittest.TestCase):
+    def test_desparse_roundtrip(self):
+        raw = os.urandom(3 * 4096)
+        sp = tms.build_sparse([(tms.RAW, raw)], block_size=4096)
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as t:
+            t.write(sp)
+            spath = t.name
+        try:
+            self.assertTrue(bp.image_is_sparse(spath))
+            rawpath, stats = bp.desparse(spath)
+            try:
+                with open(rawpath, "rb") as f:
+                    self.assertEqual(f.read(), raw)
+                self.assertEqual(stats["out_size"], len(raw))
+            finally:
+                os.unlink(rawpath)
+        finally:
+            os.unlink(spath)
+
+    def test_plain_file_not_sparse(self):
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as t:
+            t.write(b"\0" * 64)
+            path = t.name
+        try:
+            self.assertFalse(bp.image_is_sparse(path))
+        finally:
+            os.unlink(path)
 
 
 @unittest.skipUnless(shutil.which("mkfs.ext4") and shutil.which("debugfs"),
