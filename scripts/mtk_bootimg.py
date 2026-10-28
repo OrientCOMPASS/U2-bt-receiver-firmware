@@ -171,12 +171,74 @@ def extract_ramdisk(ramdisk_gz: bytes, dest_dir: str) -> None:
                           stdout=subprocess.PIPE)
     p2 = subprocess.Popen(_sudo() + ["cpio", "-idm", "--quiet"],
                           stdin=p1.stdout, cwd=dest_dir)
+    assert p1.stdout is not None and p1.stdin is not None
     p1.stdout.close()
     p1.stdin.write(ramdisk_gz)
     p1.stdin.close()
     p1.wait()
     if p2.wait() != 0:
         raise RuntimeError("cpio extract failed")
+
+
+def parse_cpio_index(ramdisk_gz: bytes) -> List[Tuple[str, int]]:
+    """Walk a newc cpio archive; return [(name, mtime_seconds), ...].
+
+    cpio extraction cannot perfectly restore timestamps (directory mtimes
+    are bumped by later child creation; symlink mtimes are not restored on
+    some systems), so we read the original mtimes from the archive and
+    re-apply them explicitly before repacking -- otherwise the rebuilt
+    ramdisk is not reproducible.
+    """
+    raw = gzip.decompress(ramdisk_gz)
+    out: List[Tuple[str, int]] = []
+    off = 0
+
+    def pad4(n: int) -> int:
+        return (n + 3) // 4 * 4
+
+    while off + 110 <= len(raw):
+        hdr = raw[off:off + 110]
+        if hdr[:6] != b"070701":
+            break
+        fields = [int(hdr[6 + 8 * i:14 + 8 * i], 16) for i in range(13)]
+        mtime, fsz, namesz = fields[5], fields[6], fields[11]
+        name = raw[off + 110:off + 110 + namesz - 1].decode(
+            "utf-8", "surrogateescape")
+        if name == "TRAILER!!!":
+            break
+        out.append((name, mtime))
+        off = pad4(pad4(off + 110 + namesz) + fsz)
+    return out
+
+
+_RESTORE_SCRIPT = (
+    "import os, sys\n"
+    "for line in open(sys.argv[1], encoding='utf-8', errors='surrogateescape'):\n"
+    "    mt, path = line.rstrip('\\n').split('\\t', 1)\n"
+    "    ns = int(mt) * 10**9\n"
+    "    try:\n"
+    "        os.utime(os.path.join(sys.argv[2], path), ns=(ns, ns),\n"
+    "                 follow_symlinks=False)\n"
+    "    except OSError:\n"
+    "        pass\n"
+)
+
+
+def restore_mtimes(src_dir: str, entries: List[Tuple[str, int]]) -> None:
+    """Re-apply archived mtimes, deepest paths first (children before the
+    directories whose mtime their creation would bump)."""
+    ordered = sorted(entries, key=lambda t: (-t[0].count("/"), t[0]))
+    with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False,
+                                     encoding="utf-8",
+                                     errors="surrogateescape") as f:
+        tsv = f.name
+        for name, mt in ordered:
+            f.write(f"{mt}\t{name}\n")
+    try:
+        subprocess.run(_sudo() + ["python3", "-c", _RESTORE_SCRIPT,
+                                  tsv, src_dir], check=True)
+    finally:
+        os.unlink(tsv)
 
 
 class _BytesSink:
@@ -191,17 +253,19 @@ class _BytesSink:
 
 
 def repack_ramdisk(src_dir: str) -> bytes:
-    # Sorted file list for deterministic output; cpio runs under sudo when
-    # needed so root-owned modes/owners are archived verbatim (-R root:root
-    # additionally normalises ownership in the archive header).
-    files = subprocess.run(["find", ".", "-mindepth", "1"], cwd=src_dir,
-                           check=True, capture_output=True, text=True)
+    # Sorted file list for deterministic output; find and cpio run under sudo
+    # when needed (extracted entries are root-owned, some dirs not traversable
+    # by the invoking user).  -R root:root normalises ownership in the archive.
+    files = subprocess.run(_sudo() + ["find", ".", "-mindepth", "1"],
+                           cwd=src_dir, check=True, capture_output=True,
+                           text=True)
     listing = "\n".join(sorted(files.stdout.splitlines())) + "\n"
 
     import threading
     sink = _BytesSink()
     gz = gzip.GzipFile(mode="wb", fileobj=sink, mtime=0)
     p1 = subprocess.Popen(_sudo() + ["cpio", "-o", "-H", "newc", "--quiet",
+                                     "--renumber-inodes",
                                      "-R", "root:root"],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           cwd=src_dir)
@@ -322,6 +386,7 @@ def cmd_disable_verity(args: argparse.Namespace) -> int:
         if edits == 0:
             log("WARNING: no /system 'verify' flag found in any fstab -- "
                 "repacking anyway")
+        restore_mtimes(rd, parse_cpio_index(ramdisk_gz))
         new_ramdisk = repack_ramdisk(rd)
 
     body = build_boot(h, kernel, new_ramdisk)
