@@ -68,15 +68,17 @@ RENAMED = {
 
 
 class Entry:
-    __slots__ = ("path", "kind", "module", "relpath", "hw", "vendor", "stem")
+    __slots__ = ("path", "kind", "module", "relpath", "hw", "egl", "vendor", "stem")
 
     def __init__(self, path: str, kind: str, module: str, relpath: str,
-                 hw: bool, vendor: bool, stem: str = "") -> None:
+                 hw: bool, vendor: bool, stem: str = "",
+                 egl: bool = False) -> None:
         self.path = path        # original list line, e.g. vendor/lib/hw/foo.so
         self.kind = kind        # "lib" | "bin" | "data"
         self.module = module    # prebuilt module name ("" for data)
         self.relpath = relpath  # path under proprietary/, e.g. vendor/lib/hw/foo.so
         self.hw = hw            # lives in a /hw/ dir -> LOCAL_MODULE_RELATIVE_PATH
+        self.egl = egl          # lives in an /egl/ dir -> LOCAL_MODULE_RELATIVE_PATH
         self.vendor = vendor    # under vendor/ -> LOCAL_VENDOR_MODULE
         self.stem = stem        # install filename when != module+suffix (RENAMED)
 
@@ -96,6 +98,7 @@ def classify(path: str) -> Entry:
     p = path.lstrip("/")
     base = os.path.basename(p)
     hw = "/hw/" in ("/" + p) or p.startswith("hw/")
+    egl = "/egl/" in ("/" + p) or p.startswith("egl/")
     vendor = p.startswith("vendor/")
 
     # 64-bit runtime shim (bin/linker64 + lib64/*.so): installed verbatim via
@@ -110,7 +113,7 @@ def classify(path: str) -> Entry:
         if module in RENAMED:
             stem = module + ".so"   # keep the original install filename
             module = RENAMED[module]
-        return Entry(path, "lib", module, p, hw, vendor, stem)
+        return Entry(path, "lib", module, p, hw, vendor, stem, egl)
 
     # Executables live under a bin/ directory and have no extension.
     if ("/bin/" in ("/" + p) or p.startswith("bin/")) and "." not in base:
@@ -155,6 +158,8 @@ def gen_android_mk(lib_e: List[Entry], bin_e: List[Entry], data_e: List[Entry]) 
             out.append("LOCAL_VENDOR_MODULE := true\n")
         if e.hw:
             out.append("LOCAL_MODULE_RELATIVE_PATH := hw\n")
+        elif e.egl:
+            out.append("LOCAL_MODULE_RELATIVE_PATH := egl\n")
         out.append("include $(BUILD_PREBUILT)\n\n")
 
     out.append("# ---- prebuilt native executables ----\n\n")

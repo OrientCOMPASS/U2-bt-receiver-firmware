@@ -53,6 +53,12 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(e.module, "libaed")
         self.assertEqual(e.stem, "")
 
+    def test_egl_library(self):
+        e = gv.classify("vendor/lib/egl/libGLES_mali.so")
+        self.assertEqual(e.kind, "lib")
+        self.assertTrue(e.egl)
+        self.assertFalse(e.hw)
+
     def test_lib64_shim_is_data_not_prebuilt(self):
         # The 64-bit runtime shim must go through PRODUCT_COPY_FILES, never
         # BUILD_PREBUILT (product is 32-bit-only).
