@@ -41,6 +41,7 @@ when not running as root (ramdisk files are root-owned).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import gzip
 import json
@@ -75,6 +76,33 @@ def _sudo() -> List[str]:
 
 def _run(cmd: List[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
+
+
+def _sudo_read(path: str) -> bytes:
+    """Read a file that may be root-owned (extracted ramdisk entries)."""
+    return subprocess.run(_sudo() + ["cat", path], check=True,
+                          capture_output=True).stdout
+
+
+def _sudo_write(path: str, data: bytes) -> None:
+    """Write a file that may be root-owned (extracted ramdisk entries)."""
+    subprocess.run(_sudo() + ["tee", path], input=data, check=True,
+                   stdout=subprocess.DEVNULL)
+
+
+@contextlib.contextmanager
+def _workdir(prefix: str = "mtkboot"):
+    """Temp dir whose contents may end up root-owned; cleaned via sudo."""
+    td = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield td
+    finally:
+        sudocmd = _sudo()
+        if sudocmd:
+            subprocess.run(sudocmd + ["rm", "-rf", td],
+                           capture_output=True, check=False)
+        else:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,8 +236,8 @@ def edit_fstab_disable_verity(ramdisk_dir: str, fstab_glob: str) -> int:
     for path in glob.glob(os.path.join(ramdisk_dir, fstab_glob)):
         if not os.path.isfile(path):
             continue
-        with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
-            lines = f.readlines()
+        raw = _sudo_read(path).decode("utf-8", "surrogateescape")
+        lines = raw.splitlines(keepends=True)
         changed = False
         for i, line in enumerate(lines):
             if "/system" not in line or "verify" not in line:
@@ -225,9 +253,7 @@ def edit_fstab_disable_verity(ramdisk_dir: str, fstab_glob: str) -> int:
                 log(f"fstab edit {os.path.basename(path)}: "
                     f"{line.strip()!r} -> {new.strip()!r}")
         if changed:
-            with open(path, "w", encoding="utf-8",
-                      errors="surrogateescape") as f:
-                f.writelines(lines)
+            _sudo_write(path, "".join(lines).encode("utf-8", "surrogateescape"))
     return edits
 
 
@@ -289,7 +315,7 @@ def cmd_disable_verity(args: argparse.Namespace) -> int:
     kernel = bytes(h["kernel"])                                  # type: ignore
     ramdisk_gz = bytes(h["ramdisk"])                             # type: ignore
 
-    with tempfile.TemporaryDirectory() as td:
+    with _workdir() as td:
         rd = os.path.join(td, "rd")
         extract_ramdisk(ramdisk_gz, rd)
         edits = edit_fstab_disable_verity(rd, args.fstab_glob)
@@ -313,13 +339,12 @@ def cmd_disable_verity(args: argparse.Namespace) -> int:
     assert bytes(h2["kernel"]) == kernel, "kernel mismatch after rebuild"
     assert h2["ramdisk_size"] == len(new_ramdisk), "ramdisk size mismatch"
     assert h2["page_size"] == h["page_size"], "page size changed"
-    with tempfile.TemporaryDirectory() as td:
+    with _workdir() as td:
         rd = os.path.join(td, "rd2")
         extract_ramdisk(bytes(h2["ramdisk"]), rd)               # type: ignore
         leftovers = 0
         for path in glob.glob(os.path.join(rd, args.fstab_glob)):
-            txt = open(path, encoding="utf-8",
-                         errors="surrogateescape").read()
+            txt = _sudo_read(path).decode("utf-8", "surrogateescape")
             for line in txt.splitlines():
                 if "/system" in line and "verify" in line:
                     leftovers += 1
