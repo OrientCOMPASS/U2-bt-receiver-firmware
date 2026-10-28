@@ -364,5 +364,33 @@ class TestRealisticSystemImage(unittest.TestCase):
         self.assertEqual(stats["total_chks"], 4)
 
 
+class TestCliMain(unittest.TestCase):
+    """Exercise main() end-to-end -- the summary print path had a %d-vs-str
+    format bug that only a real CLI invocation can catch (2026-10-28)."""
+
+    def test_main_verbose_and_check_ext4(self):
+        import tempfile
+
+        nblocks = 8
+        sb = make_ext4_superblock(nblocks, BLOCK)
+        raw = sb + os.urandom(BLOCK * (nblocks - 1))
+        img = build_sparse([(RAW, raw)])
+        td = tempfile.mkdtemp()
+        try:
+            src = os.path.join(td, "in.img")
+            dst = os.path.join(td, "out.img")
+            with open(src, "wb") as f:
+                f.write(img)
+            rc = m.main([src, dst, "--check-ext4"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(open(dst, "rb").read(), raw)
+            rc = m.main([src, dst, "-q"])
+            self.assertEqual(rc, 0)
+        finally:
+            import shutil
+
+            shutil.rmtree(td, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

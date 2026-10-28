@@ -403,7 +403,7 @@ def main(argv=None) -> int:
     out_size = os.path.getsize(args.output)
     if not args.quiet:
         print(
-            "wrote %s (%d bytes) from %d chunks: %s"
+            "wrote %s (%s) from %d chunks: %s"
             % (
                 args.output,
                 _human(out_size),
