@@ -38,9 +38,13 @@ need() {
 SRC_IMG="$1"
 [[ -f "${SRC_IMG}" ]] || { echo "ERROR: '${SRC_IMG}' is not a file" >&2; exit 1; }
 
-need python3
 need debugfs
 need readelf
+# python3 >= 3.7 required (mtk_sparse2raw.py uses `from __future__ import
+# annotations`); on hosts with an older system python3 (e.g. Ubuntu 16.04)
+# point PYTHON3 at a modern interpreter.
+PYTHON3="${PYTHON3:-python3}"
+command -v "$PYTHON3" >/dev/null 2>&1 || { echo "ERROR: python3 ('$PYTHON3') not found" >&2; exit 1; }
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
@@ -51,10 +55,10 @@ RAW_IMG="${SRC_IMG}"
 if [[ "${MAGIC_HEX}" == "ed26ff3a" ]]; then
     echo "[*] Sparse image detected (magic 0xED26FF3A); converting to raw..."
     RAW_IMG="${WORKDIR}/system.raw.img"
-    python3 "${SPARSE2RAW}" "${SRC_IMG}" "${RAW_IMG}" --check-ext4
+    "$PYTHON3" "${SPARSE2RAW}" "${SRC_IMG}" "${RAW_IMG}" --check-ext4
 else
     echo "[*] Assuming raw ext4 image; verifying superblock..."
-    python3 -c "import sys; sys.path.insert(0,'${REPO_ROOT}/scripts'); import mtk_sparse2raw as m; m.check_ext4('${SRC_IMG}')"
+    "$PYTHON3" -c "import sys; sys.path.insert(0,'${REPO_ROOT}/scripts'); import mtk_sparse2raw as m; m.check_ext4('${SRC_IMG}')"
 fi
 
 # ---- 2. Extract each entry -------------------------------------------------- #
