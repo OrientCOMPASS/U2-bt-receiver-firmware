@@ -338,6 +338,7 @@ REQUIRED = [
     "scripts/publish_release.py",
     "scripts/gen-vendor-mk.py",
     "scripts/validate_repo.py",
+    "scripts/baseline_probe.py",
     "kernel/u2_8.1_config.fragment",
     "kernel/check-kernel-config.py",
     "device/keenplus/u2/BoardConfig.mk",
@@ -361,6 +362,7 @@ REQUIRED = [
     ".github/workflows/ci.yml",
     ".github/workflows/build.yml",
     ".github/workflows/bt-compile.yml",
+    ".github/workflows/baseline-probe.yml",
 ]
 
 

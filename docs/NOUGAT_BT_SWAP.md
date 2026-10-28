@@ -53,10 +53,11 @@ r80 `system/bt` 全栈编译成了 ARM/bionic 目标码：
 ## 4. 里程碑
 
 - **B0（已完成）** 独立编译环境验证：`bt_standalone_build.sh` + CI workflow。
-- **B1 基线解剖**：CI 下载官方 `system.img`（2.6 GB，range 请求可先只读
-  ext4 元数据），产出：`build.prop` 精确版本（7.0 vs 7.1、安全补丁级别）、
-  蓝牙相关文件清单、`bluetooth.default.so` 的 DT_NEEDED 与导出/未定义符号表、
-  `libbt-vendor.so` 的接口版本。确定 AOSP 源码 tag（如 `android-7.0.0_r36`）。
+- **B1 基线解剖**（工具已就绪：`scripts/baseline_probe.py` + `baseline-probe.yml`，
+  纯 stdlib 的 zip/ext4/ELF32 解析器，无需 root/loop-mount）：产出
+  `build.prop` 精确版本、蓝牙文件清单、`bluetooth.default.so` 的
+  DT_NEEDED/符号表、依赖闭包库全量提取（B3 真链接的输入）。据此确定 AOSP
+  源码 tag（如 `android-7.0.0_r36`）。
 - **B2 补丁移植**：把 4+1 个补丁从 r80 移植到 7.0 树
   （栈位置不同：`hardware/broadcom/bluetooth`；无 `a2dp_codecs` 框架，
   AAC sink 需要按 7.0 的 `btif_a2dp_sink`/`bta_av` 结构重写挂接点）。
