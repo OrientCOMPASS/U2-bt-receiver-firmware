@@ -299,8 +299,22 @@ BY_BASENAME: dict = {
 }
 
 
+def _is_binary(rel: str) -> bool:
+    """True for binary blobs (e.g. device/keenplus/u2/prebuilt/kernel).
+
+    Text-lint checks (CRLF, conflict markers, trailing whitespace) are
+    meaningless -- and produce false positives -- on binaries such as the
+    committed prebuilt MTK kernel (gzip Image + appended DTB).
+    """
+    raw, _ = _read(rel)
+    return b"\x00" in raw[:8192]
+
+
 def validate(files: List[str], rep: Report) -> None:
     for rel in files:
+        if _is_binary(rel):
+            print(f"validate_repo: {rel}: binary file, text checks skipped")
+            continue
         base = os.path.basename(rel)
         ext = os.path.splitext(rel)[1]
         for chk in UNIVERSAL:
