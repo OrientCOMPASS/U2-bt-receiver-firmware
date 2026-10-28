@@ -20,11 +20,14 @@ REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 PATCHES="${REPO_ROOT}/patches"
 TAG="android-8.1.0_r80"
 
-# repo-subdir : patches-subdir : git-url
+# repo-subdir : patches-subdir : git-url ["|lite" suffix]
+# "|lite" = huge repo; --verify fetches only the files touched by the series
+# (googlesource ?format=TEXT) into a mini repo instead of cloning gigabytes.
 SERIES=(
     "hardware/libhardware:hardware_libhardware:https://android.googlesource.com/platform/hardware/libhardware"
     "system/bt:system_bt:https://android.googlesource.com/platform/system/bt"
     "packages/apps/Bluetooth:packages_apps_Bluetooth:https://android.googlesource.com/platform/packages/apps/Bluetooth"
+    "prebuilts/sdk:prebuilts_sdk:https://android.googlesource.com/platform/prebuilts/sdk|lite"
 )
 
 usage() {
@@ -77,14 +80,32 @@ mode_verify() {
     # shellcheck disable=SC2064
     trap "[[ '${keep}' == '1' ]] || rm -rf '${workdir}'" EXIT
     log "verify mode: cloning ${TAG} into ${workdir}"
-    local entry sub pdir url target
+    local entry sub pdir url mode target f
     for entry in "${SERIES[@]}"; do
         IFS=':' read -r sub pdir url <<<"${entry}"
+        mode=""
+        if [[ "${url}" == *"|lite" ]]; then mode="lite"; url="${url%|lite}"; fi
         target="${workdir}/${sub}"
         mkdir -p "$(dirname "${target}")"
-        log "  clone ${sub} @ ${TAG}"
-        git clone --quiet --depth 1 --branch "${TAG}" "${url}" "${target}"
-        ( cd "${target}" && git config user.name "ci" && git config user.email "ci@localhost" )
+        if [[ "${mode:-}" == "lite" ]]; then
+            log "  lite-verify ${sub} @ ${TAG} (fetch series-touched files only)"
+            mkdir -p "${target}"
+            ( cd "${target}" && git init -q . \
+                && git config user.name ci && git config user.email ci@localhost )
+            while IFS= read -r f; do
+                [[ -n "${f}" ]] || continue
+                mkdir -p "${target}/$(dirname "${f}")"
+                curl -sfL "${url}/+/refs/tags/${TAG}/${f}?format=TEXT" \
+                    | base64 -d > "${target}/${f}"
+            done < <(grep -h '^diff --git' "${PATCHES}/${pdir}"/[0-9]*.patch \
+                     | sed 's|^diff --git a/||; s| b/.*$||' | sort -u)
+            ( cd "${target}" && git add -A \
+                && git commit -qm "pristine ${TAG} (series-touched files)" )
+        else
+            log "  clone ${sub} @ ${TAG}"
+            git clone --quiet --depth 1 --branch "${TAG}" "${url}" "${target}"
+            ( cd "${target}" && git config user.name "ci" && git config user.email "ci@localhost" )
+        fi
         log "  git am ${pdir}"
         if ! apply_series "${target}" "${pdir}"; then
             err "FAILED to apply ${pdir} to ${sub}"

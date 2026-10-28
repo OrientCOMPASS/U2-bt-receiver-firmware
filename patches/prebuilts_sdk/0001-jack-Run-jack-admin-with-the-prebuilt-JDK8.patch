@@ -1,0 +1,38 @@
+From 0a57191c92964008332ec1fa458ee203553b7c8f Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 12:30:53 +0000
+Subject: [PATCH] jack: Run jack-admin with the prebuilt JDK8
+
+The setup-jack-server rule inherits a hermetic PATH from soong/kati, so
+the server JVM is the system openjdk (8u292 on Ubuntu 16.04).  Its
+post-8u261 TLS policy cannot handshake with the distro curl
+(GnuTLS 3.4.10), so jack-admin health checks fail:
+"Jack server failed to (re)start" / "SSL error when connecting".
+
+Prefix every jack-admin invocation with the AOSP-prebuilt JDK8
+(8u152-android, prebuilts/jdk/jdk8/linux-x86), which is the official
+8.1 toolchain and handshakes fine with the 16.04 curl.  Verified A/B on
+the U2 build machine: 8u292 server + curl w/ client cert = handshake
+fail; 8u152 server + same curl = HTTP response.
+
+Change-Id: Iea81f0b4a532a7357ba182e4722bde553f8d9ed9
+---
+ tools/jack_server_setup.mk | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/jack_server_setup.mk b/tools/jack_server_setup.mk
+index 780f890..9a6cbb1 100644
+--- a/tools/jack_server_setup.mk
++++ b/tools/jack_server_setup.mk
+@@ -33,7 +33,7 @@ endif
+ endif
+ 
+ .PHONY: setup-jack-server
+-setup-jack-server : PRIVATE_JACK_ADMIN := $(LOCAL_PATH)/jack-admin
++setup-jack-server : PRIVATE_JACK_ADMIN := env PATH=$(abspath $(LOCAL_PATH)/../../jdk/jdk8/linux-x86/bin):$$PATH $(LOCAL_PATH)/jack-admin
+ setup-jack-server : PRIVATE_PATH := $(LOCAL_PATH)
+ setup-jack-server : PRIVATE_SERVER_VERSION := $(jack_server_version)
+ setup-jack-server : PRIVATE_SERVER_JAR := $(jack_server_jar)
+-- 
+2.7.4
+

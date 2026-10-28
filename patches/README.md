@@ -19,11 +19,26 @@ patches/
 │   ├── 0001-a2dp-aac-Add-A2DP-AAC-sink-codec-support.patch
 │   ├── 0002-a2dp-aac-Backport-the-AAC-sink-decoder-from-pie.patch
 │   ├── 0003-btif-a2dp_sink-Dispatch-SBC-AAC-decoding-by-codec-type.patch
-│   └── 0004-a2dp-sbc-Raise-the-sink-bitpool-ceiling-for-SBC-XQ.patch
+│   ├── 0004-a2dp-sbc-Raise-the-sink-bitpool-ceiling-for-SBC-XQ.patch
+│   └── 0005-a2dp-vendor-Handle-SINK_AAC-in-the-vendor-codec-swit.patch
+├── prebuilts_sdk/            # applied to  platform/prebuilts/sdk
+│   └── 0001-jack-Run-jack-admin-with-the-prebuilt-JDK8.patch
 └── packages_apps_Bluetooth/  # applied to  platform/packages/apps/Bluetooth
     ├── 0001-a2dpsink-Bind-each-StreamHandler-to-its-own-BluetoothDevice.patch
     └── MULTIDEVICE.md        # design guide for the full F6 rewrite
 ```
+
+`prebuilts_sdk` is verified in CI in *lite* mode: the repository is multiple
+gigabytes, so `scripts/apply-patches.sh --verify` fetches only the files the
+series touches (googlesource `?format=TEXT`) into a mini repo and `git am`s
+them there — the same pristine-context guarantee, without the clone.
+
+`0001-jack-...` fixes `setup-jack-server` on hosts whose system OpenJDK is
+8u261+ (TLS policy that the Ubuntu 16.04 curl/GnuTLS client cannot handshake
+with): the rule runs `jack-admin` with the tree's own `prebuilts/jdk/jdk8`
+(8u152-android, the official 8.1 toolchain).  Found by the on-hardware smoke
+build; A/B-verified live (8u292 server: handshake fail; 8u152 server: HTTP
+response over mutual-TLS).
 
 ## How to apply
 
