@@ -149,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           NEW="$RUNNER_TEMP/new/bluetooth.default.so"
-          mkdir -p /mnt/nswap
+          sudo mkdir -p /mnt/nswap
           sudo mount -o loop,rw "$RUNNER_TEMP/baseline/system.raw.img" /mnt/nswap
           df -h /mnt/nswap
           OLD=/mnt/nswap/lib/hw/bluetooth.default.so
