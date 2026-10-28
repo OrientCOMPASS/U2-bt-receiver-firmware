@@ -1,0 +1,43 @@
+From ad38000576b0898adf89d3cb17ce56e5497ab199 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:25:23 +0000
+Subject: [PATCH] a2dp: vendor: Handle SINK_AAC in the vendor codec switches
+
+The libhardware patch adds BTAV_A2DP_CODEC_INDEX_SINK_AAC to
+btav_a2dp_codec_index_t.  Both switches over that enum in
+a2dp_vendor.cc are exhaustive without a default clause, so the new
+value trips -Werror,-Wswitch and breaks the libbluetooth build
+(observed in the r80 smoke build on the U2 build machine).
+
+SINK_AAC is not a vendor-specific codec: group it with SOURCE_AAC and
+the SBC indices so both switches break out, yielding "UNKNOWN CODEC
+INDEX" / false exactly as for the other AOSP codecs.
+
+Part of the KeenPlus U2 A2DP sink work.
+---
+ stack/a2dp/a2dp_vendor.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/stack/a2dp/a2dp_vendor.cc b/stack/a2dp/a2dp_vendor.cc
+index f0fc277..7443865 100644
+--- a/stack/a2dp/a2dp_vendor.cc
++++ b/stack/a2dp/a2dp_vendor.cc
+@@ -507,6 +507,7 @@ const char* A2DP_VendorCodecIndexStr(btav_a2dp_codec_index_t codec_index) {
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_SBC:
+     case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_AAC:
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+       break;  // These are not vendor-specific codecs
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_APTX:
+       return A2DP_VendorCodecIndexStrAptx();
+@@ -529,6 +530,7 @@ bool A2DP_VendorInitCodecConfig(btav_a2dp_codec_index_t codec_index,
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_SBC:
+     case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_AAC:
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
+       break;  // These are not vendor-specific codecs
+     case BTAV_A2DP_CODEC_INDEX_SOURCE_APTX:
+       return A2DP_VendorInitCodecConfigAptx(p_cfg);
+-- 
+2.39.5
+
