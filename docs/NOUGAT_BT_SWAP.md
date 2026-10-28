@@ -23,9 +23,9 @@
 |---|---|---|
 | `/system/lib/hw/bluetooth.default.so` | 我们编译（7.0 源码 + 移植补丁） | 7.0 时代协议栈**整体**编进这一个 .so（无独立 libbluetooth.so） |
 | `/system/lib/libbluetooth_jni.so` | 我们编译 | JNI 层；若 Java 层不改则可暂留基线原件（见 §5 R3） |
-| `/system/app/Bluetooth/Bluetooth.apk`(+odex) | 我们编译或暂留基线 | 需要 hidden-API framework；见 §5 R3 |
-| `/system/lib/hw/audio.a2dp.default.so` | 我们编译 | A2DP 音频 HAL |
-| `/system/lib/libFraunhoferAAC.so` 或静态编入 | external/aac @7.0 | AAC 解码依赖；先确认基线是否已带（B2 步骤） |
+| `/system/app/Bluetooth/Bluetooth.apk`(+odex)（镜像内路径 `/app/Bluetooth/`） | 暂留基线原件 | 实测 APK 619,805B + odex 8.65MB；Java 层不动（§5 R3/R6） |
+| `/system/lib/hw/audio.a2dp.default.so` | **B3 再定** | B1 实测：导出面仅 `HMI`+aeabi 符号、用 socket 通信，疑非 AOSP 标准 `audio_a2dp_hw`；移植栈 sink 音频优先直写 AudioTrack（MTK 已验证路径），本文件可能无需替换（§4.1） |
+| AAC 解码 | **静态编入**我们的 .so | B1 实测：基线**无** `libFraunhoferAAC.so`（仅 stagefright 软解插件 `libstagefright_soft_aacdec.so`，栈不可直用）→ 7.0 树 `external/aac` 源码静态链进 `bluetooth.default.so`，不新增系统库 |
 | MTK 私有件（preloader/lk/logo/secro/tee/libbt-vendor.so/…） | **原样保留** | 芯片适配层不动 |
 
 ## 3. 已验证的实验证据（2026-10-28）
@@ -53,11 +53,10 @@ r80 `system/bt` 全栈编译成了 ARM/bionic 目标码：
 ## 4. 里程碑
 
 - **B0（已完成）** 独立编译环境验证：`bt_standalone_build.sh` + CI workflow。
-- **B1 基线解剖**（工具已就绪：`scripts/baseline_probe.py` + `baseline-probe.yml`，
-  纯 stdlib 的 zip/ext4/ELF32 解析器，无需 root/loop-mount）：产出
-  `build.prop` 精确版本、蓝牙文件清单、`bluetooth.default.so` 的
-  DT_NEEDED/符号表、依赖闭包库全量提取（B3 真链接的输入）。据此确定 AOSP
-  源码 tag（如 `android-7.0.0_r36`）。
+- **B1 基线解剖（✅ 已完成，run 40630128218，真实官方固件）**：工具
+  `scripts/baseline_probe.py` + `baseline-probe.yml`（纯 stdlib 的
+  zip/sparse/ext4/ELF32 解析器，无需 root/loop-mount）。实测结果见 §4.1，
+  **AOSP tag 定为 `android-7.0.0_r36`**（基线为 7.0 NRD90M，R5 解除）。
 - **B2 补丁移植**：把 4+1 个补丁从 r80 移植到 7.0 树
   （栈位置不同：`hardware/broadcom/bluetooth`；无 `a2dp_codecs` 框架，
   AAC sink 需要按 7.0 的 `btif_a2dp_sink`/`bta_av` 结构重写挂接点）。
@@ -71,15 +70,77 @@ r80 `system/bt` 全栈编译成了 ARM/bionic 目标码：
 - **B5 上机验证**（用户侧）：刷机、开关蓝牙、A2DP Sink SBC/AAC 连接出声、
   双设备（F6 受 7.0 单状态机限制，见 §5 R4）、延迟/稳定性按 R 指标抽测。
 
+### 4.1 B1 实测结果（官方固件 `B04_35_1.5_8_3inch_M304_ST7701SN_20251016.zip`）
+
+**版本指纹**（build.prop 实测）：
+
+| 属性 | 值 | 结论 |
+|---|---|---|
+| ro.build.version.release / sdk | **7.0 / 24** | R5 解除：不是 7.1 |
+| ro.build.id（fingerprint 内） | **NRD90M** user/release-keys | AOSP tag 基准 |
+| ro.build.version.security_patch | 2019-05-05 | MTK 自行回合的补丁级别 |
+| ro.mediatek.version.release | alps-mp-n0.mp1-V1.19_tek6735m.65.d.n_P133 | MTK N0.MP1 V1.19 树 |
+| ro.board.platform / device / model | mt6735m / U2 / U2 | 与开发方案一致 |
+| ro.build.date | 2025-10-16 | 近期用旧 MTK 树重出 |
+
+**→ B2 checkout tag：`android-7.0.0_r36`**（7.0 系末代 tag，NRD90M 同系；
+harness `--tag` 直接传参）。
+
+**system.img 形态**：MTK 变体 sparse（block_size=4096，数据块标 0xCAC1、
+空洞标 0xCAC3，共 5,463 chunk）→ 探针自动转 raw 3,095,396,352 B
+（=2952 MiB，与 scatter 分区尺寸一致）；ext4：4096B 块、743,916 块、
+23 组、2,493 文件/369 目录；lib 243 个 + vendor/lib 225 个。
+
+**蓝牙部件清单**（替换目标 = 前 5 项；MTK 私有链不动）：
+
+| 文件 | 大小 | 处置 |
+|---|---|---|
+| `/system/lib/hw/bluetooth.default.so` | 1,735,356（导出 805/未定义 259） | **换**：7.0 移植版合并栈 |
+| `/system/lib/libbluetooth_jni.so` | 110,820 | 首选**不换**（仅经 `hw_get_module` 用 HAL，与栈零符号耦合）；`/app/Bluetooth/lib/arm/` 下是 31B 符号链接 |
+| `/app/Bluetooth/Bluetooth.apk` + `oat/arm/*.odex` | 619,805 + 8.65M | **不换**（R3/R6 首选路径：Java 层不动，odex 保留） |
+| `/system/lib/hw/audio.a2dp.default.so` | 30,364 | **B3 再定**：导出仅 `HMI`+aeabi 辅助符号、未定义含 `connect/send/setsockopt`，疑似 MTK 自定义而非 AOSP `audio_a2dp_hw` |
+| `/system/lib/{libchrome,libprotobuf-cpp-full,libevent}.so` | 837,680 / 697,944 / 239,324 | **保留可用**：换入栈可直接 DT_NEEDED 基线已有库 |
+| `/vendor/lib/libbt-vendor.so` → `libbluetooth_mtk.so` → `libnvram*` | 13,844 → 30,268 → … | **不动**：导出标准 `BLUETOOTH_VENDOR_LIB_INTERFACE`；固件下载（`GORM_FW_Init_Thread`/`BT_InitDevice`）与 NVRAM 全在链内自洽 |
+| `/vendor/lib/libbluetooth{em_mtk,_relayer,_hw_test,_mtk_pure}.so` | 17–31K | **不动**：工程模式工具，全镜像 grep 无一导入 `BTA_/BTIF_/BTM_/GATT_` 栈符号 |
+| `/system/etc/bluetooth/bt_stack.conf`、`bt_did.conf`、`/system/etc/a2dp_audio_policy_configuration.xml` | ~2–3K | 保留；B2 对照 MTK 特有键与移植栈的解析代码 |
+
+**位宽**：`bluetooth.default.so` **只有 32 位版**（无 `/system/lib64/hw/`
+对应物）；`/vendor/lib64/*` 实为与 `/vendor/lib/*` 同尺寸的 **ELF32 复制品**
+（探针按 ELF32LE 解析成功）。→ 交付物只需 32 位（armv7a），与独立编译
+harness 目标一致。
+
+**ABI 决定性结论（R1 基本解除）**：
+1. 全镜像没有任何库导入 `bluetooth.default.so` 的 805 个栈导出符号；JNI 层
+   只经 `hw_get_module` 拿 HAL 结构体 → **替换只需保 HAL（`bt_interface_t`）
+   + vendor dlopen 约定，栈导出面可自由变化**。
+2. MTK 私有依赖集中在交互层：`libcustom_prop`（`property_get` 包装，与
+   libcutils 同 ABI）、`libmedia`（`android::AudioTrack` 全套符号 →
+   **MTK 栈的 sink 音频很可能直写 AudioTrack**）、`libstagefright`（DT_NEEDED
+   在列、栈符号导入极少）。纯 AOSP 7.0 Fluoride 核心 + MTK 外挂，
+   与"只换栈、vendor 链不动"的策略兼容。
+3. **音频路径待办（B2/B3）**：基线 `audio.a2dp.default.so` 非 AOSP 标准形态，
+   移植栈的 sink 输出二选一——(a) 学 MTK 直写 AudioTrack（基线已验证可行，
+   无需动 audio HAL）；(b) 换 AOSP `audio_a2dp_hw` 版 HAL。优先 (a)，
+   改动面最小且与保留的 audioserver/audio_policy 完全兼容。
+
+**连接芯片**：MT6627 combo（`ROMv2_lm_patch_1_{0,1}_hdr.bin`、
+`WIFI_RAM_CODE_6735`、`mt6627_fm_v1_*.bin`、`WMT_SOC.cfg` 均在
+`/vendor/firmware/`）→ F10 WiFi/FM 用基线原件；BT 固件下载由不动的
+`libbt-vendor` 链负责。
+
+**产物位置**：CI run 40630128218 → artifact `baseline-probe-report`
+（92KB：`report.json` + 19 库×导出/未定义符号表 37 份）、
+`baseline-bt-extracted`（16.4MB：B3 真链接输入的全部 .so）。
+
 ## 5. 风险与对策
 
 | # | 风险 | 对策 |
 |---|---|---|
-| R1 | MTK 在 7.0 的 `bluetooth.default` 里有私有改动（非纯 AOSP） | B1 对比基线 .so 与纯 AOSP 7.0 编译产物的符号/字符串差异；差异集中在 vendor 交互层则安全，若涉栈内部则评估保留 MTK 版 HAL 外壳、只换栈对象 |
+| R1 | MTK 在 7.0 的 `bluetooth.default` 里有私有改动（非纯 AOSP） | **B1 已解除大半**：全镜像无库导入其 805 个栈导出符号，JNI 只走 `hw_get_module`；私有依赖集中在 `libcustom_prop`/`libmedia`(AudioTrack)/`libstagefright` 交互层。替换只需保 HAL + vendor dlopen 约定（§4.1） |
 | R2 | SELinux 拒绝新栈的访问（7.0 策略是 MTK 定死的） | 进程名/域不变（`bluetooth`），大概率兼容；B5 用 `logcat -b events`/`dmesg` 抓 avc denial，必要时用 magisk 式策略补丁或退回 superuser 调试 |
 | R3 | `Bluetooth.apk` 需 hidden-API framework（7.0） | 首选：Java 层不动（AAC sink 协商全在原生栈），只换 .so；确需改 APK 时，用基线 `framework.jar`（dex2jar）+ 7.0 源码树编译 |
 | R4 | F6 双设备在 7.0 与 8.1 同样受单 A2DP 状态机限制 | 与 8.1 路线一致：交付设备感知 StreamHandler 设计（`patches/MULTIDEVICE.md`），7.0 先落地 F1–F5、F7–F8 |
-| R5 | 基线是 7.1 而非 7.0 | B1 先读 `build.prop` 再定 tag，harness `--tag` 已参数化 |
+| R5 | 基线是 7.1 而非 7.0 | **B1 已解除**：build.prop 实测 7.0/SDK24/NRD90M → tag `android-7.0.0_r36`（§4.1） |
 | R6 | 换件后 `dex2oat`/odex 失效导致 APK 不启动 | 保留原 odex 则必须不改 APK（R3 首选路径自洽）；改 APK 就删对应 odex 让 ART 重编 |
 
 ## 6. 与既有产物的关系
