@@ -92,19 +92,9 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := libion_u2
-# renamed from libion: name collides with an AOSP source module (see RENAMED in gen-vendor-mk.py)
-LOCAL_INSTALLED_MODULE_STEM := libion.so
-LOCAL_MODULE_CLASS := SHARED_LIBRARIES
-LOCAL_MODULE_SUFFIX := .so
-LOCAL_SRC_FILES := proprietary/lib/libion.so
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-include $(BUILD_PREBUILT)
-
-include $(CLEAR_VARS)
 LOCAL_MODULE := libion_mtk
+# install-name fixup: file was renamed during extraction, runtime soname is the original one (see STEM_FIXUP in gen-vendor-mk.py)
+LOCAL_INSTALLED_MODULE_STEM := libion.so
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
 LOCAL_SRC_FILES := proprietary/vendor/lib/libion_mtk.so

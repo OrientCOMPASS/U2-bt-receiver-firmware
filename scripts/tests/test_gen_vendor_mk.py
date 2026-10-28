@@ -41,12 +41,27 @@ class TestClassify(unittest.TestCase):
         self.assertFalse(e.hw)
 
     def test_colliding_name_is_renamed_with_stem(self):
-        # libion collides with system/core/libion -- renamed module, original
-        # install filename preserved via LOCAL_MODULE_STEM.
-        e = gv.classify("vendor/lib/libion.so")
+        # libpower collides with hardware/libhardware_legacy's AOSP module --
+        # renamed module, original install filename preserved via
+        # LOCAL_INSTALLED_MODULE_STEM.
+        e = gv.classify("lib/libpower.so")
         self.assertEqual(e.kind, "lib")
-        self.assertEqual(e.module, "libion_u2")
+        self.assertEqual(e.module, "libpower_u2")
+        self.assertEqual(e.stem, "libpower.so")
+
+    def test_extraction_renamed_file_keeps_runtime_soname(self):
+        # libion_mtk is how extract-files.sh stored the baseline
+        # /vendor/lib/libion.so; it must still INSTALL as libion.so.
+        e = gv.classify("vendor/lib/libion_mtk.so")
+        self.assertEqual(e.module, "libion_mtk")
         self.assertEqual(e.stem, "libion.so")
+
+    def test_aosp_symbol_identical_libion_not_extracted(self):
+        # The system-side copy is gone from the list: AOSP system/core/libion
+        # is symbol-identical (verified via nm -D) and owns /system/lib.
+        e = gv.classify("vendor/lib/libion.so")
+        self.assertEqual(e.module, "libion")
+        self.assertEqual(e.stem, "")
 
     def test_non_colliding_name_has_no_stem(self):
         e = gv.classify("vendor/lib/libaed.so")

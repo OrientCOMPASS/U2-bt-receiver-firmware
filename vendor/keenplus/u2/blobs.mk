@@ -13,7 +13,6 @@ PRODUCT_PACKAGES += \
     libged \
     libgpu_aux \
     libgralloc_extra \
-    libion_u2 \
     libion_mtk \
     libbwc \
     libdpframework \

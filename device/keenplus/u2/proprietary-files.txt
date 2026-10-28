@@ -36,9 +36,12 @@ vendor/lib/libgralloc_extra.so
 # HAL links against the classic tinyalsa C ABI, which AOSP 8.1 provides;
 # device.mk adds libtinyalsa explicitly and the post-extraction dep scan
 # verifies every UND tinyalsa symbol resolves.
-# NOTE: the next four live in the baseline /system/lib (image path lib/),
-# not /vendor/lib -- verified with debugfs against the stock image.
-lib/libion.so
+# NOTE: the entries under lib/ live in the baseline /system/lib (image path
+# lib/), not /vendor/lib -- verified with debugfs against the stock image.
+# lib/libion.so is NOT extracted: AOSP system/core/libion is built for this
+# product anyway and is symbol-identical to the baseline copy (nm -D: same 12
+# exports), so it owns /system/lib/libion.so.  A second module installing to
+# that path made the AOSP strip step race/fail ("no symbols").
 vendor/lib/libion_mtk.so
 vendor/lib/libbwc.so
 vendor/lib/libdpframework.so
