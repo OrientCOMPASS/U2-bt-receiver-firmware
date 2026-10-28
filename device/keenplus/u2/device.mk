@@ -34,7 +34,12 @@ PRODUCT_PACKAGES += \
 # libxml2: many MTK blobs (libpq_cust/libperfservicenative/...) DT_NEEDED it;
 # the AOSP 8.1 source build provides the same soname (libc/libm/libz/libdl
 # only) so the baseline copy is deliberately not extracted.
+# libion: same story -- the baseline /system/lib/libion.so is symbol-identical
+# to AOSP system/core/libion (nm -D: same 12 exports) and 7 vendor blobs
+# DT_NEEDED it; listed explicitly so it is installed even though nothing else
+# in the product links it at build time.
 PRODUCT_PACKAGES += \
+    libion \
     libxml2 \
     audio.a2dp.default \
     audio.r_submix.default \
