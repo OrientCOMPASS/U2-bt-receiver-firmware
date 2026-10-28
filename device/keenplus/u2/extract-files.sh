@@ -159,8 +159,9 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
             echo "[file] ${line} (symlink dereferenced from ${src})"
         fi
         extracted=$((extracted+1))
-        # 32-bit check for ELF shared objects.
-        if readelf -h "${dst}" >/dev/null 2>&1; then
+        # 32-bit check for ELF shared objects.  EXCEPTION: the lib64/
+        # runtime shim for the AArch64 wmt tools is 64-bit by design (D2).
+        if [[ "${line}" != lib64/* ]] && readelf -h "${dst}" >/dev/null 2>&1; then
             class="$(readelf -h "${dst}" | awk -F: '/Class:/ {gsub(/ /,"",$2); print $2}')"
             if [[ "${class}" == "ELF64" ]]; then
                 echo "ERROR: ${line} is ELF64 but this port is 32-bit-only (D2)." >&2

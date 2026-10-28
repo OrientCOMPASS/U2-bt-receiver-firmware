@@ -1,0 +1,38 @@
+# init.u2.connectivity.rc -- minimal MTK connectivity/power services for u2.
+#
+# Trimmed from the baseline ramdisk's init.connectivity.rc (WMT section) and
+# init.mt6735.rc (nvram/fuelgauged).  Installed to /system/etc/init/ so 8.1
+# init imports it automatically (no ramdisk import chain needed).
+#
+# NOT started here (present in the baseline but out of scope for the BT
+# receiver): mnld/MPED (GPS), stp_dump3 (WCN coredump), wcn wifi/fm drivers.
+#
+# wmt_loader + wmt_launcher download the MT6627 combo firmware over UART/STP
+# at boot; the Bluetooth stack (libbt-vendor -> /dev/stpbt) depends on it.
+# These two binaries are AArch64 in the baseline and run through the
+# linker64/lib64 shim (see proprietary-files.txt "64-bit runtime shim").
+
+service wmt_loader /vendor/bin/wmt_loader
+    class core
+    user root
+    group root
+    oneshot
+
+service wmt_launcher /vendor/bin/wmt_launcher -p /vendor/firmware/
+    class core
+    user system
+    group system
+
+# NVRAM: BT/Wi-Fi MAC addresses and RF calibration live here; libbt-vendor
+# reads the BT address through libnvram at stack startup.
+service nvram_daemon /vendor/bin/nvram_daemon
+    class main
+    user root
+    group system
+    oneshot
+
+# MTK fuel gauge daemon (battery percentage/cycling).  32-bit ARM blob.
+service fuelgauged /vendor/bin/fuelgauged
+    class main
+    user system
+    group system

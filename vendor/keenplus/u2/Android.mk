@@ -594,6 +594,39 @@ LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
 include $(CLEAR_VARS)
+LOCAL_MODULE := libcustom_nvram
+LOCAL_MODULE_CLASS := SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX := .so
+LOCAL_SRC_FILES := proprietary/vendor/lib/libcustom_nvram.so
+LOCAL_MODULE_TAGS := optional
+LOCAL_MULTILIB := 32
+LOCAL_STRIP_MODULE :=
+LOCAL_VENDOR_MODULE := true
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libfile_op
+LOCAL_MODULE_CLASS := SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX := .so
+LOCAL_SRC_FILES := proprietary/vendor/lib/libfile_op.so
+LOCAL_MODULE_TAGS := optional
+LOCAL_MULTILIB := 32
+LOCAL_STRIP_MODULE :=
+LOCAL_VENDOR_MODULE := true
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libhwm
+LOCAL_MODULE_CLASS := SHARED_LIBRARIES
+LOCAL_MODULE_SUFFIX := .so
+LOCAL_SRC_FILES := proprietary/vendor/lib/libhwm.so
+LOCAL_MODULE_TAGS := optional
+LOCAL_MULTILIB := 32
+LOCAL_STRIP_MODULE :=
+LOCAL_VENDOR_MODULE := true
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
 LOCAL_MODULE := libcustom_prop
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_MODULE_SUFFIX := .so
@@ -676,16 +709,6 @@ LOCAL_STRIP_MODULE :=
 LOCAL_VENDOR_MODULE := true
 include $(BUILD_PREBUILT)
 
-include $(CLEAR_VARS)
-LOCAL_MODULE := permission_check
-LOCAL_MODULE_CLASS := EXECUTABLES
-LOCAL_SRC_FILES := proprietary/vendor/bin/permission_check
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_STRIP_MODULE :=
-LOCAL_VENDOR_MODULE := true
-include $(BUILD_PREBUILT)
-
 # ---- data files (NOT modules) ----
 # The following list entries are firmware/config/data, installed
 # via PRODUCT_COPY_FILES (see device.mk and blobs.mk), not as
@@ -693,13 +716,20 @@ include $(BUILD_PREBUILT)
 #   vendor/etc/audio_device.xml
 #   vendor/etc/audio_em.xml
 #   vendor/etc/audio_param
-#   etc/firmware/ROMv2_lm_patch_1_0_hdr.bin
-#   etc/firmware/ROMv2_lm_patch_1_1_hdr.bin
-#   etc/firmware/WMT_SOC.cfg
-#   etc/firmware/WIFI_RAM_CODE_6735
-#   etc/firmware/mt6627_fm_v1_coeff.bin
-#   etc/firmware/mt6627_fm_v1_patch.bin
+#   vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin
+#   vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin
+#   vendor/firmware/WMT_SOC.cfg
+#   vendor/firmware/WIFI_RAM_CODE_6735
+#   vendor/firmware/mt6627_fm_v1_coeff.bin
+#   vendor/firmware/mt6627_fm_v1_patch.bin
 #   etc/wifi/wpa_supplicant.conf
 #   etc/wifi/p2p_supplicant_overlay.conf
 #   etc/wifi/wpa_supplicant_overlay.conf
+#   bin/linker64
+#   lib64/libc.so
+#   lib64/libm.so
+#   lib64/libdl.so
+#   lib64/liblog.so
+#   lib64/libc++.so
+#   lib64/libcutils.so
 #   vendor/etc/.tp

@@ -79,16 +79,41 @@ PRODUCT_COPY_FILES += \
     device/keenplus/u2/rootdir/enableswap.sh:root/enableswap.sh
 
 # --------------------------------------------------------------------------- #
-# Firmware (MT6627 BT/Wi-Fi/FM).  Modem/DSP/catcher images are NOT copied
-# (non-goal, plan section 9).
+# Firmware (MT6627 BT/Wi-Fi/FM).  Installed to /vendor/firmware (i.e.
+# system/vendor/firmware on this non-Treble build) because the baseline
+# starts wmt_launcher with `-p /vendor/firmware/`.  Modem/DSP/catcher images
+# are NOT copied (non-goal, plan section 9).
 # --------------------------------------------------------------------------- #
 PRODUCT_COPY_FILES += \
-    vendor/keenplus/u2/proprietary/etc/firmware/ROMv2_lm_patch_1_0_hdr.bin:system/etc/firmware/ROMv2_lm_patch_1_0_hdr.bin \
-    vendor/keenplus/u2/proprietary/etc/firmware/ROMv2_lm_patch_1_1_hdr.bin:system/etc/firmware/ROMv2_lm_patch_1_1_hdr.bin \
-    vendor/keenplus/u2/proprietary/etc/firmware/WMT_SOC.cfg:system/etc/firmware/WMT_SOC.cfg \
-    vendor/keenplus/u2/proprietary/etc/firmware/WIFI_RAM_CODE_6735:system/etc/firmware/WIFI_RAM_CODE_6735 \
-    vendor/keenplus/u2/proprietary/etc/firmware/mt6627_fm_v1_coeff.bin:system/etc/firmware/mt6627_fm_v1_coeff.bin \
-    vendor/keenplus/u2/proprietary/etc/firmware/mt6627_fm_v1_patch.bin:system/etc/firmware/mt6627_fm_v1_patch.bin
+    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin:vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin:vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/WMT_SOC.cfg:vendor/firmware/WMT_SOC.cfg \
+    vendor/keenplus/u2/proprietary/vendor/firmware/WIFI_RAM_CODE_6735:vendor/firmware/WIFI_RAM_CODE_6735 \
+    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_coeff.bin:vendor/firmware/mt6627_fm_v1_coeff.bin \
+    vendor/keenplus/u2/proprietary/vendor/firmware/mt6627_fm_v1_patch.bin:vendor/firmware/mt6627_fm_v1_patch.bin
+
+# --------------------------------------------------------------------------- #
+# 64-bit runtime shim (decision D2, corrected): the baseline product is
+# arm64 (ro.product.cpu.abi=arm64-v8a) and wmt_loader / wmt_launcher /
+# stp_dump3 are AArch64.  u2 stays 32-bit, but the arm64 kernel runs both,
+# so the baseline 7.0 linker64 + the exact lib64 closure of those tools is
+# installed verbatim.  The 32-bit framework never loads these files.
+# --------------------------------------------------------------------------- #
+PRODUCT_COPY_FILES += \
+    vendor/keenplus/u2/proprietary/bin/linker64:system/bin/linker64 \
+    vendor/keenplus/u2/proprietary/lib64/libc.so:system/lib64/libc.so \
+    vendor/keenplus/u2/proprietary/lib64/libm.so:system/lib64/libm.so \
+    vendor/keenplus/u2/proprietary/lib64/libdl.so:system/lib64/libdl.so \
+    vendor/keenplus/u2/proprietary/lib64/liblog.so:system/lib64/liblog.so \
+    vendor/keenplus/u2/proprietary/lib64/libc++.so:system/lib64/libc++.so \
+    vendor/keenplus/u2/proprietary/lib64/libcutils.so:system/lib64/libcutils.so
+
+# --------------------------------------------------------------------------- #
+# MTK vendor services (WMT firmware download for BT, nvram, fuel gauge).
+# Placed in /system/etc/init/ where 8.1 init auto-imports it.
+# --------------------------------------------------------------------------- #
+PRODUCT_COPY_FILES += \
+    device/keenplus/u2/rootdir/init.u2.connectivity.rc:system/etc/init/init.u2.connectivity.rc
 
 # --------------------------------------------------------------------------- #
 # Resource overlay (Bluetooth profile switches + framework config)

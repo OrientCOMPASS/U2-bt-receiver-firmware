@@ -30,7 +30,11 @@ BOARD_USES_MTK_HARDWARE := true
 # Kernel: self-built prebuilt (plan section 13)
 # --------------------------------------------------------------------------- #
 TARGET_PREBUILT_KERNEL := device/keenplus/u2/prebuilt/kernel
-BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2 androidboot.veritymode=disabled
+# v1 bring-up: permissive until the MTK vendor services (wmt_loader,
+# wmt_launcher, nvram_daemon, fuelgauged -- unlabelled 7.0 binaries running
+# through the linker64 shim) have their own domains.  Shipping builds MUST
+# re-enable enforcing and add policy under device/keenplus/u2/sepolicy/.
+BOARD_KERNEL_CMDLINE := bootopt=64S3,32N2,64N2 androidboot.veritymode=disabled androidboot.selinux=permissive
 BOARD_KERNEL_PAGESIZE := 2048
 BOARD_KERNEL_BASE := 0x40080000
 # offset semantics: mkbootimg computes addr = base + offset.  The baseline header

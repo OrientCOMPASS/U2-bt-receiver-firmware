@@ -98,6 +98,12 @@ def classify(path: str) -> Entry:
     hw = "/hw/" in ("/" + p) or p.startswith("hw/")
     vendor = p.startswith("vendor/")
 
+    # 64-bit runtime shim (bin/linker64 + lib64/*.so): installed verbatim via
+    # PRODUCT_COPY_FILES, NOT as prebuilt modules (the product is 32-bit, so a
+    # BUILD_PREBUILT module could never carry these AArch64 files).
+    if p.startswith("lib64/") or base == "linker64":
+        return Entry(path, "data", "", p, hw, vendor)
+
     if p.endswith(".so"):
         module = base[:-3]
         stem = ""

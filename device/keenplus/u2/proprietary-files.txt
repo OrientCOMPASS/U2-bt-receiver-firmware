@@ -72,14 +72,14 @@ vendor/lib/libbluetooth_mtk_pure.so
 vendor/lib/libbluetooth_relayer.so
 vendor/lib/libbluetoothem_mtk.so
 vendor/lib/libbluetooth_hw_test.so
-etc/firmware/ROMv2_lm_patch_1_0_hdr.bin
-etc/firmware/ROMv2_lm_patch_1_1_hdr.bin
-etc/firmware/WMT_SOC.cfg
+vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin
+vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin
+vendor/firmware/WMT_SOC.cfg
 
 # ---- Wi-Fi / FM / GPS (MT6627 combo) ----
-etc/firmware/WIFI_RAM_CODE_6735
-etc/firmware/mt6627_fm_v1_coeff.bin
-etc/firmware/mt6627_fm_v1_patch.bin
+vendor/firmware/WIFI_RAM_CODE_6735
+vendor/firmware/mt6627_fm_v1_coeff.bin
+vendor/firmware/mt6627_fm_v1_patch.bin
 vendor/lib/hw/radio.fm.mt6737m.so
 vendor/lib/hw/flp.mt6737m.so
 vendor/lib/hw/gps.mt6735m.so
@@ -101,10 +101,30 @@ vendor/lib/hw/power.mt6735m.so
 vendor/lib/libSoftGatekeeper.so
 vendor/lib/libnvram.so
 vendor/lib/libnvram_daemon_callback.so
+# nvram_daemon DT_NEEDED closure (verified via readelf on the baseline):
+vendor/lib/libcustom_nvram.so
+vendor/lib/libfile_op.so
+vendor/lib/libhwm.so
 vendor/lib/libcustom_prop.so
 vendor/bin/fuelgauged
 vendor/bin/nvram_daemon
-vendor/bin/permission_check
+
+# ---- 64-bit runtime shim (decision D2, corrected) ----
+# The baseline is a 64-bit product (ro.product.cpu.abi=arm64-v8a):
+# /vendor/bin/wmt_loader, wmt_launcher and stp_dump3 are AArch64 even
+# though every /vendor/lib blob is 32-bit.  u2 keeps a 32-bit system, but
+# the arm64 kernel runs both ABIs, so the baseline 7.0 loader64 plus the
+# exact lib64 closure of those three tools (readelf-verified: libc, libm,
+# libdl, liblog, libc++, libcutils) is extracted here and installed to
+# /system/bin/linker64 and /system/lib64/ via PRODUCT_COPY_FILES (see
+# device.mk).  The 32-bit framework never loads these.
+bin/linker64
+lib64/libc.so
+lib64/libm.so
+lib64/libdl.so
+lib64/liblog.so
+lib64/libc++.so
+lib64/libcutils.so
 
 # ---- Touch parameters ----
 vendor/etc/.tp
@@ -113,13 +133,14 @@ vendor/etc/.tp
 # EXPLICITLY NOT EXTRACTED (plan sections 9 and 15.1) -- listed here so the
 # omission is deliberate and auditable, not an oversight:
 #   vendor/lib/hw/camera.mt6735m.so and all camera blobs
-#   etc/firmware/modem_1_ltg_n.img / catcher_filter_1_ltg_n.bin /
+#   vendor/firmware/modem_1_ltg_n.img / catcher_filter_1_ltg_n.bin /
 #       dsp_1_ltg_n.bin / em_filter_1_ltg_n.bin   (~10 MiB, no modem)
 #   MiraVision / EngineerMode / MTKLogger / Exchange2 / MtkCalendar / Omacp /
 #       AtciService / MDMLSample / LocationEM2 / YGPS / FTPreCheck / SensorHub /
 #       CalendarImporter / DrmProvider
 #   preload/hotapps/*   (993 MiB)
 #   media/1080p.avi     (128 MiB)
-#   lib64/* and vendor/lib64/*   (165 MiB, decision D2)
+#   lib64/* and vendor/lib64/*   (165 MiB, decision D2 -- EXCEPT the seven
+#       shim files in the "64-bit runtime shim" section above)
 #   tts/lang_pico/*     (6.16 MiB)
 # --------------------------------------------------------------------------- #

@@ -57,6 +57,9 @@ PRODUCT_PACKAGES += \
     libSoftGatekeeper \
     libnvram \
     libnvram_daemon_callback \
+    libcustom_nvram \
+    libfile_op \
+    libhwm \
     libcustom_prop \
     wmt_loader \
     wmt_launcher \
@@ -64,8 +67,7 @@ PRODUCT_PACKAGES += \
     mnld \
     MPED \
     fuelgauged \
-    nvram_daemon \
-    permission_check
+    nvram_daemon
 
 # ---- data files still needing explicit PRODUCT_COPY_FILES ----
 # (firmware / wifi / audio_param etc.; device.mk already copies the
@@ -73,13 +75,20 @@ PRODUCT_PACKAGES += \
 #   vendor/etc/audio_device.xml
 #   vendor/etc/audio_em.xml
 #   vendor/etc/audio_param
-#   etc/firmware/ROMv2_lm_patch_1_0_hdr.bin
-#   etc/firmware/ROMv2_lm_patch_1_1_hdr.bin
-#   etc/firmware/WMT_SOC.cfg
-#   etc/firmware/WIFI_RAM_CODE_6735
-#   etc/firmware/mt6627_fm_v1_coeff.bin
-#   etc/firmware/mt6627_fm_v1_patch.bin
+#   vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin
+#   vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin
+#   vendor/firmware/WMT_SOC.cfg
+#   vendor/firmware/WIFI_RAM_CODE_6735
+#   vendor/firmware/mt6627_fm_v1_coeff.bin
+#   vendor/firmware/mt6627_fm_v1_patch.bin
 #   etc/wifi/wpa_supplicant.conf
 #   etc/wifi/p2p_supplicant_overlay.conf
 #   etc/wifi/wpa_supplicant_overlay.conf
+#   bin/linker64
+#   lib64/libc.so
+#   lib64/libm.so
+#   lib64/libdl.so
+#   lib64/liblog.so
+#   lib64/libc++.so
+#   lib64/libcutils.so
 #   vendor/etc/.tp

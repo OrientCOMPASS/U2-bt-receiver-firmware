@@ -53,6 +53,14 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(e.module, "libaed")
         self.assertEqual(e.stem, "")
 
+    def test_lib64_shim_is_data_not_prebuilt(self):
+        # The 64-bit runtime shim must go through PRODUCT_COPY_FILES, never
+        # BUILD_PREBUILT (product is 32-bit-only).
+        e = gv.classify("lib64/libc.so")
+        self.assertEqual(e.kind, "data")
+        e = gv.classify("bin/linker64")
+        self.assertEqual(e.kind, "data")
+
     def test_hw_library(self):
         e = gv.classify("vendor/lib/hw/audio.primary.mt6735m.so")
         self.assertEqual(e.kind, "lib")
