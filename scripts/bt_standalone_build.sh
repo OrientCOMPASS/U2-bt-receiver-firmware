@@ -171,7 +171,17 @@ setup_sources() {
   clone_sparse  av        "$AOSP/frameworks/av" \
       media/libaudioclient/include media/libmedia/include media/libaudiohal/include include
   clone_sparse  sysmedia  "$AOSP/system/media" audio/include audio_utils/include
-  clone_sparse  gtest     "$AOSP/external/googletest" googletest/include
+  if [ ! -d "$SRC/gtest" ]; then
+    # external/googletest carries NO android-7.* tags at all; we only need
+    # gtest/gtest_prod.h (FRIEND_TEST macro) -- version-stable, so pin the
+    # 8.1 tag when building the nougat tree.
+    local gtag="$TAG"
+    [ "$TREE" = nougat ] && gtag="android-8.1.0_r80"
+    echo "[src] clone gtest (sparse: googletest/include @ $gtag)"
+    git clone -q --depth 1 --branch "$gtag" --filter=blob:none --sparse \
+      "$AOSP/external/googletest" "$SRC/gtest"
+    git -C "$SRC/gtest" sparse-checkout set googletest/include
+  fi
   if [ ! -d "$SRC/libchrome" ]; then
     echo "[src] clone libchrome (headers only)"
     git clone -q --depth 1 --branch "$TAG" --filter=blob:none --no-checkout \
