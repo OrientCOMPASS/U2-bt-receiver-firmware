@@ -488,6 +488,52 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Final dropper sweep v7 (vendor URLs, prop fragments, whole-image grep)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== [1] dex containers: property FRAGMENT sweep (catches concat):"
+          : > "$P/v7_prop_fragments.txt"
+          while read -r rel; do
+            f="/mnt/sys/$rel"
+            { sudo strings -a "$f" 2>/dev/null || true; } \
+              | grep -aiE 'persist\.sys\.install|by\.pwd|by\.wifi|installSilent|silentInstall|silent_install|installApk|downloadApk|InstallPwd|WifiSet' \
+              | sort -u | head -20 | sed "s|^|$rel: |" >> "$P/v7_prop_fragments.txt" || true
+          done < "$P/vdex_list.txt"
+          sort -u "$P/v7_prop_fragments.txt" | tee "$P/v7_prop_fragments_sorted.txt" | head -60
+          echo "== [2] vendor/bin + xbin URL sweep:"
+          : > "$P/v7_vendorbin_urls.txt"
+          for f in /mnt/sys/vendor/bin/* /mnt/sys/vendor/xbin/*; do
+            [ -f "$f" ] || continue
+            n=$(basename "$f")
+            { sudo strings -a "$f" 2>/dev/null || true; } \
+              | grep -aoE 'https?://[A-Za-z0-9._-]+[^"'"'"' <>]*' | sort -u \
+              | sed "s|^|$n: |" >> "$P/v7_vendorbin_urls.txt" || true
+          done
+          { grep -viE 'strongswan|wiki\.|ietf|rfc|openssl|gnu\.org|apache|kernel\.org|sourceforge|android\.com|google|mediatek\.com/(faq|dla)' "$P/v7_vendorbin_urls.txt" | head -80 ; } || true
+          wc -l "$P/v7_vendorbin_urls.txt"
+          echo "== [3] vendor libs containing http URLs:"
+          { sudo grep -rlaE 'https?://' /mnt/sys/vendor/lib /mnt/sys/vendor/lib64 /mnt/sys/lib /mnt/sys/lib64 2>/dev/null | sed 's|/mnt/sys/||' ; } | tee "$P/v7_url_libs.txt" | head -40 || true
+          echo "== [4] network-daemon strings dumps:"
+          for b in dm_agent_binder GoogleOtaBinder netdiag epdg_wod mtk_agpsd wifi2agps md_monitor usp_service terservice; do
+            if [ -f "/mnt/sys/vendor/bin/$b" ]; then
+              sudo strings -a "/mnt/sys/vendor/bin/$b" > "$P/v7_daemon_$b.strings" 2>/dev/null || true
+              echo "### $b: $(wc -l < "$P/v7_daemon_$b.strings") strings"
+              { grep -aiE 'https?://|\.com|\.cn|install|download.*apk|server.*addr|fota|dm.*server' "$P/v7_daemon_$b.strings" | sort -u | head -25 ; } || true
+            fi
+          done
+          echo "== [5] WHOLE-IMAGE grep for the 5 app identities:"
+          { sudo grep -rlaiE 'quark|wandoujia|hiby|lianbo|mengxin|万能联播|萌新|豌豆荚|夸克|海贝' /mnt/sys 2>/dev/null | sed 's|/mnt/sys/||' | head -40 ; } | tee "$P/v7_appname_files.txt" || true
+          wc -l "$P/v7_appname_files.txt"
+          echo "== [6] exact package-name grep:"
+          { sudo grep -rlaE 'com\.quark|com\.wandoujia|com\.hiby|phoenix2' /mnt/sys 2>/dev/null | sed 's|/mnt/sys/||' | head -20 ; } | tee "$P/v7_pkgname_files.txt" || true
+          wc -l "$P/v7_pkgname_files.txt"
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail
