@@ -164,8 +164,15 @@ setup_sources() {
   # through the (later) libldacdec+bco-shim route, see DEVELOPMENT_PLAN 16.8.
   [ "$TREE" = nougat ] || clone_full libldac "$AOSP/external/libldac"
   clone_full    aac       "$AOSP/external/aac"
-  clone_sparse  core      "$AOSP/system/core" \
-      libcutils/include libutils/include liblog/include libsystem/include base/include
+  if [ "$TREE" = nougat ]; then
+    # N keeps the legacy TOP-LEVEL include/ tree (cutils, utils, log, system,
+    # android...). Per-lib include dirs (libcutils/include, liblog/include,
+    # libsystem/) do not exist until O.
+    clone_sparse  core    "$AOSP/system/core" include base/include
+  else
+    clone_sparse  core    "$AOSP/system/core" \
+        libcutils/include libutils/include liblog/include libsystem/include base/include
+  fi
   clone_sparse  native    "$AOSP/frameworks/native" \
       include libs/binder/include libs/ui/include libs/gui/include libs/nativewindow/include
   clone_sparse  av        "$AOSP/frameworks/av" \
@@ -261,9 +268,9 @@ SENTINELS_NOUGAT=(
   "libhardware/include/hardware/bluetooth.h"
   "libchrome/base/logging.h"
   "gtest/googletest/include/gtest/gtest_prod.h"
-  "core/libcutils/include/cutils/properties.h"
-  "core/libutils/include/utils/RefBase.h"
-  "core/liblog/include/log/log.h"
+  "core/include/cutils/properties.h"
+  "core/include/utils/RefBase.h"
+  "core/include/log/log.h"
   "native/libs/binder/include/binder/Parcel.h"
   "av/media/libmedia/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
@@ -357,6 +364,7 @@ BT_INC=(
   -I"\$BDCFG"
   -I"\$SRC/libchrome" -I"\$SRC/gtest/googletest/include"
   -I"\$SRC/libhardware/include"
+  -I"\$SRC/core/include"
   -I"\$SRC/core/libcutils/include" -I"\$SRC/core/libutils/include"
   -I"\$SRC/core/liblog/include" -I"\$SRC/core/libsystem/include"
   -I"\$SRC/core/base/include"
