@@ -57,7 +57,7 @@ jobs:
             -path '*/toolchains/llvm/prebuilt/linux-x86_64' | head -1)
           echo "NDKROOT=$NDKROOT"
           echo "-- baseline extraction contents:"
-          find "$RUNNER_TEMP/baseline-bt" -type f | head -40
+          { find "$RUNNER_TEMP/baseline-bt" -type f | head -40; } || true
           python3 scripts/bt_symbol_gate.py \
             --ours "$RUNNER_TEMP/btw/out/bluetooth.default.so" \
             --baseline-dir "$RUNNER_TEMP/baseline-bt" \
