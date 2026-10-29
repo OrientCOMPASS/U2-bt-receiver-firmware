@@ -203,6 +203,67 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Dropper hunt (hidden APKs, scripts, init services, jar URLs)
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== ALL *.apk outside the standard app roots:"
+          sudo find /mnt/sys -name '*.apk' \
+            -not -path '*/app/*' -not -path '*/priv-app/*' \
+            -not -path '*/vendor/app/*' -not -path '*/vendor/priv-app/*' \
+            -not -path '*/preload/*' -not -path '*/preinstall/*' \
+            | tee "$P/hidden_apks.txt" || true
+          echo "== ALL *.sh under /system:"
+          sudo find /mnt/sys -name '*.sh' | tee "$P/system_sh.txt" || true
+          while read -r s; do
+            [ -n "$s" ] || continue
+            echo "### $s"; sudo cat "$s"
+          done < "$P/system_sh.txt" > "$P/system_sh_contents.txt" || true
+          wc -l "$P/system_sh_contents.txt"
+          echo "== /system/bin + /system/xbin listing:"
+          sudo ls -la /mnt/sys/bin /mnt/sys/xbin | tee "$P/system_bin.txt" | head -80
+          echo "== /system/etc/init + rc services:"
+          sudo ls -laR /mnt/sys/etc/init 2>/dev/null | tee "$P/system_etc_init.txt" || true
+          sudo grep -r -n '^service\|^on \|exec ' /mnt/sys/etc/init/ 2>/dev/null \
+            | tee "$P/system_rc_services.txt" | head -60 || true
+          echo "== non-AOSP jars in /system/framework:"
+          sudo ls -la /mnt/sys/framework | tee "$P/framework_ls.txt" | head -80
+          echo "== URL/install-pattern hunt in framework jars (dex strings):"
+          : > "$P/jar_url_hints.txt"
+          for j in /mnt/sys/framework/*.jar /mnt/sys/framework/*.vdex; do
+            [ -f "$j" ] || continue
+            case "$(basename "$j")" in
+              core-*.jar|conscrypt.jar|bouncycastle.jar|apache-xml.jar|ext.jar|framework.jar|telephony-common.jar|ims-common.jar|org.apache.http.legacy*.jar|android.test*.jar|core-libart*.jar|okhttp.jar) ;;
+            esac
+            sudo sh -c "unzip -p '$j' 'classes*.dex' 2>/dev/null | strings | grep -aoE 'https?://[A-Za-z0-9./_%?=&-]+|(hotapps|wandoujia|quark|hiby|liambo|mengxin|installSilent|silentInstall|downloadApk)[A-Za-z0-9._-]*' | sort -u | sed 's|^|$(basename "$j"): |'" \
+              >> "$P/jar_url_hints.txt" || true
+          done
+          sort -u "$P/jar_url_hints.txt" | head -120
+          echo "== URL hunt in /system/bin + xbin binaries:"
+          : > "$P/bin_url_hints.txt"
+          for f in /mnt/sys/bin/* /mnt/sys/xbin/*; do
+            [ -f "$f" ] || continue
+            sudo sh -c "strings '$f' 2>/dev/null | grep -aoE 'https?://[A-Za-z0-9./_%?=&-]+|(hotapps|wandoujia|quark|hiby|liambo|mengxin)[A-Za-z0-9._-]*' | sort -u | sed 's|^|$(basename "$f"): |'" \
+              >> "$P/bin_url_hints.txt" || true
+          done
+          sort -u "$P/bin_url_hints.txt" | head -80
+          echo "== grep etc/vendor configs for installer keywords:"
+          sudo grep -r -inE 'hotapps|wandoujia|quark|hiby|liambo|mengxin|preload.*http|install.*url' \
+            /mnt/sys/etc /mnt/sys/vendor/etc /mnt/sys/data 2>/dev/null \
+            | tee "$P/etc_dropper_grep.txt" | head -40 || true
+          echo "== /system/data + recovery_rootcheck:"
+          sudo file /mnt/sys/data/recovery_rootcheck 2>/dev/null || true
+          sudo strings /mnt/sys/data/recovery_rootcheck 2>/dev/null | head -30 || true
+          echo "== build.prop vendor/dropper props:"
+          grep -iE 'bs\.|hotapps|install|preload|bird' "$P/build.prop" || true
+          echo "== ramdisk rc files: every service/exec line:"
+          grep -n '^service\|    exec\|    start ' "$P"/boot_rd/*.rc 2>/dev/null \
+            | tee "$P/ramdisk_services.txt" | head -100 || true
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail
