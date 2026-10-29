@@ -219,6 +219,28 @@ jobs:
             --json "$P/removed.json" | tail -30
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Block dropper domains in /system/etc/hosts (when list present)
+        run: |
+          set -euo pipefail
+          # Second blade against the vendor network dropper: even when its
+          # code lives inside framework odex (unremovable), resolving its
+          # hosts to 127.0.0.1 starves it.  debloat/hosts-block.txt carries
+          # one bare domain per line ('#'-comments allowed).
+          if [ -s debloat/hosts-block.txt ] && \
+             grep -qvE '^\s*(#|$)' debloat/hosts-block.txt; then
+            echo "-- /system/etc/hosts BEFORE:"
+            sudo cat /mnt/sys/etc/hosts
+            {
+              echo "# --- U2 debloat: vendor dropper domains blocked (debloat/hosts-block.txt)"
+              grep -vE '^\s*(#|$)' debloat/hosts-block.txt | sed 's/^/127.0.0.1 /'
+            } | sudo tee -a /mnt/sys/etc/hosts > /dev/null
+            echo "-- /system/etc/hosts AFTER:"
+            sudo cat /mnt/sys/etc/hosts
+            sudo ls -l /mnt/sys/etc/hosts
+          else
+            echo "hosts-block.txt absent/empty -- skipped"
+          fi
+
       - name: Zero-fill free space (keeps the re-sparsified image small)
         run: |
           set -uo pipefail

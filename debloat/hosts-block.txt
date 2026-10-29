@@ -1,0 +1,6 @@
+# Domains of the vendor network dropper (the thing that silently installed
+# Quark/Wandoujia/HiBy/万能联播/萌新社区 and uninstalled the camera on first
+# boot -- observed on real hardware after flashing debloat v0).
+# One bare domain per line; the fw-debloat workflow appends
+# "127.0.0.1 <domain>" to /system/etc/hosts before repacking.
+# Filled in from the probe v3b odex string sweep (run 40934434361).
