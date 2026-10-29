@@ -83,6 +83,7 @@ jobs:
           path: |
             ${{ runner.temp }}/btw/out/
             ${{ runner.temp }}/btw/logs/results.log
+            ${{ runner.temp }}/btw/logs/error_summary.txt
             ${{ runner.temp }}/btw/tu_list.txt
             ${{ runner.temp }}/build.log
           if-no-files-found: warn

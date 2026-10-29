@@ -398,14 +398,15 @@ AAC_INC=(
   -I"\$SRC/aac/libPCMutils/include" -I"\$SRC/aac/libSBRdec/include"
   -I"\$SRC/aac/libSBRenc/include"
   -I"\$SRC/aac/libFDK/src" -I"\$SRC/aac/libSYS/src"
-  -I"\$SRC/core/liblog/include" -I"\$SRC/core/libsystem/include"
+  -I"\$SRC/core/include"
+  -I"\$SRC/core/libcutils/include" -I"\$SRC/core/liblog/include" -I"\$SRC/core/libsystem/include"
 )
 LDAC_INC=( -I"\$SRC/libldac/inc" -I"\$SRC/libldac/abr/inc" )
 DEFS=(
   -DEXPORT_SYMBOL=__attribute__\\(\\(visibility\\(\\"default\\"\\)\\)\\)
   -DLOG_NDEBUG=1 -DBUILDCFG $bd_def -DNDEBUG
 )
-CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
+CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c -O0 -fPIC -w -Wno-c++11-narrowing -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
 CFLAGS=(   "\${TARGET[@]}" "\${SYSROOT[@]}" -std=c99     -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden -fcommon "\${DEFS[@]}" )
 ENVEOF
   cat > "$WORKDIR/compile_one.sh" <<'ONEEOF'
@@ -501,6 +502,38 @@ compile_all() {
   echo "[build] result: $P/$TOTAL passed, $F failed"
   if [ "$F" != 0 ]; then
     grep '^FAIL' "$LOGS/results.log" | head -30
+    echo "[build] error triage (all $F failing TUs):"
+    python3 - "$OBJ" "$LOGS/error_summary.txt" <<'TRIAGEEOF'
+import os, re, sys, collections
+objdir, out = sys.argv[1], sys.argv[2]
+hdr = collections.Counter(); hdr_tus = collections.defaultdict(list)
+other = collections.Counter(); other_tus = collections.defaultdict(list)
+for fn in sorted(os.listdir(objdir)):
+    if not fn.endswith('.err'): continue
+    tu = fn[:-4]
+    txt = open(os.path.join(objdir, fn), errors='replace').read()
+    m = re.search(r"fatal error: '([^']+)' file not found", txt)
+    if m:
+        hdr[m.group(1)] += 1; hdr_tus[m.group(1)].append(tu); continue
+    m = re.search(r"(?:fatal )?error: (.+)", txt)
+    if m:
+        msg = re.sub(r'0x[0-9a-fA-F]+', '0xX', m.group(1).strip())[:110]
+    else:
+        msg = '<unparsed>'
+    other[msg] += 1; other_tus[msg].append(tu)
+with open(out, 'w') as f:
+    f.write(f"== missing headers ({sum(hdr.values())} TUs) ==\n")
+    for h, c in hdr.most_common():
+        f.write(f"{c:4d}  {h}\n")
+        for t in hdr_tus[h][:10]: f.write(f"        {t}\n")
+        if len(hdr_tus[h]) > 10: f.write(f"        ... +{len(hdr_tus[h])-10} more\n")
+    f.write(f"\n== other first errors ({sum(other.values())} TUs) ==\n")
+    for msg, c in other.most_common(60):
+        f.write(f"{c:4d}  {msg}\n")
+        for t in other_tus[msg][:6]: f.write(f"        {t}\n")
+        if len(other_tus[msg]) > 6: f.write(f"        ... +{len(other_tus[msg])-6} more\n")
+sys.stdout.write(open(out).read()[:7000])
+TRIAGEEOF
     echo "[build] first failing TU diagnostics:"
     local -a fails
     mapfile -t fails < <(grep '^FAIL' "$LOGS/results.log" | head -3 | awk '{print $2}')
