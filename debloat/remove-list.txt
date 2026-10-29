@@ -1,0 +1,11 @@
+# debloat/remove-list.txt -- curated third-party preload removal list.
+#
+# One system-relative path per line; ONLY top-level app directories under
+#   app/  priv-app/  vendor/app/  vendor/priv-app/
+# are accepted (scripts/debloat_system.py enforces this; '#' comments and
+# blank lines are ignored).  fw-debloat refuses to run while this file has
+# no entries.
+#
+# CURATE from the fw-probe run's apps_system.json inventory: keep AOSP
+# platform packages, MTK packages and anything boot-critical; remove
+# third-party preloads.

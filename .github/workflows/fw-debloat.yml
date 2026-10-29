@@ -1,0 +1,490 @@
+# --------------------------------------------------------------------------- #
+# fw-debloat.yml -- baseline-editing experiment (phase 2): remove the curated
+# third-party preinstalled apps from the OFFICIAL Android 7.0 system.img and
+# publish the result as an SP_Flash_Tool-flashable package.
+#
+# What is modified vs the official baseline zip:
+#   system.img   loop-mounted rw; every directory listed in
+#                debloat/remove-list.txt is deleted (safety-railed by
+#                scripts/debloat_system.py); free space zero-filled;
+#                e2fsck; re-sparsified with img2simg (4096).
+#   boot.img     repacked by scripts/mtk_bootimg.py disable-verity: the ONLY
+#                change is dropping the fs_mgr 'verify' flag from the /system
+#                fstab line (dm-verity MUST be off for an edited system to
+#                mount), then re-signed with the AOSP testkey -- the same key
+#                the stock boot is signed with.  Kernel stays byte-identical;
+#                the ramdisk file list and all non-fstab contents are
+#                diff-asserted identical to stock.
+#   recovery.img byte-identical passthrough.
+#   everything else (preloader/lk/logo/secro/tee/userdata/cache/scatter...)
+#                byte-identical passthrough via scripts/repack_firmware.py.
+#
+# Boot-sanity validation done here (CI cannot flash real hardware):
+#   * kernel md5 identical to stock; ramdisk entry list identical;
+#     only fstab* content differs; /system line has no 'verify'
+#   * boot-critical packages (SystemUI/Settings/Bluetooth/PackageInstaller/
+#     providers/shell/phone + framework-res.apk) all present after surgery
+#   * e2fsck -fn clean on the edited image; final in-package image is
+#     round-tripped (sparse->raw->mount->inventory) and the app-set algebra
+#     before - removed == after == final is asserted
+#   * package validated against the official scatter (completeness + sizes)
+#
+# Publishes: release `firmware-debloat-<date>` (prerelease) with the flash
+# zip + VERIFICATION.md; artifact `fw-debloat-report` carries all JSON/logs.
+# --------------------------------------------------------------------------- #
+name: fw-debloat
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkg_name:
+        description: 'Package (folder/zip base) name'
+        default: 'U2_7.0_debloat_v0'
+        required: true
+      fw_tag:
+        description: 'Release tag (empty = auto: firmware-debloat-<date>)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish the GitHub release when every check passes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  BASELINE_URL: >-
+    https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/download/base_firmware/B04_35_1.5_8_3inch_M304_ST7701SN_20251016.zip
+  KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
+  SYSTEM_PARTITION_BYTES: '3095396352'
+  PKG: ${{ inputs.pkg_name }}
+  FW_TAG_IN: ${{ inputs.fw_tag }}
+
+jobs:
+  debloat:
+    name: debloat + repack + validate + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools (cpio, simg, attr, e2fsprogs)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio android-sdk-libsparse-utils attr e2fsprogs
+          df -h "$RUNNER_TEMP" /
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Removal list sanity
+        run: |
+          set -euo pipefail
+          test -f debloat/remove-list.txt
+          N=$(grep -cvE '^\s*(#|$)' debloat/remove-list.txt || true)
+          echo "removal list entries: $N"
+          test "$N" -gt 0
+          cat debloat/remove-list.txt
+
+      - name: Fetch AOSP testkey pair (stock boot is signed with it)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keys"
+          for f in testkey.pk8 testkey.x509.pem; do
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://android.googlesource.com/platform/build/+/refs/tags/android-8.1.0_r80/target/product/security/${f}?format=TEXT" \
+              | base64 -d > "$RUNNER_TEMP/keys/$f"
+          done
+          ls -l "$RUNNER_TEMP/keys"
+          openssl x509 -in "$RUNNER_TEMP/keys/testkey.x509.pem" -noout -subject
+
+      - name: Stream-extract baseline boot/recovery/system
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/probe" "$RUNNER_TEMP/baseline" "$RUNNER_TEMP/build_out"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import mtk_fw_zip
+          import repack_firmware as rf
+          base = os.path.join(os.environ["RUNNER_TEMP"], "baseline")
+          rz = mtk_fw_zip.RemoteZip(os.environ["BASELINE_URL"])
+          for fn, dest in (("boot.img", "boot.img"),
+                           ("recovery.img", "recovery.img"),
+                           ("system.img", "system.sparse.img")):
+              e = rf.find_entry_by_basename(rz, fn)
+              if e is None:
+                  raise FileNotFoundError(f"baseline zip has no {fn}")
+              n = rz.extract_stream(e, os.path.join(base, dest))
+              print(f"[debloat] {fn}: {n} bytes")
+          rz.close()
+          PY
+          md5sum "$RUNNER_TEMP/baseline"/*.img | tee "$RUNNER_TEMP/probe/baseline_md5.txt"
+          df -h "$RUNNER_TEMP"
+
+      - name: Repack boot.img (dm-verity off) + strict diff vs stock
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          B="$RUNNER_TEMP/baseline"; OUT="$RUNNER_TEMP/build_out"; P="$RUNNER_TEMP/probe"
+          python3 scripts/mtk_bootimg.py disable-verity \
+            "$B/boot.img" "$OUT/boot.img" \
+            --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
+            --x509 "$RUNNER_TEMP/keys/testkey.x509.pem"
+          rm -rf "$P/newboot" "$P/stockboot" "$P/newrd" "$P/stockrd"
+          python3 scripts/mtk_bootimg.py unpack "$OUT/boot.img" "$P/newboot"
+          python3 scripts/mtk_bootimg.py unpack "$B/boot.img" "$P/stockboot"
+          GOT=$(md5sum "$P/newboot/kernel.bin" | cut -d' ' -f1)
+          WANT=$(md5sum "$P/stockboot/kernel.bin" | cut -d' ' -f1)
+          echo "kernel md5: new=$GOT stock=$WANT want=$KERNEL_MD5"
+          test "$GOT" = "$KERNEL_MD5"
+          test "$WANT" = "$KERNEL_MD5"
+          mkdir -p "$P/newrd" "$P/stockrd"
+          (cd "$P/newrd"   && gzip -dc "$P/newboot/ramdisk.cpio.gz"   | cpio -idm --quiet --no-absolute-filenames)
+          (cd "$P/stockrd" && gzip -dc "$P/stockboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          (cd "$P/newrd"   && find . | sort) > "$P/newrd.list"
+          (cd "$P/stockrd" && find . | sort) > "$P/stockrd.list"
+          diff "$P/stockrd.list" "$P/newrd.list"
+          echo "ramdisk entry list: identical ($(wc -l < "$P/newrd.list") entries)"
+          diff -rq "$P/stockrd" "$P/newrd" > "$P/ramdisk_diff.txt" || true
+          cat "$P/ramdisk_diff.txt"
+          grep -v 'fstab' "$P/ramdisk_diff.txt" > "$P/ramdisk_diff_unexpected.txt" || true
+          if [ -s "$P/ramdisk_diff_unexpected.txt" ]; then
+            echo "FATAL: non-fstab ramdisk content differs from stock"; exit 1
+          fi
+          found=0
+          for f in "$P/newrd"/fstab*; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "### repacked $(basename "$f"):"; cat "$f"
+            if grep -E '/system' "$f" | grep -q 'verify'; then
+              echo "FATAL: /system line still carries verify"; exit 1
+            fi
+          done
+          test "$found" = 1
+          for f in "$P/stockrd"/fstab*; do
+            [ -f "$f" ] || continue
+            echo "### stock $(basename "$f"):"; cat "$f"
+          done
+          diff -u "$P/stockrd/fstab.mt6735" "$P/newrd/fstab.mt6735" \
+            | tee "$P/fstab.diff" || true
+          test -f "$P/newboot/tail.der" && echo "signature tail: $(stat -c %s "$P/newboot/tail.der") bytes"
+          md5sum "$OUT/boot.img" | tee "$P/new_boot_md5.txt"
+
+      - name: Recovery passthrough
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; OUT="$RUNNER_TEMP/build_out"; P="$RUNNER_TEMP/probe"
+          cp "$B/recovery.img" "$OUT/recovery.img"
+          md5sum "$B/recovery.img" | awk '{print $1}' > "$P/recovery_md5.txt"
+          cat "$P/recovery_md5.txt"
+
+      - name: system.img sparse->raw, mount rw
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          python3 scripts/mtk_sparse2raw.py "$B/system.sparse.img" "$B/system.raw.img" -q
+          rm -f "$B/system.sparse.img"
+          ls -l "$B/system.raw.img"
+          python3 scripts/fw_inventory.py verity "$B/system.raw.img" \
+            --out "$P/system_verity_before.json" | tail -8
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,rw "$B/system.raw.img" /mnt/sys
+          df -h /mnt/sys
+
+      - name: Inventory before + remove listed apps
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sudo python3 scripts/fw_inventory.py apps /mnt/sys \
+            --out "$P/apps_before.json" > /dev/null
+          jq -r '.[] | "\(.root)/\(.entry)\t\(.package)"' "$P/apps_before.json" 2>/dev/null | head -80 || true
+          sudo python3 scripts/debloat_system.py \
+            --mount /mnt/sys --list debloat/remove-list.txt \
+            --json "$P/removed.json" | tail -30
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
+      - name: Zero-fill free space (keeps the re-sparsified image small)
+        run: |
+          set -uo pipefail
+          df -h /mnt/sys
+          dd if=/dev/zero of=/mnt/sys/.zerofill bs=1M status=progress || true
+          sync
+          rm -f /mnt/sys/.zerofill
+          sync
+          df -h /mnt/sys
+
+      - name: Inventory after + boot-critical package assertions
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sudo python3 scripts/fw_inventory.py apps /mnt/sys \
+            --out "$P/apps_after.json" > /dev/null
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          MNT = "/mnt/sys"
+          def recs(f):
+              with open(os.path.join(P, f)) as fh:
+                  return json.load(fh)
+          before, after = recs("apps_before.json"), recs("apps_after.json")
+          removed = json.load(open(os.path.join(P, "removed.json")))
+          bset = {a["root"] + "/" + a["entry"] for a in before}
+          aset = {a["root"] + "/" + a["entry"] for a in after}
+          rset = {r["path"] for r in removed["planned"]}
+          ghost = rset - bset
+          if ghost:
+              print(f"[assert] note: targets without APKs (dirs still removed): {sorted(ghost)}")
+          assert bset - rset == aset, f"app-set mismatch: {sorted((bset - rset) ^ aset)}"
+          assert not (aset & rset), f"removed dirs still present: {sorted(aset & rset)}"
+          pkgs_b = {a["package"] for a in before if a.get("package")}
+          pkgs_a = {a["package"] for a in after if a.get("package")}
+          REQUIRED = ["com.android.systemui", "com.android.settings",
+                      "com.android.bluetooth", "com.android.packageinstaller",
+                      "com.android.providers.settings", "com.android.providers.media",
+                      "com.android.shell", "com.android.phone"]
+          lost = [p for p in REQUIRED if p in pkgs_b and p not in pkgs_a]
+          assert not lost, f"boot-critical packages lost: {lost}"
+          absent = [p for p in REQUIRED if p not in pkgs_b]
+          if absent:
+              print(f"[assert] note: not present in baseline (skipped): {absent}")
+          assert os.path.isfile(os.path.join(MNT, "framework/framework-res.apk")), \
+              "framework-res.apk missing!"
+          overlap = {r["package"] for r in removed["planned"]} & pkgs_a
+          assert not overlap, f"removed packages still present: {sorted(overlap)}"
+          print(f"[assert] PASS: before={len(bset)} removed={len(rset & bset)} "
+                f"after={len(aset)} freed={removed['freed_bytes']/1048576:.1f} MiB; "
+                "boot-critical packages + framework-res intact")
+          PY
+
+      - name: Unmount, e2fsck, zero stale verity tail, re-sparsify
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; OUT="$RUNNER_TEMP/build_out"; P="$RUNNER_TEMP/probe"
+          sync
+          sudo umount /mnt/sys
+          sudo e2fsck -fy "$B/system.raw.img" || rc=$?
+          echo "e2fsck -fy rc=${rc:-0} (<=3 means clean or fixed)"
+          test "${rc:-0}" -le 3
+          unset rc || true
+          sudo e2fsck -fn "$B/system.raw.img"
+          echo "e2fsck -fn: clean"
+          FS_SIZE=$(jq -r '.ext4_fs_size' "$P/system_verity_before.json")
+          IMG_SIZE=$(stat -c %s "$B/system.raw.img")
+          if [ "$FS_SIZE" -lt "$IMG_SIZE" ]; then
+            SEEK=$((FS_SIZE / 4096)); CNT=$(( (IMG_SIZE - FS_SIZE) / 4096 ))
+            echo "zeroing stale verity tail: seek=$SEEK count=$CNT blocks"
+            dd if=/dev/zero of="$B/system.raw.img" bs=4096 seek="$SEEK" count="$CNT" conv=notrunc status=none
+          fi
+          img2simg "$B/system.raw.img" "$OUT/system.img" 4096
+          rm -f "$B/system.raw.img"
+          SZ=$(stat -c %s "$OUT/system.img")
+          echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
+          test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
+          df -h "$RUNNER_TEMP"
+
+      - name: Assemble the flash package (official scatter + private parts)
+        run: |
+          set -euo pipefail
+          python3 scripts/repack_firmware.py \
+            --baseline-url "$BASELINE_URL" \
+            --build-out "$RUNNER_TEMP/build_out" \
+            --out "$RUNNER_TEMP/$PKG.zip" --pkg-name "$PKG"
+          rm -rf "$RUNNER_TEMP/build_out"
+          ls -l "$RUNNER_TEMP/$PKG.zip"
+          df -h "$RUNNER_TEMP"
+
+      - name: Validate the final package end to end
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          P="$RUNNER_TEMP/probe"; CHK="$RUNNER_TEMP/chk"
+          rm -rf "$CHK"; mkdir -p "$CHK"
+          (cd "$CHK" && unzip -oq "$RUNNER_TEMP/$PKG.zip")
+          ls -l "$CHK/$PKG"
+          SCAT="$(find "$CHK/$PKG" -name '*_scatter.txt' | head -1)"
+          python3 scripts/mtk_scatter.py validate "$SCAT" "$CHK/$PKG" | tee "$P/scatter_validate.txt"
+          # --- final system image round-trip --------------------------------
+          python3 scripts/mtk_sparse2raw.py "$CHK/$PKG/system.img" "$CHK/system.raw.img" -q 2>/dev/null \
+            || simg2img "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+          rm -f "$CHK/$PKG/system.img"
+          sudo mkdir -p /mnt/chk
+          sudo mount -o loop,ro "$CHK/system.raw.img" /mnt/chk
+          sudo python3 scripts/fw_inventory.py apps /mnt/chk \
+            --out "$P/apps_final.json" > /dev/null
+          test -f /mnt/chk/framework/framework-res.apk
+          sudo umount /mnt/chk
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+          python3 scripts/fw_inventory.py verity "$CHK/system.raw.img" \
+            --out "$P/system_verity_final.json" | tail -6
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          def recs(f):
+              with open(os.path.join(P, f)) as fh:
+                  return {(a["root"] + "/" + a["entry"], a.get("package")) for a in json.load(fh)}
+          before, after, final = recs("apps_before.json"), recs("apps_after.json"), recs("apps_final.json")
+          removed = {r["path"] for r in json.load(open(os.path.join(P, "removed.json")))["planned"]}
+          bdirs = {d for d, _ in before}
+          assert bdirs - removed == {d for d, _ in after}, "before-removed != after"
+          assert after == final, f"final image mismatch: {sorted(after ^ final)}"
+          print(f"[verify] round-trip PASS: final in-package image == edited image "
+                f"({len(final)} APK records)")
+          PY
+          rm -f "$CHK/system.raw.img"
+          # --- final boot image ---------------------------------------------
+          rm -rf "$P/pkgboot" "$P/pkgrd"
+          python3 scripts/mtk_bootimg.py unpack "$CHK/$PKG/boot.img" "$P/pkgboot"
+          GOT=$(md5sum "$P/pkgboot/kernel.bin" | cut -d' ' -f1)
+          echo "package boot kernel md5: $GOT (want $KERNEL_MD5)"
+          test "$GOT" = "$KERNEL_MD5"
+          mkdir -p "$P/pkgrd"
+          (cd "$P/pkgrd" && gzip -dc "$P/pkgboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          found=0
+          for f in "$P/pkgrd"/fstab*; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "### package $(basename "$f"):"; cat "$f"
+            if grep -E '/system' "$f" | grep -q 'verify'; then
+              echo "FATAL: packaged boot fstab still verifies /system"; exit 1
+            fi
+          done
+          test "$found" = 1
+          # --- recovery passthrough -----------------------------------------
+          GOT=$(md5sum "$CHK/$PKG/recovery.img" | awk '{print $1}')
+          WANT=$(cat "$P/recovery_md5.txt")
+          echo "package recovery md5: $GOT (stock $WANT)"
+          test "$GOT" = "$WANT"
+          df -h "$RUNNER_TEMP"
+
+      - name: Write VERIFICATION.md
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          PKG = os.environ["PKG"]
+          def load(n):
+              with open(os.path.join(P, n)) as f:
+                  return json.load(f)
+          removed = load("removed.json")
+          vb = load("system_verity_before.json")
+          vf = load("system_verity_final.json")
+          before, after, final = (load(f"apps_{k}.json") for k in ("before", "after", "final"))
+          zip_path = os.path.join(os.environ["RUNNER_TEMP"], PKG + ".zip")
+          md5 = subprocess.run(["md5sum", zip_path], capture_output=True, text=True).stdout.split()[0]
+          L = []
+          L.append(f"# VERIFICATION -- {PKG}.zip\n")
+          L.append(f"- package md5: `{md5}`  ({os.path.getsize(zip_path)} bytes)")
+          L.append(f"- kernel md5 (stock == repacked == in-package): `{os.environ['KERNEL_MD5']}`")
+          L.append("- boot.img: ONLY change = fs_mgr `verify` flag dropped from the"
+                   " /system fstab line + CMS re-sign with the AOSP testkey (the stock"
+                   " signing key); ramdisk entry list and all non-fstab bytes diff-asserted"
+                   " identical to stock")
+          L.append("- recovery.img + all MTK-private partitions: byte-identical passthrough")
+          L.append(f"- system.img verity area before edit: trailing_bytes={vb['trailing_bytes']},"
+                   f" footer_present={vb['verity_present']} (stale tail zeroed after edit;"
+                   " verity is disabled in the boot fstab so the tail is never read)")
+          L.append(f"- e2fsck -fn on the edited image: clean")
+          L.append(f"- scatter validation: see scatter_validate.txt artifact\n")
+          L.append(f"## Removed app directories ({len(removed['planned'])},"
+                   f" {removed['freed_bytes']/1048576:.1f} MiB freed)\n")
+          L.append("| path | package | MiB |")
+          L.append("|---|---|---|")
+          for r in removed["planned"]:
+              L.append(f"| {r['path']} | {r['package']} | {r['bytes']/1048576:.1f} |")
+          if removed.get("dangling_refs"):
+              L.append("\nDangling config references (harmless; PMS ignores unknown packages, left in place):\n")
+              for h in removed["dangling_refs"]:
+                  L.append(f"- `{h['file']}` mentions `{h['package']}`")
+          L.append(f"\n## App inventory algebra\n")
+          L.append(f"- APK records: before={len(before)}  after={len(after)}  final(in-package)={len(final)}")
+          L.append("- asserted: before_dirs - removed == after_dirs; after == final (records incl. packages)")
+          L.append("- asserted present after edit: framework-res.apk + boot-critical packages"
+                   " (SystemUI, Settings, Bluetooth, PackageInstaller, providers.settings,"
+                   " providers.media, shell, phone -- whichever the baseline has)")
+          L.append("\n## Kept apps (after edit)\n")
+          L.append("| root/entry | package | versionName | MiB |")
+          L.append("|---|---|---|---|")
+          for a in sorted(after, key=lambda x: x["root"] + "/" + x["entry"]):
+              L.append(f"| {a['root']}/{a['entry']} | {a.get('package')} |"
+                       f" {a.get('versionName')} | {a['dir_size']/1048576:.1f} |")
+          txt = "\n".join(L) + "\n"
+          with open(os.path.join(P, "VERIFICATION.md"), "w") as f:
+              f.write(txt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(txt)
+          print(txt[:3000])
+          PY
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          DATE=$(date -u +%Y%m%d)
+          FW_TAG="${FW_TAG_IN:-firmware-debloat-$DATE}"
+          NAME="U2 debloat: official 7.0 minus preinstalled third-party apps (verity-off boot)"
+          {
+            echo "KeenPlus U2 -- **debloat experiment** on the OFFICIAL Android 7.0 baseline"
+            echo "(B04_35_1.5_8_3inch_M304_ST7701SN_20251016)."
+            echo
+            echo "**What changed vs the official zip**"
+            echo
+            echo "- \`system.img\`: preinstalled third-party apps removed (curated list in"
+            echo "  \`debloat/remove-list.txt\`); free space zero-filled; e2fsck clean;"
+            echo "  re-sparsified.  Everything else in /system is byte-identical."
+            echo "- \`boot.img\`: repacked with ONLY the dm-verity \`verify\` flag dropped"
+            echo "  from the /system fstab line (an edited system cannot pass the stock"
+            echo "  verity hashtree), re-signed with the AOSP testkey -- the same key the"
+            echo "  stock boot carries.  Kernel md5 unchanged; ramdisk diff-asserted."
+            echo "- \`recovery.img\`, preloader/lk/logo/secro/tee/userdata/cache, scatter:"
+            echo "  untouched."
+            echo
+            echo "**Removed apps**"
+            echo
+            jq -r '.planned[] | "- `\(.path)` (\(.package), \(.bytes/1048576*10|round/10) MiB)"' "$P/removed.json"
+            echo
+            echo "**CI boot-sanity validation (see VERIFICATION.md asset)**: kernel md5"
+            echo "identical, ramdisk entry-identical, boot-critical packages present,"
+            echo "e2fsck clean, scatter-validated, final image round-tripped and"
+            echo "app-set algebra asserted."
+            echo
+            echo "> CI cannot flash hardware -- the definitive boot test is on-device."
+            echo "> Structurally nothing outside system contents + the fstab verify flag"
+            echo "> differs from the official firmware."
+            echo
+            echo "**Flash:** SP Flash Tool -> load the scatter from the zip ->"
+            echo "\"Download Only\" (or Firmware Upgrade).  **Rescue:** reflash the"
+            echo "official baseline zip; never Format; never touch nvram."
+            echo
+            echo "If it unexpectedly hangs at the boot logo, the suspect list (in order):"
+            echo "1) lk rejecting the regenerated CMS signature tail -> rerun this"
+            echo "workflow with a --no-sign boot variant; 2) anything else -> reflash"
+            echo "the baseline and open an issue with the last-kmsg/UART log."
+          } > "$RUNNER_TEMP/NOTES.md"
+          cp "$RUNNER_TEMP/NOTES.md" "$P/NOTES.md"
+          python3 scripts/publish_release.py \
+            --tag "$FW_TAG" --name "$NAME" \
+            --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
+            --files "$RUNNER_TEMP/$PKG.zip" "$P/VERIFICATION.md"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-debloat-report
+          path: |
+            ${{ runner.temp }}/probe/
+            ${{ runner.temp }}/NOTES.md
+          if-no-files-found: warn

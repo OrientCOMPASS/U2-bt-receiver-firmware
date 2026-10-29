@@ -1,5 +1,15 @@
 # KeenPlus U2 -- AOSP 8.1 Bluetooth-receiver firmware
 
+> **2026-10-29 — route change (fresh start).** The from-source AOSP 8.1 route
+> (hybrid firmware v0-v4) is **abandoned**; its releases were deleted and the
+> branch was rolled back to `3c8b5b2` with **all CI workflows removed**. The
+> active work is now the **baseline-editing experiment**: take the *official*
+> Android 7.0 firmware as-is, remove the preinstalled third-party apps from
+> `system.img`, pair it with a verity-off repacked `boot.img`, validate
+> everything in CI and publish the result. See [`debloat/README.md`](debloat/README.md)
+> and the dispatch-only workflows `fw-probe.yml` / `fw-debloat.yml`. The text
+> below is kept as history; its `ci.yml` badge and `build.yml` links are dead.
+
 Self-developed **Android 8.1 (Oreo)** firmware for the **KeenPlus U2_6735_1.5+8G**
 media player, rebuilt as a lean **Bluetooth audio receiver** (A2DP Sink) on the
 MediaTek **MT6735M** SoC (quad Cortex-A53, **1.5 GiB** RAM, **8 GiB** storage).
@@ -10,7 +20,6 @@ audio sink + local player that boots AOSP 8.1, connects to one or two phones
 over Bluetooth, and plays their audio (SBC / AAC / SBC-XQ receive; LDAC
 transmit), within a tight RAM/latency budget.
 
-[![CI](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/actions/workflows/ci.yml/badge.svg)](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/actions/workflows/ci.yml)
 
 > **Status / scope.**  This repository contains the *firmware engineering*: the
 > device tree, resource overlays, SEPolicy, kernel-config contract, the AOSP

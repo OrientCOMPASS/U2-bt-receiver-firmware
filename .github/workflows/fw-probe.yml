@@ -1,0 +1,281 @@
+# --------------------------------------------------------------------------- #
+# fw-probe.yml -- baseline firmware inventory probe (debloat route, phase 1).
+#
+# Downloads NOTHING into git; streams the official 7.0 baseline zip over HTTP
+# range requests and produces a full factual inventory used to curate
+# debloat/remove-list.txt:
+#
+#   * zip entry table + official scatter partition table
+#   * boot.img / recovery.img: header, cmdline, kernel md5, ramdisk file
+#     list, every fstab*, default.prop   (dm-verity flag status!)
+#   * system.img: MTK-sparse -> raw, verity-footer/trailing scan, mounted
+#     read-only app inventory (package/version/size/oat per APK under
+#     app/, priv-app/, vendor/app/, vendor/priv-app/, overlay dirs),
+#     build.prop, /etc/permissions + preferred-apps + sysconfig dumps
+#   * userdata.img / cache.img: mounted listing + every APK's manifest
+#     (vendor preload apps live here on many MTK devices)
+#
+# Output: artifact `fw-probe-report` (report.json + REPORT.md + raw dumps).
+# Read-only against the baseline; publishes nothing.
+# --------------------------------------------------------------------------- #
+name: fw-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASELINE_URL: >-
+    https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/download/base_firmware/B04_35_1.5_8_3inch_M304_ST7701SN_20251016.zip
+  KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
+
+jobs:
+  probe:
+    name: Baseline inventory probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools (cpio, simg, attr, e2fsprogs)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio android-sdk-libsparse-utils attr e2fsprogs
+          df -h "$RUNNER_TEMP" /
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: List baseline zip + scatter partition table
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/probe" "$RUNNER_TEMP/baseline"
+          python3 scripts/fw_inventory.py zip-list "$BASELINE_URL" \
+            --out "$RUNNER_TEMP/probe/zip_entries.json" > /dev/null
+          jq -r '.[] | "\(.name)\t\(.method)\t\(.compressed)\t\(.uncompressed)"' \
+            "$RUNNER_TEMP/probe/zip_entries.json" 2>/dev/null \
+            || cat "$RUNNER_TEMP/probe/zip_entries.json"
+          python3 - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, "scripts")
+          import mtk_fw_zip, mtk_scatter
+          rz = mtk_fw_zip.RemoteZip(os.environ["BASELINE_URL"])
+          scat = rz.find_scatter()
+          assert scat, "no scatter in baseline zip"
+          data = rz.read_entry(scat)
+          out = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          p = os.path.join(out, os.path.basename(scat))
+          with open(p, "wb") as f:
+              f.write(data)
+          sc = mtk_scatter.load_scatter(p)
+          with open(os.path.join(out, "scatter.json"), "w") as f:
+              json.dump(sc, f, indent=1)
+          print("[probe] scatter:", scat)
+          for part in sc["partitions"]:
+              print(f"  {part.name:16s} {part.file_name or '-':30s} "
+                    f"download={part.is_download} size={part.size_bytes}")
+          rz.close()
+          PY
+
+      - name: Stream-extract boot/recovery/system/userdata/cache images
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import mtk_fw_zip
+          import repack_firmware as rf
+          base = os.path.join(os.environ["RUNNER_TEMP"], "baseline")
+          rz = mtk_fw_zip.RemoteZip(os.environ["BASELINE_URL"])
+          def grab(fn, dest):
+              e = rf.find_entry_by_basename(rz, fn)
+              if e is None:
+                  print(f"[probe] {fn}: NOT IN ZIP")
+                  return
+              n = rz.extract_stream(e, os.path.join(base, dest))
+              print(f"[probe] {fn}: {n} bytes -> {dest}")
+          grab("boot.img", "boot.img")
+          grab("recovery.img", "recovery.img")
+          grab("system.img", "system.sparse.img")
+          grab("userdata.img", "userdata.img")
+          grab("cache.img", "cache.img")
+          rz.close()
+          PY
+          ls -l "$RUNNER_TEMP/baseline"
+          md5sum "$RUNNER_TEMP/baseline"/*.img | tee "$RUNNER_TEMP/probe/baseline_md5.txt"
+          df -h "$RUNNER_TEMP"
+
+      - name: Boot + recovery ramdisk facts (verity flags, cmdline)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          P="$RUNNER_TEMP/probe"; B="$RUNNER_TEMP/baseline"
+          for img in boot recovery; do
+            [ -f "$B/$img.img" ] || continue
+            rm -rf "$P/${img}_unpack" "$P/${img}_rd"
+            python3 scripts/mtk_bootimg.py unpack "$B/$img.img" "$P/${img}_unpack"
+            GOT=$(md5sum "$P/${img}_unpack/kernel.bin" | cut -d' ' -f1)
+            echo "== $img kernel md5: $GOT (stock boot reference: $KERNEL_MD5)"
+            mkdir -p "$P/${img}_rd"
+            (cd "$P/${img}_rd" && gzip -dc "$P/${img}_unpack/ramdisk.cpio.gz" \
+              | cpio -idm --quiet --no-absolute-filenames)
+            (cd "$P/${img}_rd" && find . | sort) > "$P/${img}_ramdisk_files.txt"
+            echo "-- $img ramdisk entries: $(wc -l < "$P/${img}_ramdisk_files.txt")"
+            for f in "$P/${img}_rd"/fstab*; do
+              [ -f "$f" ] || continue
+              echo "### $img $(basename "$f"):"
+              cat "$f" | tee -a "$P/${img}_fstab.txt"
+            done
+            if [ -f "$P/${img}_rd/default.prop" ]; then
+              echo "-- $img default.prop:"; cat "$P/${img}_rd/default.prop"
+              cp "$P/${img}_rd/default.prop" "$P/${img}_default.prop"
+            fi
+            python3 - "$P/${img}_unpack/header.json" "$P/${img}_header_summary.json" <<'PY'
+          import json, sys
+          h = json.load(open(sys.argv[1]))
+          keep = {k: h[k] for k in ("kernel_size", "ramdisk_size", "page_size",
+                                    "cmdline", "name", "extra_cmdline") if k in h}
+          json.dump(keep, open(sys.argv[2], "w"), indent=1)
+          print("-- header:", json.dumps(keep))
+          PY
+          done
+
+      - name: system.img sparse->raw + verity scan
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          od -A n -t x1 -N 4 "$B/system.sparse.img"
+          python3 scripts/mtk_sparse2raw.py "$B/system.sparse.img" "$B/system.raw.img" -q
+          rm -f "$B/system.sparse.img"
+          ls -l "$B/system.raw.img"
+          python3 scripts/fw_inventory.py verity "$B/system.raw.img" \
+            --out "$P/system_verity.json"
+
+      - name: Mount system + full app inventory
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          df -h /mnt/sys
+          ls /mnt/sys > "$P/system_toplevel.txt"; cat "$P/system_toplevel.txt"
+          sudo du -xsm /mnt/sys/* 2>/dev/null | sort -rn > "$P/system_du.txt" || true
+          head -40 "$P/system_du.txt"
+          sudo python3 scripts/fw_inventory.py apps /mnt/sys \
+            --out "$P/apps_system.json" > /dev/null
+          jq -r '.[] | "\(.root)/\(.entry)\t\(.package)\t\(.versionName)\t\(.dir_size)"' \
+            "$P/apps_system.json" | column -t -s $'\t' || true
+          sudo cp /mnt/sys/build.prop "$P/build.prop"
+          mkdir -p "$P/etc"
+          for d in permissions preferred-apps sysconfig; do
+            sudo cp -r "/mnt/sys/etc/$d" "$P/etc/$d" 2>/dev/null || true
+          done
+          ls /mnt/sys/etc > "$P/system_etc.txt"
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
+      - name: userdata/cache inventory (preload apps?)
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          for img in userdata cache; do
+            [ -f "$B/$img.img" ] || { echo "== $img: absent"; continue; }
+            RAW="$B/$img.raw.img"
+            MAGIC=$(od -A n -t x1 -N 4 "$B/$img.img" | tr -d ' \n')
+            echo "== $img.img magic: $MAGIC ($(stat -c %s "$B/$img.img") bytes)"
+            case "$MAGIC" in
+              3aff26ed|3afe26ed)
+                python3 scripts/mtk_sparse2raw.py "$B/$img.img" "$RAW" -q 2>/dev/null \
+                  || simg2img "$B/$img.img" "$RAW"
+                rm -f "$B/$img.img";;
+              *) mv "$B/$img.img" "$RAW";;
+            esac
+            sudo mkdir -p "/mnt/$img"
+            if sudo mount -o loop,ro "$RAW" "/mnt/$img"; then
+              ls -la "/mnt/$img" > "$P/${img}_toplevel.txt"; cat "$P/${img}_toplevel.txt"
+              sudo find "/mnt/$img" -not -path '*/lost+found*' \
+                > "$P/${img}_files.txt" || true
+              echo "-- $img files: $(wc -l < "$P/${img}_files.txt")"
+              head -100 "$P/${img}_files.txt"
+              sudo find "/mnt/$img" -name '*.apk' > "$P/${img}_apks.txt" || true
+              while read -r apk; do
+                [ -n "$apk" ] || continue
+                echo "### $apk"
+                sudo python3 scripts/fw_inventory.py manifest "$apk"
+              done < "$P/${img}_apks.txt" > "$P/${img}_apk_manifests.txt" || true
+              cat "$P/${img}_apk_manifests.txt"
+              sudo umount "/mnt/$img"
+            else
+              echo "== $img: mount FAILED -- skipping content inventory"
+            fi
+            rm -f "$RAW"
+          done
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          df -h "$RUNNER_TEMP"
+
+      - name: Assemble report.json + REPORT.md
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          def load(n, default=None):
+              p = os.path.join(P, n)
+              if not os.path.isfile(p):
+                  return default
+              with open(p) as f:
+                  try:
+                      return json.load(f)
+                  except Exception:
+                      return f.read()
+          rep = {
+              "zip_entries": load("zip_entries.json"),
+              "scatter": load("scatter.json"),
+              "system_verity": load("system_verity.json"),
+              "apps_system": load("apps_system.json"),
+              "boot_header": load("boot_header_summary.json"),
+              "recovery_header": load("recovery_header_summary.json"),
+          }
+          with open(os.path.join(P, "report.json"), "w") as f:
+              json.dump(rep, f, indent=1)
+          L = ["# Baseline probe report (debloat route, phase 1)", ""]
+          v = rep["system_verity"] or {}
+          L += ["## system.img verity scan",
+                f"- image_size: {v.get('image_size')}",
+                f"- ext4_fs_size: {v.get('ext4_fs_size')}",
+                f"- trailing_bytes: {v.get('trailing_bytes')}",
+                f"- footer_hits_tail: {len(v.get('footer_hits_tail') or [])}",
+                f"- verity_present: {v.get('verity_present')}", ""]
+          bh = rep["boot_header"] or {}
+          L += ["## boot.img", f"- cmdline: `{bh.get('cmdline')}`",
+                f"- kernel_size: {bh.get('kernel_size')}  ramdisk_size: {bh.get('ramdisk_size')}", ""]
+          apps = rep["apps_system"] or []
+          L += [f"## system apps ({len(apps)} APK records)", "",
+                "| root | entry | package | versionName | dir MiB | oat |",
+                "|---|---|---|---|---|---|"]
+          for a in apps:
+              L.append(f"| {a['root']} | {a['entry']} | {a.get('package')} | "
+                       f"{a.get('versionName')} | {a['dir_size']/1048576:.1f} | "
+                       f"{a['has_oat_dir']} |")
+          txt = "\n".join(L) + "\n"
+          with open(os.path.join(P, "REPORT.md"), "w") as f:
+              f.write(txt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(txt)
+          print(txt[:4000])
+          PY
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-probe-report
+          path: ${{ runner.temp }}/probe/
+          if-no-files-found: error
