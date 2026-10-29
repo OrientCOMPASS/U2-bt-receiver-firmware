@@ -335,6 +335,55 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: ExactCalculator dissection (dropper suspect)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          mkdir -p "$P/calc"
+          sudo cp /mnt/sys/app/ExactCalculator/ExactCalculator.apk "$P/calc/"
+          sudo cp -r /mnt/sys/app/ExactCalculator/oat "$P/calc/oat" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$P/calc"
+          cd "$P/calc"
+          md5sum ExactCalculator.apk | tee calc_md5.txt
+          unzip -l ExactCalculator.apk | tee calc_entries.txt
+          mkdir -p x && (cd x && unzip -oq ../ExactCalculator.apk)
+          find x -type f | sort | tee calc_files.txt
+          while read -r f; do file "$f"; done < calc_files.txt | tee calc_filetypes.txt
+          echo "-- manifest components (injection forensics):"
+          python3 "$GITHUB_WORKSPACE/scripts/fw_inventory.py" components \
+            ExactCalculator.apk | tee calc_components.json
+          echo "-- assets dump:"
+          if [ -d x/assets ]; then
+            find x/assets -type f | while read -r f; do
+              echo "### $f"; file "$f"; head -c 3000 "$f" | strings | head -50
+            done | tee calc_assets.txt
+          else
+            echo "(no assets dir)" | tee calc_assets.txt
+          fi
+          echo "-- full dex strings (sorted, complete -- small app):"
+          for d in x/classes*.dex; do
+            [ -f "$d" ] || continue
+            echo "### $d"
+            strings -a "$d"
+          done | sort -u > calc_dex_strings.txt
+          wc -l calc_dex_strings.txt
+          echo "-- full odex strings:"
+          { find oat -name '*.odex' -exec sudo strings -a {} \; ; } 2>/dev/null \
+            | sort -u > calc_odex_strings.txt || true
+          wc -l calc_odex_strings.txt
+          echo "-- suspicious lines in dex strings:"
+          { grep -aiE 'http|\.com|\.cn|\.net|/[a-z]+api|url|download|install|uninstall|\.apk|server|host|domain|pwd|setprop|getprop|exec|Runtime|pm |settings put|content://|sendBroadcast|okhttp|retrofit' \
+              calc_dex_strings.txt | head -150 ; } || true
+          echo "-- suspicious lines in odex strings:"
+          { grep -aiE 'http|\.com|\.cn|\.net|url|download|install|uninstall|\.apk|server|domain|pwd|prop|exec' \
+              calc_odex_strings.txt | head -150 ; } || true
+          rm -rf x
+          cd "$GITHUB_WORKSPACE"
+          sudo umount /mnt/sys
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail

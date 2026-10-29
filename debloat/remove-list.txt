@@ -32,3 +32,24 @@ vendor/priv-app/Baidu_Location
 # com.teksun.factorytest (priv-app/ValidationTools; factory-line only,
 # no runtime function on a shipped device)
 priv-app/ValidationTools
+
+# --- v1 (2026-10-30): the NETWORK DROPPER + cameraless cleanup ---
+# ExactCalculator (com.android.calculator2): VENDOR-INJECTED silent app
+# installer.  Evidence: its odex/dex references persist.sys.install.by.pwd
+# (the gate prop set in the boot ramdisk default.prop) -- stock AOSP
+# calculator contains no such code; probe v3b odex sweep (run 40934434361)
+# found this string in NO other app.  This is the agent that, on the
+# user's device after flashing debloat v0 with userdata wiped, silently
+# installed Quark/Wandoujia/HiBy Music/万能联播/萌新社区 on first boot and
+# uninstalled the stock Camera.  Platform-signed => holds INSTALL/DELETE
+# _PACKAGES by signature.  Full dissection: probe v4 (calc_* artifacts).
+app/ExactCalculator
+
+# Camera (com.mediatek.camera): U2 has NO camera hardware (user-confirmed;
+# the vendor agent uninstalls it at runtime anyway).  16.4 MiB with odex.
+vendor/app/Camera
+
+# MiraVision (com.mediatek.miravision.ui): display PQ-tuning UI, 60.8 MiB
+# -- largest remaining single reducible item; PQ service itself lives in
+# the HWC/SurfaceFlinger vendor stack and is untouched by removing the UI.
+vendor/app/MiraVision

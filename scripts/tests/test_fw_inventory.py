@@ -88,6 +88,56 @@ def build_manifest(pkg="com.example.test", vcode=5, vname="1.2.3",
     return struct.pack("<HHI", 0x0003, 8, 8 + len(doc)) + doc
 
 
+def build_manifest_components(pkg="com.example.test", vname="1.2.3"):
+    S = ["manifest", "package", "versionCode", "versionName", "application",
+         "label", "name", "value", "service", "receiver", "uses-permission",
+         "meta-data", pkg, vname, "com.example.MyApp", ".EvilService",
+         ".BootRecv", "android.permission.INSTALL_PACKAGES", "cfgKey",
+         "cfgVal"]
+    idx = {s: i for i, s in enumerate(S)}
+    resmap = [0] * len(S)
+    resmap[idx["versionCode"]] = fi.RES_VERSION_CODE
+    resmap[idx["versionName"]] = fi.RES_VERSION_NAME
+    resmap[idx["label"]] = fi.RES_LABEL
+    resmap[idx["name"]] = fi.RES_NAME
+    resmap[idx["value"]] = fi.RES_VALUE
+
+    def sa(sidx, ttype, data):
+        return {"name": idx["name"], "raw": sidx, "type": ttype, "data": data}
+
+    doc = (_utf8_pool(S) + _resmap(resmap)
+           + _start_el(idx["manifest"], [
+               {"name": idx["package"], "raw": idx[pkg],
+                "type": fi.TYPE_STRING, "data": idx[pkg]},
+               {"name": idx["versionCode"], "raw": -1,
+                "type": fi.TYPE_INT_DEC, "data": 7},
+               {"name": idx["versionName"], "raw": idx[vname],
+                "type": fi.TYPE_STRING, "data": idx[vname]}])
+           + _start_el(idx["application"], [
+               {"name": idx["label"], "raw": -1,
+                "type": fi.TYPE_REFERENCE, "data": 0x7F090001},
+               sa(idx["com.example.MyApp"], fi.TYPE_STRING,
+                  idx["com.example.MyApp"])])
+           + _start_el(idx["meta-data"], [
+               sa(idx["cfgKey"], fi.TYPE_STRING, idx["cfgKey"]),
+               {"name": idx["value"], "raw": idx["cfgVal"],
+                "type": fi.TYPE_STRING, "data": idx["cfgVal"]}])
+           + _end_el(idx["meta-data"])
+           + _start_el(idx["service"], [
+               sa(idx[".EvilService"], fi.TYPE_STRING, idx[".EvilService"])])
+           + _end_el(idx["service"])
+           + _start_el(idx["receiver"], [
+               sa(idx[".BootRecv"], fi.TYPE_STRING, idx[".BootRecv"])])
+           + _end_el(idx["receiver"])
+           + _end_el(idx["application"])
+           + _start_el(idx["uses-permission"], [
+               sa(idx["android.permission.INSTALL_PACKAGES"], fi.TYPE_STRING,
+                  idx["android.permission.INSTALL_PACKAGES"])])
+           + _end_el(idx["uses-permission"])
+           + _end_el(idx["manifest"]))
+    return struct.pack("<HHI", 0x0003, 8, 8 + len(doc)) + doc
+
+
 def make_apk(path, pkg="com.example.test", vcode=5, vname="1.2.3"):
     d = os.path.dirname(path)
     if d:
@@ -258,6 +308,46 @@ class TestCli(unittest.TestCase):
             with open(out) as f:
                 data = json.load(f)
             self.assertEqual(data[0]["package"], "com.a")
+
+
+class TestComponents(unittest.TestCase):
+    def test_components_axml(self):
+        r = fi.components_axml(build_manifest_components())
+        self.assertEqual(r["package"], "com.example.test")
+        by = {}
+        for c in r["components"]:
+            by.setdefault(c["el"], []).append(c)
+        self.assertEqual(by["application"][0]["name"], "com.example.MyApp")
+        self.assertIn("service", by)
+        self.assertEqual(by["service"][0]["name"], ".EvilService")
+        self.assertEqual(by["receiver"][0]["name"], ".BootRecv")
+        self.assertEqual(by["uses-permission"][0]["name"],
+                         "android.permission.INSTALL_PACKAGES")
+        md = by["meta-data"][0]
+        self.assertEqual(md["name"], "cfgKey")
+        self.assertEqual(md["value"], "cfgVal")
+        # non-forensic attrs (label) are deliberately NOT extracted
+        self.assertNotIn("label", by["application"][0])
+
+    def test_components_apk(self):
+        with tempfile.TemporaryDirectory() as td:
+            apk = os.path.join(td, "a.apk")
+            with zipfile.ZipFile(apk, "w") as z:
+                z.writestr("AndroidManifest.xml",
+                           build_manifest_components())
+            r = fi.components_apk(apk)
+        self.assertEqual(r["package"], "com.example.test")
+        names = {c.get("name") for c in r["components"]}
+        self.assertIn(".EvilService", names)
+
+    def test_components_apk_broken(self):
+        with tempfile.TemporaryDirectory() as td:
+            apk = os.path.join(td, "b.apk")
+            with zipfile.ZipFile(apk, "w") as z:
+                z.writestr("AndroidManifest.xml", b"\x00" * 16)
+            r = fi.components_apk(apk)
+        self.assertIn("parse_error", r)
+        self.assertEqual(r["components"], [])
 
 
 if __name__ == "__main__":

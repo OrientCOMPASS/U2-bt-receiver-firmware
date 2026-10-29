@@ -50,6 +50,12 @@ TYPE_INT_BOOLEAN = 0x12
 RES_LABEL = 0x01010001
 RES_VERSION_CODE = 0x0101021B
 RES_VERSION_NAME = 0x0101021C
+RES_VALUE = 0x01010002
+RES_NAME = 0x01010003
+RES_PERMISSION = 0x01010006
+RES_EXPORTED = 0x01010010
+RES_PROCESS = 0x01010011
+RES_AUTHORITIES = 0x01010018
 
 
 def parse_string_pool(data: bytes, chunk_off: int) -> List[str]:
@@ -150,6 +156,98 @@ def manifest_apk(apk_path: str) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         return {"package": None, "versionCode": None, "versionName": None,
                 "label": None, "parse_error": f"{type(e).__name__}: {e}"}
+
+
+COMPONENT_ELS = frozenset({
+    "application", "activity", "activity-alias", "service", "receiver",
+    "provider", "uses-permission", "uses-permission-sdk-23", "permission",
+    "permission-group", "meta-data", "uses-library"})
+
+_ATTR_BY_RESID = {RES_NAME: "name", RES_PERMISSION: "permission",
+                  RES_PROCESS: "process", RES_AUTHORITIES: "authorities",
+                  RES_VALUE: "value", RES_EXPORTED: "exported"}
+_ATTR_BY_NAME = {"name": "name", "permission": "permission",
+                 "process": "process", "authorities": "authorities",
+                 "value": "value", "exported": "exported"}
+
+
+def components_axml(data: bytes) -> Dict[str, Any]:
+    """Enumerate the manifest package + every component element.
+
+    Injection forensics: a MODIFIED system app (e.g. the vendor dropper
+    hiding in ExactCalculator) betrays itself with non-AOSP <service>/
+    <receiver>/<meta-data> entries and a custom Application class.
+    Returns {"package": str|None, "components": [{el, name?, permission?,
+    process?, authorities?, value?, exported?}, ...]}.
+    """
+    if len(data) < 8:
+        raise ValueError("AXML too short")
+    magic, hdr_size = struct.unpack_from("<HH", data, 0)
+    if magic != 0x0003:
+        raise ValueError("bad AXML magic 0x%04X" % magic)
+    strings: List[str] = []
+    resmap: List[int] = []
+    out: Dict[str, Any] = {"package": None, "components": []}
+    off = hdr_size
+    while off + 8 <= len(data):
+        ctype, chdr, csize = struct.unpack_from("<HHI", data, off)
+        if csize < 8 or off + csize > len(data):
+            break
+        if ctype == CHUNK_STRING_POOL:
+            strings = parse_string_pool(data, off)
+        elif ctype == CHUNK_RESOURCE_MAP:
+            n = (csize - chdr) // 4
+            if n > 0:
+                resmap = list(struct.unpack_from("<%dI" % n, data, off + chdr))
+        elif ctype == CHUNK_START_ELEMENT:
+            e = off + chdr
+            name_idx = struct.unpack_from("<i", data, e + 4)[0]
+            astart = struct.unpack_from("<H", data, e + 8)[0] or 20
+            asize = struct.unpack_from("<H", data, e + 10)[0] or 20
+            count = struct.unpack_from("<H", data, e + 12)[0]
+            el = strings[name_idx] if 0 <= name_idx < len(strings) else "?"
+            if el == "manifest" or el in COMPONENT_ELS:
+                rec: Dict[str, Any] = {"el": el}
+                for i in range(count):
+                    ao = e + astart + i * asize
+                    _ns, a_name, a_raw = struct.unpack_from("<iii", data, ao)
+                    _sz, _r0, vtype, vdata = struct.unpack_from("<HBBi",
+                                                                data, ao + 12)
+                    resid = resmap[a_name] if 0 <= a_name < len(resmap) else 0
+                    nm = strings[a_name] if 0 <= a_name < len(strings) else "?"
+                    if vtype == TYPE_STRING:
+                        val: Any = (strings[vdata]
+                                    if 0 <= vdata < len(strings) else None)
+                        if val is None and 0 <= a_raw < len(strings):
+                            val = strings[a_raw]
+                    elif vtype == TYPE_INT_BOOLEAN:
+                        val = bool(vdata)
+                    elif vtype == TYPE_REFERENCE:
+                        val = "@0x%08x" % (vdata & 0xFFFFFFFF)
+                    else:
+                        val = vdata
+                    if el == "manifest":
+                        if nm == "package" and resid == 0:
+                            out["package"] = val
+                        continue
+                    key = _ATTR_BY_RESID.get(resid) or _ATTR_BY_NAME.get(nm)
+                    if key is not None:
+                        rec[key] = val
+                if el != "manifest":
+                    out["components"].append(rec)
+        off += csize
+    return out
+
+
+def components_apk(apk_path: str) -> Dict[str, Any]:
+    """components_axml over an APK's AndroidManifest.xml; never raises."""
+    try:
+        with zipfile.ZipFile(apk_path) as z:
+            with z.open("AndroidManifest.xml") as f:
+                return components_axml(f.read())
+    except Exception as e:  # noqa: BLE001
+        return {"package": None, "components": [],
+                "parse_error": f"{type(e).__name__}: {e}"}
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +449,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     z.add_argument("src", help="zip path or http(s) URL")
     z.add_argument("--out")
 
+    c = sub.add_parser("components",
+                       help="APK -> manifest component list (injection forensics)")
+    c.add_argument("apk")
+    c.add_argument("--out")
+
     args = ap.parse_args(argv)
     if args.cmd == "manifest":
         _emit(manifest_apk(args.apk), args.out)
@@ -360,6 +463,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         _emit(scan_verity(args.image), args.out)
     elif args.cmd == "zip-list":
         _emit(zip_list(args.src), args.out)
+    elif args.cmd == "components":
+        _emit(components_apk(args.apk), args.out)
     return 0
 
 
