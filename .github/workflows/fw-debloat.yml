@@ -149,6 +149,14 @@ jobs:
           mkdir -p "$P/newrd" "$P/stockrd"
           (cd "$P/newrd"   && gzip -dc "$P/newboot/ramdisk.cpio.gz"   | cpio -idm --quiet --no-absolute-filenames)
           (cd "$P/stockrd" && gzip -dc "$P/stockboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          # neutralize escaping symlinks (d -> /sys/kernel/debug etc.) so
+          # diff -r compares stub text instead of following them outside
+          for RD in "$P/newrd" "$P/stockrd"; do
+            find "$RD" -type l | while read -r l; do
+              t=$(readlink "$l"); rm -f "$l"
+              printf 'SYMLINK -> %s\n' "$t" > "$l"
+            done
+          done
           (cd "$P/newrd"   && find . | sort) > "$P/newrd.list"
           (cd "$P/stockrd" && find . | sort) > "$P/stockrd.list"
           diff "$P/stockrd.list" "$P/newrd.list"
@@ -348,6 +356,10 @@ jobs:
           test "$GOT" = "$KERNEL_MD5"
           mkdir -p "$P/pkgrd"
           (cd "$P/pkgrd" && gzip -dc "$P/pkgboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          find "$P/pkgrd" -type l | while read -r l; do
+            t=$(readlink "$l"); rm -f "$l"
+            printf 'SYMLINK -> %s\n' "$t" > "$l"
+          done
           found=0
           for f in "$P/pkgrd"/fstab*; do
             [ -f "$f" ] || continue

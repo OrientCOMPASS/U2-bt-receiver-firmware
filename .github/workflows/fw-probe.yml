@@ -127,6 +127,14 @@ jobs:
             mkdir -p "$P/${img}_rd"
             (cd "$P/${img}_rd" && gzip -dc "$P/${img}_unpack/ramdisk.cpio.gz" \
               | cpio -idm --quiet --no-absolute-filenames)
+            # neutralize symlinks: ramdisk links (d -> /sys/kernel/debug,
+            # etc -> /system/vendor, ...) escape the tree; artifact upload and
+            # diff -r would follow them (EACCES / spurious diffs).  Stub them
+            # as text files so the tree stays traversable and comparable.
+            find "$P/${img}_rd" -type l | while read -r l; do
+              t=$(readlink "$l"); rm -f "$l"
+              printf 'SYMLINK -> %s\n' "$t" > "$l"
+            done
             (cd "$P/${img}_rd" && find . | sort) > "$P/${img}_ramdisk_files.txt"
             echo "-- $img ramdisk entries: $(wc -l < "$P/${img}_ramdisk_files.txt")"
             for f in "$P/${img}_rd"/fstab*; do
