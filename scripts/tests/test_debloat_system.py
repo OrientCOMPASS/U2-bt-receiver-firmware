@@ -24,6 +24,7 @@ def build_fake_system(root):
     make_apk(os.path.join(root, "app/Junk/Junk.apk"), "com.junk.app")
     make_apk(os.path.join(root, "app/Good/Good.apk"), "com.good.app")
     make_apk(os.path.join(root, "priv-app/Evil/Evil.apk"), "com.evil.app")
+    make_apk(os.path.join(root, "preload/Pre/Pre.apk"), "com.preload.junk")
     os.makedirs(os.path.join(root, "app/Junk/oat/arm"))
     with open(os.path.join(root, "app/Junk/oat/arm/Junk.odex"), "wb") as f:
         f.write(b"\x00" * 4096)
@@ -53,18 +54,21 @@ class TestDebloat(unittest.TestCase):
             mnt = os.path.join(td, "sys")
             build_fake_system(mnt)
             lst = os.path.join(td, "list.txt")
-            write_list(lst, ["# comment", "", "app/Junk", "priv-app/Evil"])
+            write_list(lst, ["# comment", "", "app/Junk", "priv-app/Evil",
+                             "preload/Pre"])
             out = os.path.join(td, "removed.json")
             rc, _ = run_main(["--mount", mnt, "--list", lst, "--json", out])
             self.assertEqual(rc, 0)
             self.assertFalse(os.path.exists(os.path.join(mnt, "app/Junk")))
             self.assertFalse(os.path.exists(os.path.join(mnt, "priv-app/Evil")))
+            self.assertFalse(os.path.exists(os.path.join(mnt, "preload/Pre")))
             self.assertTrue(os.path.isdir(os.path.join(mnt, "app/Good")))
             with open(out) as f:
                 rep = json.load(f)
             self.assertGreater(rep["freed_bytes"], 4096)
             pkgs = {p["package"] for p in rep["planned"]}
-            self.assertEqual(pkgs, {"com.junk.app", "com.evil.app"})
+            self.assertEqual(pkgs, {"com.junk.app", "com.evil.app",
+                                    "com.preload.junk"})
             self.assertIn({"file": "etc/permissions/junk-perms.xml",
                            "package": "com.junk.app"}, rep["dangling_refs"])
             self.assertTrue(os.path.isfile(
@@ -85,7 +89,8 @@ class TestDebloat(unittest.TestCase):
             mnt = os.path.join(td, "sys")
             build_fake_system(mnt)
             for bad in ("../etc", "etc/permissions", "app/Junk/oat",
-                        "/app/Junk", "app/", "framework"):
+                        "/app/Junk", "app/", "framework", "preload",
+                        "preinstall/x/y"):
                 lst = os.path.join(td, "list.txt")
                 write_list(lst, [bad])
                 rc, _ = run_main(["--mount", mnt, "--list", lst])

@@ -479,6 +479,16 @@ jobs:
             --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
             --files "$RUNNER_TEMP/$PKG.zip" "$P/VERIFICATION.md"
 
+      - name: Make artifact readable by the upload action
+        if: always()
+        run: |
+          P="$RUNNER_TEMP/probe"
+          [ -d "$P" ] || exit 0
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          sudo chmod -R a+rX "$P" 2>/dev/null || true
+          [ -f "$RUNNER_TEMP/NOTES.md" ] && chmod a+r "$RUNNER_TEMP/NOTES.md" || true
+          echo "unreadable leftovers: $(find "$P" ! -readable | wc -l)"
+
       - name: Upload report artifact
         if: always()
         uses: actions/upload-artifact@v4

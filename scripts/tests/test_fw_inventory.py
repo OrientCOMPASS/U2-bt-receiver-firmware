@@ -139,12 +139,14 @@ class TestScanApps(unittest.TestCase):
                 f.write(b"\x00" * 1024)
             make_apk(os.path.join(td, "priv-app/Bar/Bar.apk"), "com.bar", 2, "2.0")
             make_apk(os.path.join(td, "app/Loose.apk"), "com.loose")
+            make_apk(os.path.join(td, "preload/Pre/Pre.apk"), "com.pre")
             os.makedirs(os.path.join(td, "app/NoApkHere"))          # ignored
             with open(os.path.join(td, "app/readme.txt"), "w") as f:  # ignored
                 f.write("x")
             recs = fi.scan_apps(td)
             by_entry = {r["entry"]: r for r in recs}
-            self.assertEqual(set(by_entry), {"Foo", "Bar", "Loose.apk"})
+            self.assertEqual(set(by_entry), {"Foo", "Bar", "Loose.apk", "Pre"})
+            self.assertEqual(by_entry["Pre"]["root"], "preload")
             self.assertEqual(by_entry["Foo"]["package"], "com.foo")
             self.assertEqual(by_entry["Foo"]["root"], "app")
             self.assertTrue(by_entry["Foo"]["has_oat_dir"])
@@ -173,7 +175,7 @@ class TestVerity(unittest.TestCase):
                         + b"\xAA" * 4088)
             r = fi.scan_verity(img)
             self.assertTrue(r["verity_present"])
-            self.assertEqual(r["footer_hits_tail"][0]["offset"], size - 4096)
+            self.assertEqual(r["footer_hits"][0]["offset"], size - 4096)
             self.assertEqual(r["image_size"], size)
 
     def test_no_footer(self):
@@ -197,6 +199,24 @@ class TestVerity(unittest.TestCase):
             r = fi.scan_verity(img)
             self.assertEqual(r["ext4_fs_size"], fs_bytes)
             self.assertEqual(r["trailing_bytes"], 64 << 10)
+
+    @unittest.skipUnless(shutil.which("mkfs.ext4"), "mkfs.ext4 not available")
+    def test_full_trailing_scan_finds_mid_footer(self):
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "fs.img")
+            fs_bytes = 16 << 20
+            subprocess.run(["mkfs.ext4", "-q", "-b", "4096", "-F", img, "4096"],
+                           check=True)
+            off = fs_bytes + (128 << 10)
+            with open(img, "r+b") as f:
+                f.seek(0, os.SEEK_END)
+                f.write(b"\x00" * (1 << 20))       # 1 MiB trailing area
+                f.seek(off)
+                f.write(fi.VERITY_FOOTER_MAGIC + b"\x00" * 60)
+            r = fi.scan_verity(img)
+            self.assertTrue(r["verity_present"])
+            self.assertIn(off, [h["offset"] for h in r["footer_hits"]])
+            self.assertEqual(r["scanned_bytes"], 1 << 20)
 
 
 class TestZipList(unittest.TestCase):

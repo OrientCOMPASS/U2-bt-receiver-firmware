@@ -7,8 +7,10 @@ line, e.g. `app/Foo` or `priv-app/Bar`; '#' comments and blank lines are
 ignored.  Safety rails (all enforced, any violation aborts before deleting
 anything):
 
-  * every path must match ^(app|priv-app|vendor/app|vendor/priv-app)/[^/]+$
-    -- top-level app directories only, no nesting, no '..', no absolute paths
+  * every path must match ^(app|priv-app|vendor/app|vendor/priv-app|preload|
+    preinstall)/[^/]+$ -- top-level app directories only (preload/preinstall
+    are the MTK first-boot copy-to-/data sources), no nesting, no '..', no
+    absolute paths
   * every path must exist as a directory on the mount
   * nothing outside the listed directories is ever touched
 
@@ -33,7 +35,8 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional, Set
 
-SAFE_PATH = re.compile(r"^(app|priv-app|vendor/app|vendor/priv-app)/[^/]+$")
+SAFE_PATH = re.compile(
+    r"^(app|priv-app|vendor/app|vendor/priv-app|preload|preinstall)/[^/]+$")
 
 
 def load_list(path: str) -> List[str]:

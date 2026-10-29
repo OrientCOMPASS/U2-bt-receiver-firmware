@@ -179,6 +179,19 @@ jobs:
             sudo cp -r "/mnt/sys/etc/$d" "$P/etc/$d" 2>/dev/null || true
           done
           ls /mnt/sys/etc > "$P/system_etc.txt"
+          echo "-- /system/data (recursive):"
+          sudo ls -laR /mnt/sys/data > "$P/system_data.txt" 2>&1 || true
+          head -40 "$P/system_data.txt"
+          echo "-- /system/preinstall (recursive):"
+          sudo ls -laR /mnt/sys/preinstall > "$P/preinstall_tree.txt" 2>&1 || true
+          head -60 "$P/preinstall_tree.txt"
+          echo "-- /system/preload (top level):"
+          sudo ls -la /mnt/sys/preload > "$P/preload_top.txt" 2>&1 || true
+          cat "$P/preload_top.txt"
+          echo "-- install-recovery mechanism:"
+          sudo ls -la /mnt/sys/etc/install-recovery.sh /mnt/sys/recovery-from-boot.p \
+            > "$P/install_recovery.txt" 2>&1 || true
+          cat "$P/install_recovery.txt"
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
@@ -252,7 +265,9 @@ jobs:
                 f"- image_size: {v.get('image_size')}",
                 f"- ext4_fs_size: {v.get('ext4_fs_size')}",
                 f"- trailing_bytes: {v.get('trailing_bytes')}",
-                f"- footer_hits_tail: {len(v.get('footer_hits_tail') or [])}",
+                f"- scanned_bytes: {v.get('scanned_bytes')}",
+                f"- footer_hits: {len(v.get('footer_hits') or [])}",
+                f"- footer_at_legacy_midpoint: {v.get('footer_at_legacy_midpoint')}",
                 f"- verity_present: {v.get('verity_present')}", ""]
           bh = rep["boot_header"] or {}
           L += ["## boot.img", f"- cmdline: `{bh.get('cmdline')}`",
@@ -273,7 +288,17 @@ jobs:
           print(txt[:4000])
           PY
 
+      - name: Make artifact readable by the upload action
+        if: always()
+        run: |
+          P="$RUNNER_TEMP/probe"
+          [ -d "$P" ] || exit 0
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          sudo chmod -R a+rX "$P" 2>/dev/null || true
+          echo "unreadable leftovers: $(find "$P" ! -readable | wc -l)"
+
       - name: Upload probe artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fw-probe-report

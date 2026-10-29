@@ -157,7 +157,7 @@ def manifest_apk(apk_path: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 APP_ROOTS = ["app", "priv-app", "vendor/app", "vendor/priv-app",
-             "overlay", "vendor/overlay"]
+             "overlay", "vendor/overlay", "preload", "preinstall"]
 
 
 def _dir_size(path: str) -> int:
@@ -241,35 +241,60 @@ def ext4_fs_size(img: str) -> Optional[int]:
         return None
 
 
-def scan_verity(img: str, tail_scan: int = 1 << 20) -> Dict[str, Any]:
-    """Locate verity footer magic near the end (and at the legacy mid-point)
-    of a raw image and report the fs-size vs image-size trailing gap."""
+def scan_verity(img: str, tail_scan: int = 1 << 20,
+                max_trailing_scan: int = 512 << 20) -> Dict[str, Any]:
+    """Locate verity footer magic in a raw image and report the fs-size vs
+    image-size trailing gap.
+
+    Scan window: the whole trailing area beyond the ext4 fs when it exists
+    and is <= max_trailing_scan (that is where hashtree + footer live), else
+    the last tail_scan bytes.  The legacy mid-point location is checked too.
+    """
     size = os.path.getsize(img)
+    fs_size = ext4_fs_size(img)
+    trailing = (size - fs_size) if (fs_size and 0 < fs_size < size) else 0
+    scan_len = tail_scan
+    if 0 < trailing <= max_trailing_scan:
+        scan_len = trailing
+    scan_len = min(scan_len, size)
+    win_start = size - scan_len
     hits: List[Dict[str, Any]] = []
+    magic = VERITY_FOOTER_MAGIC
     with open(img, "rb") as f:
-        n = min(size, tail_scan)
-        f.seek(size - n)
-        tail = f.read(n)
-        start = 0
-        while True:
-            i = tail.find(VERITY_FOOTER_MAGIC, start)
-            if i < 0:
+        f.seek(win_start)
+        pos = win_start
+        carry = b""
+        while pos < size:
+            buf = f.read(min(8 << 20, size - pos))
+            if not buf:
                 break
-            off = size - n + i
-            hits.append({"offset": off, "hexdump": tail[i:i + 72].hex()})
-            start = i + 4
+            hay = carry + buf
+            base = pos - len(carry)
+            start = 0
+            while True:
+                i = hay.find(magic, start)
+                if i < 0:
+                    break
+                hits.append({"offset": base + i,
+                             "hexdump": hay[i:i + 72].hex()})
+                start = i + 4
+            carry = hay[-3:] if len(hay) >= 3 else hay
+            pos += len(buf)
         legacy_off = size // 2 - 4096
         legacy = False
         if 0 < legacy_off < size - 4:
-            f.seek(legacy_off)
-            legacy = f.read(4) == VERITY_FOOTER_MAGIC
-    fs_size = ext4_fs_size(img)
+            if legacy_off >= win_start:
+                legacy = any(h["offset"] == legacy_off for h in hits)
+            else:
+                f.seek(legacy_off)
+                legacy = f.read(4) == magic
     return {
         "image": img,
         "image_size": size,
         "ext4_fs_size": fs_size,
-        "trailing_bytes": (size - fs_size) if fs_size else None,
-        "footer_hits_tail": hits,
+        "trailing_bytes": trailing or None,
+        "scanned_bytes": scan_len,
+        "footer_hits": hits,
         "footer_at_legacy_midpoint": legacy,
         "verity_present": bool(hits or legacy),
     }
