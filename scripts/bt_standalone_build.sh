@@ -190,6 +190,7 @@ setup_sources() {
         media/libaudioclient/include media/libmedia/include media/libaudiohal/include include
   fi
   clone_sparse  sysmedia  "$AOSP/system/media" audio/include audio_utils/include
+  clone_sparse  libnativehelper "$AOSP/libnativehelper" include
   if [ ! -d "$SRC/gtest" ]; then
     # external/googletest carries NO android-7.* tags at all; we only need
     # gtest/gtest_prod.h (FRIEND_TEST macro) -- version-stable, so pin the
@@ -286,6 +287,7 @@ SENTINELS_NOUGAT=(
   "native/include/binder/Parcel.h"
   "av/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
+  "libnativehelper/include/nativehelper/ScopedFd.h"
   "tinyxml2/tinyxml2.h"
   "aac/libAACdec/include/aacdecoder_lib.h"
 )
@@ -372,7 +374,8 @@ BT_INC=(
   -I"\$BT/utils/include" -I"\$BT/vnd/include" -I"\$BT/vnd/ble"
   -I"\$BT/types" -I"\$BT/device/include"
   -I"\$BT/embdrv/sbc/encoder/include" -I"\$BT/embdrv/sbc/decoder/include"
-  -I"\$BT/audio_a2dp_hw/include"
+  -I"\$BT/audio_a2dp_hw/include" -I"\$BT/audio_a2dp_hw"
+  -I"\$SRC/libnativehelper/include"
   -I"\$BDCFG"
   -I"\$SRC/libchrome" -I"\$SRC/gtest/googletest/include"
   -I"\$SRC/libhardware/include"
@@ -404,7 +407,7 @@ AAC_INC=(
 LDAC_INC=( -I"\$SRC/libldac/inc" -I"\$SRC/libldac/abr/inc" )
 DEFS=(
   -DEXPORT_SYMBOL=__attribute__\\(\\(visibility\\(\\"default\\"\\)\\)\\)
-  -DLOG_NDEBUG=1 -DBUILDCFG $bd_def -DNDEBUG
+  -DLOG_NDEBUG=1 -DBUILDCFG -DHAS_NO_BDROID_BUILDCFG $bd_def -DNDEBUG
 )
 CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c -O0 -fPIC -w -Wno-c++11-narrowing -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
 CFLAGS=(   "\${TARGET[@]}" "\${SYSROOT[@]}" -std=c99     -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden -fcommon "\${DEFS[@]}" )
@@ -472,7 +475,7 @@ SMOKEOF
   echo "[build] system/bt module dirs present:$bt_dirs"
   (cd "$SRC/bt" && find $bt_dirs \
        \( -name '*.cc' -o -name '*.cpp' -o -name '*.c' \) 2>/dev/null) \
-    | grep -vE '(^|/)(test|tests)/|_test\.cc$|_unittest\.cc$|_test_support\.cc$|hci_layer_android\.cc$|^osi/src/metrics\.cc$' \
+    | grep -vE '(^|/)(test|tests)/|_test\.cc$|_unittest\.cc$|_test_support\.cc$|hci_layer_android\.cc$|^osi/src/metrics\.(cc|cpp)$' \
     | sed 's#^#bt #' >> "$LIST"
   # external/aac -- Android.bp globs top-level "lib*/src/*.cpp" only
   local l files
