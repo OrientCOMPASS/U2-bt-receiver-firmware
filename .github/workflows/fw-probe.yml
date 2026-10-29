@@ -443,6 +443,51 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Vendor dropper dissection (probe v6)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== /system/vendor/etc/init/ (MTK N vendor rc dir):"
+          sudo ls -la /mnt/sys/vendor/etc/init/ 2>/dev/null | tee "$P/vendor_etc_init_ls.txt" || true
+          for f in /mnt/sys/vendor/etc/init/*; do
+            [ -f "$f" ] || continue
+            echo "### $f"; sudo cat "$f"
+          done > "$P/vendor_etc_init_full.txt" 2>/dev/null || true
+          cat "$P/vendor_etc_init_full.txt" | head -200
+          echo "== disableapplist.txt + custom.conf:"
+          sudo cat /mnt/sys/vendor/etc/disableapplist.txt | tee "$P/disableapplist.txt" || true
+          sudo cat /mnt/sys/vendor/etc/custom.conf | tee "$P/custom_conf.txt" | head -60 || true
+          echo "== vendor etc file list (full):"
+          sudo find /mnt/sys/vendor/etc -maxdepth 1 -type f | sed 's|/mnt/sys/||' | tee "$P/vendor_etc_files.txt" | head -60
+          echo "== property-string consumers across ALL native code:"
+          { sudo grep -rlaE 'persist\.sys\.install|disableapplist|install\.by\.(pwd|wifi)' \
+              /mnt/sys/bin /mnt/sys/xbin /mnt/sys/lib /mnt/sys/lib64 \
+              /mnt/sys/vendor/bin /mnt/sys/vendor/lib /mnt/sys/vendor/lib64 \
+              /mnt/sys/etc /mnt/sys/framework/oat 2>/dev/null \
+              | sed 's|/mnt/sys/||' ; } | tee "$P/prop_consumers.txt" || true
+          echo "== downloader / autobt / starter full strings:"
+          for b in downloader autobt starter; do
+            if [ -f "/mnt/sys/vendor/bin/$b" ]; then
+              echo "### $b ($(sudo stat -c%s "/mnt/sys/vendor/bin/$b") bytes)"
+              sudo strings -a "/mnt/sys/vendor/bin/$b" > "$P/vendorbin_$b.strings" || true
+              wc -l "$P/vendorbin_$b.strings"
+              { grep -aiE 'http|\.com|\.cn|\.net|\.apk|url|download|install|uninstall|server|host|domain|pwd|wifi|prop|exec|system\(|pm |settings|socket|connect|GET |POST ' \
+                  "$P/vendorbin_$b.strings" | sort -u | head -80 ; } || true
+            fi
+          done
+          echo "== services.odex vendor-hook context (Gate/apk-enabled/disableapp/downloader):"
+          { sudo strings -a /mnt/sys/framework/oat/arm64/services.odex 2>/dev/null \
+              | grep -aiE 'gate|apk is enabled|disableapp|install\.by|downloader|starter|autobt|vendor.*install' \
+              | sort -u | head -60 ; } | tee "$P/services_hook_strings.txt" || true
+          { sudo strings -a /mnt/sys/framework/oat/arm64/boot-mediatek-framework.oat /mnt/sys/framework/oat/arm64/boot-mediatek-common.oat 2>/dev/null \
+              | grep -aiE 'disableapp|install\.by|downloader|gate.*apk|apk.*gate' | sort -u | head -40 ; } \
+            | tee "$P/mtk_fw_hook_strings.txt" || true
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail
