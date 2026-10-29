@@ -202,6 +202,12 @@ setup_sources() {
       "$AOSP/external/googletest" "$SRC/gtest"
     git -C "$SRC/gtest" sparse-checkout set googletest/include
   fi
+  clone_sparse  bionic    "$AOSP/bionic" libc/kernel/uapi/linux
+  # Kernel-uapi shim: the NDK sysroot does not export linux/binder.h, but the
+  # N AudioTrack/binder include chain (btif_avrcp_audio_track.cpp) needs it.
+  # Copy ONLY binder.h into a shim dir so nothing else shadows the NDK.
+  mkdir -p "$WORKDIR/shim/linux"
+  cp "$SRC/bionic/libc/kernel/uapi/linux/binder.h" "$WORKDIR/shim/linux/binder.h"
   if [ ! -d "$SRC/libchrome" ]; then
     echo "[src] clone libchrome (headers only)"
     git clone -q --depth 1 --branch "$TAG" --filter=blob:none --no-checkout \
@@ -288,6 +294,7 @@ SENTINELS_NOUGAT=(
   "av/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
   "libnativehelper/include/nativehelper/ScopedFd.h"
+  "bionic/libc/kernel/uapi/linux/binder.h"
   "tinyxml2/tinyxml2.h"
   "aac/libAACdec/include/aacdecoder_lib.h"
 )
@@ -376,6 +383,7 @@ BT_INC=(
   -I"\$BT/embdrv/sbc/encoder/include" -I"\$BT/embdrv/sbc/decoder/include"
   -I"\$BT/audio_a2dp_hw/include" -I"\$BT/audio_a2dp_hw"
   -I"\$SRC/libnativehelper/include"
+  -I"\$HERE/shim"
   -I"\$BDCFG"
   -I"\$SRC/libchrome" -I"\$SRC/gtest/googletest/include"
   -I"\$SRC/libhardware/include"
