@@ -173,8 +173,14 @@ setup_sources() {
     clone_sparse  core    "$AOSP/system/core" \
         libcutils/include libutils/include liblog/include libsystem/include base/include
   fi
-  clone_sparse  native    "$AOSP/frameworks/native" \
-      include libs/binder/include libs/ui/include libs/gui/include libs/nativewindow/include
+  if [ "$TREE" = nougat ]; then
+    # N: frameworks/native headers all live in the top-level include/ tree
+    # (binder, gui, ui, android, media, input...). Per-lib include dirs came later.
+    clone_sparse  native  "$AOSP/frameworks/native" include
+  else
+    clone_sparse  native  "$AOSP/frameworks/native" \
+        include libs/binder/include libs/ui/include libs/gui/include libs/nativewindow/include
+  fi
   clone_sparse  av        "$AOSP/frameworks/av" \
       media/libaudioclient/include media/libmedia/include media/libaudiohal/include include
   clone_sparse  sysmedia  "$AOSP/system/media" audio/include audio_utils/include
@@ -271,7 +277,7 @@ SENTINELS_NOUGAT=(
   "core/include/cutils/properties.h"
   "core/include/utils/RefBase.h"
   "core/include/log/log.h"
-  "native/libs/binder/include/binder/Parcel.h"
+  "native/include/binder/Parcel.h"
   "av/media/libmedia/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
   "tinyxml2/tinyxml2.h"
