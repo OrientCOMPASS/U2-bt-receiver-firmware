@@ -285,40 +285,45 @@ jobs:
               | grep -aiE 'http|\.apk|install|download|quark|wandoujia|hiby|lianbo|mengxin|pwd|bs\.' \
               | sort -u | head -120 | tee "$P/fwkplugin_strings.txt" || true
           fi
-          echo "== vdex list:"
+          echo "== dex-container list (this MTK N build ships .odex only; dex is embedded in the oat container):"
           sudo find /mnt/sys/framework /mnt/sys/app /mnt/sys/priv-app /mnt/sys/vendor \
-            -name '*.vdex' 2>/dev/null | sed 's|/mnt/sys/||' | tee "$P/vdex_list.txt" | head -60
-          echo "== single strings pass per vdex -> domains + keywords:"
-          : > "$P/vdex_domains.txt"; : > "$P/vdex_keywords.txt"
+            \( -name '*.odex' -o -name '*.vdex' -o -name '*.oat' \) 2>/dev/null \
+            | sed 's|/mnt/sys/||' | sort | tee "$P/vdex_list.txt"
+          wc -l "$P/vdex_list.txt"
+          echo "== single strings pass per container -> domains + keywords:"
+          : > "$P/vdex_domains.txt"; : > "$P/vdex_keywords.txt"; : > "$P/vdex_scanstat.txt"
           while read -r rel; do
             f="/mnt/sys/$rel"
             tmp="$RUNNER_TEMP/cur.strings"
             sudo strings -a "$f" > "$tmp" 2>/dev/null || true
-            grep -aoE 'https?://[A-Za-z0-9._-]+[^"'"'"' <>]*' "$tmp" | sort -u \
+            nd=$(grep -acE 'https?://' "$tmp" || true)
+            echo "$rel scanned: $(wc -l < "$tmp") strings, $nd url-ish" >> "$P/vdex_scanstat.txt"
+            grep -aoE 'https?://[A-Za-z0-9._-]+[^"'"'"' <>]*' "$tmp" 2>/dev/null | sort -u \
               | sed "s|^|$rel: |" >> "$P/vdex_domains.txt" || true
-            grep -aiE 'install[._-]?by[._-]?pwd|bs\.fake|silent|hotapps|quark|wandoujia|hiby|lianbo|mengxin|uninstall|DELETE_PACKAGES|INSTALL_PACKAGES' "$tmp" \
+            grep -aiE 'install[._-]?by[._-]?pwd|bs\.fake|silent|hotapps|quark|wandoujia|hiby|lianbo|mengxin|uninstall|DELETE_PACKAGES|INSTALL_PACKAGES|夸克|豌豆荚|海贝|联播|萌新' "$tmp" 2>/dev/null \
               | sort -u | head -25 | sed "s|^|$rel: |" >> "$P/vdex_keywords.txt" || true
             rm -f "$tmp"
           done < "$P/vdex_list.txt"
           wc -l "$P/vdex_domains.txt" "$P/vdex_keywords.txt"
+          cat "$P/vdex_scanstat.txt" | head -60
           echo "-- non-AOSP-looking domains:"
-          cut -d: -f2- "$P/vdex_domains.txt" | sort -u | grep -viE 'android\.com|google|apache\.org|w3\.org|xml|schema|oracle|java|sun\.com|openssl|kernel\.org|gnu\.org|ietf|rfc-|unicode|json|sqlite|chromium|webkit|mozilla|sourceforge|python|xmlpull|xml\.org|samsung|nvidia|imgtec|khronos|openmobile|gsma|omtp|example\.' | head -80
+          { cut -d: -f2- "$P/vdex_domains.txt" | sort -u | grep -viE 'android\.com|google|apache\.org|w3\.org|xml|schema|oracle|java|sun\.com|openssl|kernel\.org|gnu\.org|ietf|rfc-|unicode|json|sqlite|chromium|webkit|mozilla|sourceforge|python|xmlpull|xml\.org|samsung|nvidia|imgtec|khronos|openmobile|gsma|omtp|example\.|licenses' | head -100 ; } || true
           echo "-- keyword hits:"
-          sort -u "$P/vdex_keywords.txt" | head -100
+          { sort -u "$P/vdex_keywords.txt" | head -120 ; } || true
           echo "== etc/permissions + sysconfig + vendor permissions (full dump):"
           for x in /mnt/sys/etc/permissions/*.xml /mnt/sys/etc/sysconfig/*.xml \
                    /mnt/sys/vendor/etc/permissions/*.xml /mnt/sys/vendor/etc/sysconfig/*.xml; do
             [ -f "$x" ] || continue
             echo "### ${x#/mnt/sys/}"; sudo cat "$x"
           done > "$P/etc_permissions.txt" 2>/dev/null || true
-          grep -B2 -A2 -iE 'INSTALL_PACKAGES|DELETE_PACKAGES' "$P/etc_permissions.txt" | head -40 || true
+          { grep -B2 -A2 -iE 'INSTALL_PACKAGES|DELETE_PACKAGES' "$P/etc_permissions.txt" | head -40 ; } || true
           wc -l "$P/etc_permissions.txt"
           echo "== big-file payload hunt (>2M outside lib/oat/fonts/media/tts/usr):"
           sudo find /mnt/sys -type f -size +2M \
             -not -path '*/lib/*' -not -path '*/lib64/*' -not -path '*/oat/*' \
             -not -path '*/fonts/*' -not -path '*/media/*' -not -path '*/tts/*' \
             -not -path '*/usr/*' -not -path '*/fake-libs*' 2>/dev/null \
-            | while read -r f; do sudo file "$f"; done | tee "$P/bigfiles.txt" | head -60
+            | { while read -r f; do sudo file "$f"; done | tee "$P/bigfiles.txt" | head -60 ; } || true
           echo "== vendor rc files (full):"
           cat "$P/boot_rd/init.project.rc" "$P/boot_rd/init.common_svc.rc" \
             > "$P/vendor_rc_full.txt" 2>/dev/null || true
