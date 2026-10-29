@@ -62,6 +62,8 @@ jobs:
             --ours "$RUNNER_TEMP/btw/out/bluetooth.default.so" \
             --baseline-dir "$RUNNER_TEMP/baseline-bt" \
             --sysroot-lib "$NDKROOT/sysroot/usr/lib/arm-linux-androideabi/26" \
+            --proven-und "$RUNNER_TEMP/baseline-bt/lib/hw/bluetooth.default.so" \
+            --proven-und "$RUNNER_TEMP/baseline-bt/lib/libbluetooth_jni.so" \
             --out "$RUNNER_TEMP/btw/out/symbol_gate.json"
 
       - name: Artifact summary (ELF class/machine + DT_NEEDED)

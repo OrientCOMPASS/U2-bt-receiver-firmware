@@ -134,6 +134,20 @@ def exports_of(paths: List[str]) -> Set[str]:
     return syms
 
 
+def unds_of(paths: List[str]) -> Set[str]:
+    """Undefined symbols of stock device libraries: whatever THEY bind to on
+    the real device is proven runtime-resolvable in the BT process."""
+    syms: Set[str] = set()
+    for p in paths:
+        try:
+            for nm, bind, shndx in Elf(p).dynsyms():
+                if shndx == SHN_UNDEF and nm:
+                    syms.add(strip_ver(nm))
+        except (ValueError, OSError, struct.error) as ex:
+            print(f"[gate] WARN: cannot parse {p}: {ex}", file=sys.stderr)
+    return syms
+
+
 def find_so(dirs: List[str]) -> List[str]:
     out = []
     for root in dirs:
@@ -154,6 +168,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--baseline-dir", action="append", default=[])
     ap.add_argument("--sysroot-lib", action="append", default=[])
     ap.add_argument("--allowlist")
+    ap.add_argument("--proven-und", action="append", default=[],
+                    help="ELF (e.g. the stock 32-bit lib/hw/bluetooth.default.so "
+                         "shipped by the device) whose UNDEFINED symbols are "
+                         "proven runtime-resolvable in the target BT process; "
+                         "they join the provided set.  Needed because the "
+                         "baseline extraction carries 64-bit libmedia/libutils "
+                         "only, while size_t-mangled symbols (AudioTrack::write, "
+                         "ctor) differ between 32/64-bit.")
     ap.add_argument("--out")
     args = ap.parse_args(argv)
 
@@ -176,7 +198,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     base_syms = exports_of(base_libs)
     sys_syms = exports_of(sys_libs)
 
-    provided = base_syms | sys_syms | allow
+    proven_libs = find_so(args.proven_und)
+    proven_syms = unds_of(proven_libs)
+
+    provided = base_syms | sys_syms | allow | proven_syms
     missing = sorted(strong_und - provided)
     weak_missing = sorted(weak_und - provided)
 
@@ -189,6 +214,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "sysroot_libs": len(sys_libs),
         "sysroot_export_syms": len(sys_syms),
         "allowlist": sorted(allow),
+        "proven_und_libs": proven_libs,
+        "proven_und_syms": len(proven_syms),
         "missing": missing,
         "weak_missing": weak_missing,
         "verdict": "PASS" if not missing else "FAIL",
@@ -201,7 +228,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"strongUND={len(strong_und)} weakUND={len(weak_und)}")
     print(f"[gate] baseline: {len(base_libs)} libs / {len(base_syms)} exports; "
           f"sysroot: {len(sys_libs)} libs / {len(sys_syms)} exports; "
-          f"allowlist: {len(allow)}")
+          f"allowlist: {len(allow)}; proven-und: {len(proven_libs)} libs / "
+          f"{len(proven_syms)} syms")
     if missing:
         print(f"[gate] FAIL: {len(missing)} strong undefined symbols NOT "
               f"provided by baseline+sysroot:")
@@ -211,7 +239,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"    ... and {len(missing) - 60} more (see --out JSON)")
     else:
         print("[gate] PASS: every strong undefined symbol resolves against "
-              "baseline U sysroot U allowlist")
+              "baseline U sysroot U allowlist U proven-und")
         if weak_missing:
             print(f"[gate] note: {len(weak_missing)} WEAK undefined remain "
                   f"(bind to 0; first 10): {weak_missing[:10]}")
