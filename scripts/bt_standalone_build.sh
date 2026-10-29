@@ -57,6 +57,7 @@
 set -euo pipefail
 
 TAG="android-8.1.0_r80"
+TREE=""                       # 8.1 (default) | nougat  (auto from android-7.* tag)
 NDK_URL="https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
 WORKDIR=""
 JOBS="$(nproc 2>/dev/null || echo 2)"
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --workdir)    WORKDIR="${2:-}"; shift 2 ;;
     --tag)        TAG="${2:-}"; shift 2 ;;
+    --tree)       TREE="${2:-}"; shift 2 ;;
     --ndk-url)    NDK_URL="${2:-}"; shift 2 ;;
     --jobs)       JOBS="${2:-}"; shift 2 ;;
     --smoke)      SMOKE=1; shift ;;
@@ -82,12 +84,25 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$WORKDIR" ] || die "--workdir is required"
+if [ -z "$TREE" ]; then
+  case "$TAG" in
+    android-7.*) TREE="nougat" ;;
+    *)           TREE="8.1" ;;
+  esac
+fi
+case "$TREE" in 8.1|nougat) ;; *) die "--tree must be 8.1 or nougat (got: $TREE)" ;; esac
+echo "[cfg] tree=$TREE tag=$TAG"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-PATCH_DIR="$REPO_ROOT/patches"
-BDCFG_DIR="$REPO_ROOT/device/keenplus/u2"
-[ -d "$PATCH_DIR/system_bt" ] || die "patches not found at $PATCH_DIR"
-[ -f "$BDCFG_DIR/bdroid_buildcfg.h" ] || die "bdroid_buildcfg.h not found in $BDCFG_DIR"
+if [ "$TREE" = nougat ]; then
+  PATCH_DIR="$REPO_ROOT/patches/nougat"
+  BDCFG_DIR="$REPO_ROOT/device/keenplus/u2-n"
+else
+  PATCH_DIR="$REPO_ROOT/patches"
+  BDCFG_DIR="$REPO_ROOT/device/keenplus/u2"
+  [ -d "$PATCH_DIR/system_bt" ] || die "patches not found at $PATCH_DIR"
+  [ -f "$BDCFG_DIR/bdroid_buildcfg.h" ] || die "bdroid_buildcfg.h not found in $BDCFG_DIR"
+fi
 
 SRC="$WORKDIR/src"
 OBJ="$WORKDIR/obj"
@@ -145,7 +160,9 @@ setup_sources() {
   clone_full    bt        "$AOSP/system/bt"
   clone_sparse  libhardware "$AOSP/hardware/libhardware" include
   clone_full    tinyxml2  "$AOSP/external/tinyxml2"
-  clone_full    libldac   "$AOSP/external/libldac"
+  # external/libldac exists only from 8.0 on; LDAC on the nougat tree goes
+  # through the (later) libldacdec+bco-shim route, see DEVELOPMENT_PLAN 16.8.
+  [ "$TREE" = nougat ] || clone_full libldac "$AOSP/external/libldac"
   clone_full    aac       "$AOSP/external/aac"
   clone_sparse  core      "$AOSP/system/core" \
       libcutils/include libutils/include liblog/include libsystem/include base/include
@@ -166,6 +183,21 @@ setup_sources() {
 }
 
 apply_patches() {
+  if [ "$TREE" = nougat ]; then
+    if ls "$PATCH_DIR/system_bt"/*.patch >/dev/null 2>&1; then
+      git -C "$SRC/bt" config user.name  "OrientCOMPASS"
+      git -C "$SRC/bt" config user.email "316423573+OrientCOMPASS@users.noreply.github.com"
+      local p n=0
+      for p in "$PATCH_DIR/system_bt"/*.patch; do
+        git -C "$SRC/bt" am "$p" >/dev/null || die "git am failed: $p"
+        n=$((n+1))
+      done
+      echo "[patch] bt(nougat): applied $n patch(es) from $PATCH_DIR/system_bt"
+    else
+      echo "[patch] bt(nougat): no series yet -- PRISTINE tree gate"
+    fi
+    return 0
+  fi
   # Deterministic "already applied?" markers: files/symbols our series adds.
   if [ -f "$SRC/bt/stack/a2dp/a2dp_aac_decoder.cc" ]; then
     echo "[patch] bt: series already applied (a2dp_aac_decoder.cc present)"
@@ -204,6 +236,26 @@ apply_patches() {
 # differences (a top-level "include" cone once failed to materialize on the
 # CI runners), so verify and self-heal instead of failing deep inside clang
 # with a confusing "file not found".
+SENTINELS_NOUGAT=(
+  "bt/stack/a2dp/a2dp_api.c"
+  "bt/stack/avdt/avdt_defs.h"
+  "bt/btif/co/bta_av_co.c"
+  "bt/main/bte_main.cc"
+  "bt/gki/ulinux/gki_ulinux.c"
+  "bt/embdrv/sbc/decoder/include/oi_codec_sbc.h"
+  "libhardware/include/hardware/bluetooth.h"
+  "libchrome/base/logging.h"
+  "gtest/googletest/include/gtest/gtest_prod.h"
+  "core/libcutils/include/cutils/properties.h"
+  "core/libutils/include/utils/RefBase.h"
+  "core/liblog/include/log/log.h"
+  "native/libs/binder/include/binder/Parcel.h"
+  "av/media/libaudioclient/include/media/AudioTrack.h"
+  "sysmedia/audio/include/system/audio.h"
+  "tinyxml2/tinyxml2.h"
+  "aac/libAACdec/include/aacdecoder_lib.h"
+)
+
 SENTINELS=(
   "bt/stack/a2dp/a2dp_aac_decoder.cc"
   "libhardware/include/hardware/bt_av.h"
@@ -224,8 +276,9 @@ SENTINELS=(
 )
 
 verify_headers() {
-  local s repo missing=0
-  for s in "${SENTINELS[@]}"; do
+  local s repo missing=0 arr=SENTINELS
+  [ "$TREE" = nougat ] && arr=SENTINELS_NOUGAT
+  for s in "${!arr[@]}"; do
     if [ ! -f "$SRC/$s" ]; then
       repo="${s%%/*}"
       echo "[verify] MISSING $s -- healing $repo with a full checkout"
@@ -240,7 +293,9 @@ verify_headers() {
       missing=$((missing+1))
     fi
   done
-  if grep -q 'BTAV_A2DP_CODEC_INDEX_SINK_AAC' "$SRC/libhardware/include/hardware/bt_av.h"; then
+  if [ "$TREE" = nougat ]; then
+    echo "[verify] all ${#SENTINELS_NOUGAT[@]} nougat sentinels present ($missing healed)"
+  elif grep -q 'BTAV_A2DP_CODEC_INDEX_SINK_AAC' "$SRC/libhardware/include/hardware/bt_av.h"; then
     echo "[verify] all ${#SENTINELS[@]} sentinels present ($missing healed); patches in place"
   else
     die "libhardware patch marker missing (bt_av.h)"
@@ -251,6 +306,11 @@ verify_headers() {
 # Stage 3: compile environment (mirrors fluoride_defaults + module include_dirs)
 # ---------------------------------------------------------------------------
 write_env() {
+  local bd_def="-DHAS_BDROID_BUILDCFG"
+  if [ "$TREE" = nougat ] && [ ! -f "$BDCFG_DIR/bdroid_buildcfg.h" ]; then
+    bd_def=""   # pristine gate: pure AOSP N defaults from bt_target.h
+    echo "[env] nougat pristine: no bdroid_buildcfg (AOSP defaults)"
+  fi
   cat > "$WORKDIR/env.sh" <<ENVEOF
 HERE="$WORKDIR"
 SRC="$SRC"
@@ -307,7 +367,7 @@ AAC_INC=(
 LDAC_INC=( -I"\$SRC/libldac/inc" -I"\$SRC/libldac/abr/inc" )
 DEFS=(
   -DEXPORT_SYMBOL=__attribute__\\(\\(visibility\\(\\"default\\"\\)\\)\\)
-  -DLOG_NDEBUG=1 -DBUILDCFG -DHAS_BDROID_BUILDCFG -DNDEBUG
+  -DLOG_NDEBUG=1 -DBUILDCFG $bd_def -DNDEBUG
 )
 CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
 CFLAGS=(   "\${TARGET[@]}" "\${SYSROOT[@]}" -std=c99     -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden -fcommon "\${DEFS[@]}" )
@@ -364,7 +424,7 @@ SMOKEOF
   fi
   # system/bt -- everything that lands in bluetooth.default / audio.a2dp.default
   (cd "$SRC/bt" && find main hci btif stack bta btcore device osi types utils \
-       audio_a2dp_hw udrv embdrv \
+       audio_a2dp_hw udrv embdrv gki \
        \( -name '*.cc' -o -name '*.c' \) 2>/dev/null) \
     | grep -vE '(^|/)(test|tests)/|_test\.cc$|_unittest\.cc$|_test_support\.cc$|hci_layer_android\.cc$|^osi/src/metrics\.cc$' \
     | sed 's#^#bt #' >> "$LIST"
@@ -375,9 +435,11 @@ SMOKEOF
       printf '%s\n' "$files" | sed 's#^#aac #' >> "$LIST"
     fi
   done
-  # external/libldac -- Android.bp: 2-file enc source list + 1-file abr
-  (cd "$SRC/libldac" && ls src/ldaclib.c src/ldacBT.c abr/src/ldacBT_abr.c 2>/dev/null) \
-    | sed 's#^#ldac #' >> "$LIST"
+  # external/libldac -- Android.bp: 2-file enc source list + 1-file abr (8.x only)
+  if [ -d "$SRC/libldac" ]; then
+    (cd "$SRC/libldac" && ls src/ldaclib.c src/ldacBT.c abr/src/ldacBT_abr.c 2>/dev/null) \
+      | sed 's#^#ldac #' >> "$LIST"
+  fi
   sort -o "$LIST" "$LIST"
 }
 
@@ -418,11 +480,15 @@ link_artifacts() {
   echo "[link] libFraunhoferAAC.a"
   mapfile -t aac_objs < <(find "$OBJ" -name 'aac_*.o' | sort)
   "$AR" rcs "$OUTDIR/libFraunhoferAAC.a" "${aac_objs[@]}"
-  echo "[link] libldacBT_enc.so + libldacBT_abr.so"
-  "$CC" "${TARGET[@]}" "${SYSROOT[@]}" -shared -o "$OUTDIR/libldacBT_enc.so" \
-    "$OBJ/ldac_src_ldaclib.c.o" "$OBJ/ldac_src_ldacBT.c.o" -llog || return 1
-  "$CC" "${TARGET[@]}" "${SYSROOT[@]}" -shared -o "$OUTDIR/libldacBT_abr.so" \
-    "$OBJ/ldac_abr_src_ldacBT_abr.c.o" -llog || return 1
+  if [ -f "$OBJ/ldac_src_ldaclib.c.o" ]; then
+    echo "[link] libldacBT_enc.so + libldacBT_abr.so"
+    "$CC" "${TARGET[@]}" "${SYSROOT[@]}" -shared -o "$OUTDIR/libldacBT_enc.so" \
+      "$OBJ/ldac_src_ldaclib.c.o" "$OBJ/ldac_src_ldacBT.c.o" -llog || return 1
+    "$CC" "${TARGET[@]}" "${SYSROOT[@]}" -shared -o "$OUTDIR/libldacBT_abr.so" \
+      "$OBJ/ldac_abr_src_ldacBT_abr.c.o" -llog || return 1
+  else
+    echo "[link] libldacBT_*: no objects (nougat pristine tree) -- skipped"
+  fi
   echo "[link] bluetooth.default.so (all stack objects; undefined platform symbols allowed)"
   mapfile -t bt_objs < <(find "$OBJ" -name 'bt_*.o' ! -name 'bt_audio_a2dp_hw_*' | sort)
   "$CCXX" "${TARGET[@]}" "${SYSROOT[@]}" -shared -static-libstdc++ \

@@ -1,17 +1,24 @@
 # Nougat BT Swap — 在官方 7.0 固件上落地自研蓝牙栈
 
-> **状态：已搁置（2026-10-28 决策）。** 本路线是"无法编译完整 AOSP 8.1"
-> 时期的妥协方案；构建机到位、8.1 全量编译已跑通后，按原方案直接升级
-> 8.1（`build.yml` + u2 设备目标 v1），不再在 7.0 上投入。B4 彩排
-> （§4.2）已实测证明 8.1 产物无法直接换进 7.0（HIDL 依赖缺失），full
-> 换芯必须先做 B2 移植——该工作量与 v1 完整构建相比不划算。
-> 本文档与 `swapfw.yml`（bootonly/full 两模式）保留作参考与工具储备：
-> boot 重打包/重签工具链（`mtk_bootimg.py`）对 v1 路线仍然有用
-> （`firmware.yml` v1 模式用 `sign` 子命令给 mkbootimg 产物补签名尾）。
+> **状态：已重启（2026-10-30，用户指令）——现为唯一活跃路线。**
+> 8.1 全量构建路线终止（构建机始终未到位，v0–v4 实验固件与 workflows 已删除，
+> 仓库回滚至 3c8b5b2）。基线直改（debloat）路线已产出可刷固件并在真机验证：
+> `firmware-debloat-20261029` 刷入后**正常开机**——这同时证明了本路线 B4 的
+> 两大前置：verity-off boot 重打包被 lk/init 接受；system.img 手术后 e2fsck/
+> 挂载/启动全链路无损。
 >
-> 原状态：**计划已立项，实验证据充分**（见 §3）。本文档是"7.0 换芯"路线的
-> 权威计划；8.1 完整固件路线（`build.yml` + `docs/FIRMWARE_BUILD.md`）继续保留，
-> 两条路线互不冲突。
+> **重启后的功能范围（用户 2026-10-30 确认）**：A2DP **Sink** +
+> **AAC 解码** + **LDAC 660 kbps 接收**（按 DEVELOPMENT_PLAN.md §16.8：
+> `hegdi/libldacdec` MIT clean-room 解码器 + 自制 `libldacBT_bco.so` shim +
+> SINK_LDAC 挂接 + AVDTP MTU 1024）。Java 层维持不动（R3 首选路径）。
+>
+> **执行载体已就位**：`bt_standalone_build.sh` 新增 nougat 树支持
+> （`--tag android-7.0.0_r36` 自动切换；无 libldac/无 bt_av HAL 补丁；
+> pristine 哨兵集；GKI 目录纳入 TU 清单），`scripts/bt_symbol_gate.py`
+> 实现 B3 链接零缺口闸门，`.github/workflows/bt70.yml` 串起
+> 编译 → 链接 → B1 基线符号门。补丁系列规划见 `patches/nougat/README.md`
+> （0001 aac-sink → 0002 sbc-xq → 0003 avdt-mtu → 0004 ldac-sink）。
+> B4 将基于 fw-debloat 已验证的手术流水线新增 swap 步骤；B5 上机。
 
 ## 1. 为什么走这条路
 

@@ -1,0 +1,88 @@
+name: bt70-nougat-stack
+
+# B2/B3 of the RESTARTED Nougat BT swap route (docs/NOUGAT_BT_SWAP.md):
+# compile the android-7.0.0_r36 Fluoride stack (+ patches/nougat series once
+# it exists) with the standalone harness, link real ELF artifacts, then run
+# the B3 symbol gate against the baseline .so extraction (run 40630128218).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/bt_standalone_build.sh
+      - scripts/bt_symbol_gate.py
+      - patches/nougat/**
+      - device/keenplus/u2-n/**
+      - .github/workflows/bt70.yml
+
+concurrency:
+  group: bt70-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile-link-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchain + AOSP sources
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/btw
+          key: btw-nougat-r36-v1-${{ hashFiles('scripts/bt_standalone_build.sh') }}-${{ hashFiles('patches/nougat/**') }}
+
+      - name: Compile + link the Nougat BT stack (armv7a, AOSP defaults)
+        run: |
+          set -euo pipefail
+          scripts/bt_standalone_build.sh \
+            --workdir "$RUNNER_TEMP/btw" \
+            --tag android-7.0.0_r36 \
+            --jobs "$(nproc)" \
+            --link 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Download baseline BT libs (B1 extraction, run 40630128218)
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-bt-extracted
+          run-id: 40630128218
+          path: ${{ runner.temp }}/baseline-bt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: B3 symbol gate (strong UND subset of baseline U NDK sysroot)
+        run: |
+          set -euo pipefail
+          NDKROOT=$(find "$RUNNER_TEMP/btw" -maxdepth 6 -type d \
+            -path '*/toolchains/llvm/prebuilt/linux-x86_64' | head -1)
+          echo "NDKROOT=$NDKROOT"
+          echo "-- baseline extraction contents:"
+          find "$RUNNER_TEMP/baseline-bt" -type f | head -40
+          python3 scripts/bt_symbol_gate.py \
+            --ours "$RUNNER_TEMP/btw/out/bluetooth.default.so" \
+            --baseline-dir "$RUNNER_TEMP/baseline-bt" \
+            --sysroot-lib "$NDKROOT/sysroot/usr/lib/arm-linux-androideabi/26" \
+            --out "$RUNNER_TEMP/btw/out/symbol_gate.json"
+
+      - name: Artifact summary (ELF class/machine + DT_NEEDED)
+        run: |
+          set -euo pipefail
+          NDKROOT=$(find "$RUNNER_TEMP/btw" -maxdepth 6 -type d \
+            -path '*/toolchains/llvm/prebuilt/linux-x86_64' | head -1)
+          for f in "$RUNNER_TEMP"/btw/out/*.so; do
+            echo "== $(basename "$f")"
+            "$NDKROOT/bin/llvm-readelf" -h "$f" | grep -E 'Class:|Machine:|Type:'
+            "$NDKROOT/bin/llvm-readelf" -d "$f" | grep NEEDED || true
+          done | tee "$RUNNER_TEMP/btw/out/needed.txt"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bt70-build
+          path: |
+            ${{ runner.temp }}/btw/out/
+            ${{ runner.temp }}/btw/logs/results.log
+            ${{ runner.temp }}/btw/tu_list.txt
+            ${{ runner.temp }}/build.log
+          if-no-files-found: warn
