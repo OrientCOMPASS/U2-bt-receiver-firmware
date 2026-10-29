@@ -7,7 +7,10 @@
 > Android 7.0 firmware as-is, remove the preinstalled third-party apps from
 > `system.img`, pair it with a verity-off repacked `boot.img`, validate
 > everything in CI and publish the result. See [`debloat/README.md`](debloat/README.md)
-> and the dispatch-only workflows `fw-probe.yml` / `fw-debloat.yml`. The text
+> and the dispatch-only workflows `fw-probe.yml` / `fw-debloat.yml`.
+> **Delivered:** release
+> [`firmware-debloat-20261029`](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/tag/firmware-debloat-20261029)
+> (851 MiB flash zip, CI-green, on-device boot test pending). The text
 > below is kept as history; its `ci.yml` badge and `build.yml` links are dead.
 
 Self-developed **Android 8.1 (Oreo)** firmware for the **KeenPlus U2_6735_1.5+8G**

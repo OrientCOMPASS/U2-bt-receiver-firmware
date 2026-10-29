@@ -120,7 +120,40 @@ for THIS boot experiment -- one variable class at a time.
 
 ## Results
 
-* phase 1 probe: run 40922183963 SUCCESS, artifact `fw-probe-report`
-  (REPORT.md also lands in the run summary).
-* phase 2 build: see release `firmware-debloat-*` (zip + VERIFICATION.md)
-  and the `fw-debloat-report` artifact of the fw-debloat run.
+* **Phase 1 probe** -- run 40922183963 SUCCESS, artifact `fw-probe-report`
+  (REPORT.md also lands in the run summary).  Two earlier probe runs
+  (40919564612, 40921164435) failed only at artifact upload: the extracted
+  ramdisk trees keep the stock symlinks (`d -> /sys/kernel/debug` etc.) and
+  the upload scanner followed them into root-only paths (EACCES); both
+  workflows now stub extracted symlinks into text files.
+* **Phase 2 build** -- release
+  [`firmware-debloat-20261029`](https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/tag/firmware-debloat-20261029):
+  `U2_7.0_debloat_v0.zip` **892,402,824 B (851 MiB)** + `VERIFICATION.md`.
+  Final green run: **40924546095** (all 21 steps; artifact
+  `fw-debloat-report`).  Key numbers from that run:
+  * removals: 4 dirs / 18 APKs, **1009.8 MiB freed**
+    (`preload/hotapps` 993.0, `app/BsHotApps` 13.0,
+    `vendor/priv-app/Baidu_Location` 2.4, `priv-app/ValidationTools` 1.4);
+    zero dangling refs in etc/permissions|preferred-apps|sysconfig
+  * app inventory algebra: before 81 dirs (95 APK records) - 4 == after 77
+    dirs (77 records) == final in-package image; boot-critical packages +
+    `framework/framework-res.apk` asserted present
+  * boot.img: ramdisk diff vs stock = **only fstab.mt6735**
+    (`ro wait,verify` -> `ro wait`); kernel md5 identical
+    (`4128dc54373f68008afd1eb6ed25c105`); testkey CMS tail regenerated
+  * recovery.img md5 identical to stock; scatter validation OK
+    (10 files, complete + within partition sizes)
+  * e2fsck -fn clean; stale verity tail (46 MiB, footer was at offset
+    3071078400) zeroed; free space zero-filled; re-sparsified system.img
+    = 1,495,048,060 B (cap 3,095,396,352)
+* First publish (run 40923082802) was structurally green but shipped a
+  1.87 GB zip: the zero-fill `dd` ran unprivileged against the root-owned
+  /system root and silently failed.  Fixed with `sudo` + hard assertions
+  (avail < 64 MiB after fill; sparse < 2 GB) and re-published under the
+  same tag (asset replaced in place).
+
+**On-device boot test: pending (user side).**  CI proved structural
+bootability only; flash via SP Flash Tool ("Download Only"), rescue =
+reflash the official baseline zip.  If it hangs at the boot logo, the
+prime suspect is lk rejecting the regenerated CMS signature tail --
+`mtk_bootimg.py disable-verity --no-sign` is the prepared fallback.
