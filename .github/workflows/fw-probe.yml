@@ -264,6 +264,72 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Deep dropper sweep (vdex dex strings, FwkPlugin, permissions, payloads)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== FwkPlugin dissection:"
+          sudo ls -laR /mnt/sys/vendor/plugin | tee "$P/fwkplugin_ls.txt" || true
+          mkdir -p "$P/fwk"
+          sudo cp /mnt/sys/vendor/plugin/FwkPlugin/FwkPlugin.apk "$P/fwk/" || true
+          sudo chown -R "$(id -u):$(id -g)" "$P/fwk"
+          if [ -f "$P/fwk/FwkPlugin.apk" ]; then
+            unzip -l "$P/fwk/FwkPlugin.apk" | tee "$P/fwkplugin_entries.txt" | head -40
+            python3 scripts/fw_inventory.py manifest "$P/fwk/FwkPlugin.apk" \
+              | tee "$P/fwkplugin_manifest.json" || true
+            unzip -p "$P/fwk/FwkPlugin.apk" classes.dex > "$P/fwk/fwk_classes.dex" 2>/dev/null || true
+            strings -a "$P/fwk/fwk_classes.dex" 2>/dev/null \
+              | grep -aiE 'http|\.apk|install|download|quark|wandoujia|hiby|lianbo|mengxin|pwd|bs\.' \
+              | sort -u | head -120 | tee "$P/fwkplugin_strings.txt" || true
+          fi
+          echo "== vdex list:"
+          sudo find /mnt/sys/framework /mnt/sys/app /mnt/sys/priv-app /mnt/sys/vendor \
+            -name '*.vdex' 2>/dev/null | sed 's|/mnt/sys/||' | tee "$P/vdex_list.txt" | head -60
+          echo "== single strings pass per vdex -> domains + keywords:"
+          : > "$P/vdex_domains.txt"; : > "$P/vdex_keywords.txt"
+          while read -r rel; do
+            f="/mnt/sys/$rel"
+            tmp="$RUNNER_TEMP/cur.strings"
+            sudo strings -a "$f" > "$tmp" 2>/dev/null || true
+            grep -aoE 'https?://[A-Za-z0-9._-]+[^"'"'"' <>]*' "$tmp" | sort -u \
+              | sed "s|^|$rel: |" >> "$P/vdex_domains.txt" || true
+            grep -aiE 'install[._-]?by[._-]?pwd|bs\.fake|silent|hotapps|quark|wandoujia|hiby|lianbo|mengxin|uninstall|DELETE_PACKAGES|INSTALL_PACKAGES' "$tmp" \
+              | sort -u | head -25 | sed "s|^|$rel: |" >> "$P/vdex_keywords.txt" || true
+            rm -f "$tmp"
+          done < "$P/vdex_list.txt"
+          wc -l "$P/vdex_domains.txt" "$P/vdex_keywords.txt"
+          echo "-- non-AOSP-looking domains:"
+          cut -d: -f2- "$P/vdex_domains.txt" | sort -u | grep -viE 'android\.com|google|apache\.org|w3\.org|xml|schema|oracle|java|sun\.com|openssl|kernel\.org|gnu\.org|ietf|rfc-|unicode|json|sqlite|chromium|webkit|mozilla|sourceforge|python|xmlpull|xml\.org|samsung|nvidia|imgtec|khronos|openmobile|gsma|omtp|example\.' | head -80
+          echo "-- keyword hits:"
+          sort -u "$P/vdex_keywords.txt" | head -100
+          echo "== etc/permissions + sysconfig + vendor permissions (full dump):"
+          for x in /mnt/sys/etc/permissions/*.xml /mnt/sys/etc/sysconfig/*.xml \
+                   /mnt/sys/vendor/etc/permissions/*.xml /mnt/sys/vendor/etc/sysconfig/*.xml; do
+            [ -f "$x" ] || continue
+            echo "### ${x#/mnt/sys/}"; sudo cat "$x"
+          done > "$P/etc_permissions.txt" 2>/dev/null || true
+          grep -B2 -A2 -iE 'INSTALL_PACKAGES|DELETE_PACKAGES' "$P/etc_permissions.txt" | head -40 || true
+          wc -l "$P/etc_permissions.txt"
+          echo "== big-file payload hunt (>2M outside lib/oat/fonts/media/tts/usr):"
+          sudo find /mnt/sys -type f -size +2M \
+            -not -path '*/lib/*' -not -path '*/lib64/*' -not -path '*/oat/*' \
+            -not -path '*/fonts/*' -not -path '*/media/*' -not -path '*/tts/*' \
+            -not -path '*/usr/*' -not -path '*/fake-libs*' 2>/dev/null \
+            | while read -r f; do sudo file "$f"; done | tee "$P/bigfiles.txt" | head -60
+          echo "== vendor rc files (full):"
+          cat "$P/boot_rd/init.project.rc" "$P/boot_rd/init.common_svc.rc" \
+            > "$P/vendor_rc_full.txt" 2>/dev/null || true
+          wc -l "$P/vendor_rc_full.txt"
+          echo "== current /system/etc/hosts:"
+          sudo cat /mnt/sys/etc/hosts | tee "$P/etc_hosts.txt" || true
+          echo "== vendor tree (depth 2):"
+          sudo find /mnt/sys/vendor -maxdepth 2 | sed 's|/mnt/sys/||' | tee "$P/vendor_tree.txt" | head -120
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail
