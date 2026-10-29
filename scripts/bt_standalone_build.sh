@@ -246,12 +246,17 @@ apply_patches() {
 # differences (a top-level "include" cone once failed to materialize on the
 # CI runners), so verify and self-heal instead of failing deep inside clang
 # with a confusing "file not found".
+# Nougat (r36) real layout, verified against gitiles:
+#   stack/a2dp is still a2d_api.c/a2d_sbc.c (old naming); there is NO
+#   btif_a2dp_sink.cc (sink decode lives in btif_media_task.c), NO gki/,
+#   NO types/; main/ is C (bte_main.c); AudioTrack.h lives in
+#   frameworks/av/media/libmedia/include (libaudioclient split came in O).
 SENTINELS_NOUGAT=(
-  "bt/stack/a2dp/a2dp_api.c"
+  "bt/stack/a2dp/a2d_api.c"
   "bt/stack/avdt/avdt_defs.h"
   "bt/btif/co/bta_av_co.c"
-  "bt/main/bte_main.cc"
-  "bt/gki/ulinux/gki_ulinux.c"
+  "bt/btif/src/btif_media_task.c"
+  "bt/main/bte_main.c"
   "bt/embdrv/sbc/decoder/include/oi_codec_sbc.h"
   "libhardware/include/hardware/bluetooth.h"
   "libchrome/base/logging.h"
@@ -260,7 +265,7 @@ SENTINELS_NOUGAT=(
   "core/libutils/include/utils/RefBase.h"
   "core/liblog/include/log/log.h"
   "native/libs/binder/include/binder/Parcel.h"
-  "av/media/libaudioclient/include/media/AudioTrack.h"
+  "av/media/libmedia/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
   "tinyxml2/tinyxml2.h"
   "aac/libAACdec/include/aacdecoder_lib.h"
@@ -434,9 +439,18 @@ SMOKEOF
     return 0
   fi
   # system/bt -- everything that lands in bluetooth.default / audio.a2dp.default
-  (cd "$SRC/bt" && find main hci btif stack bta btcore device osi types utils \
-       audio_a2dp_hw udrv embdrv gki \
-       \( -name '*.cc' -o -name '*.c' \) 2>/dev/null) \
+  # (main/Android.mk WHOLE_STATIC set: bta device btif hci protos(stack) stack
+  #  utils btcore osi + main + sbc enc/dec + uipc; profile/=libbtprofile and
+  #  service/ are NOT part of the module).  Dirs are existence-filtered:
+  #  Nougat has no types/ or gki/, and `find missing_dir` would trip pipefail.
+  local bt_dirs=""
+  for d in main hci btif stack bta btcore device osi types utils \
+           audio_a2dp_hw udrv embdrv gki; do
+    [ -d "$SRC/bt/$d" ] && bt_dirs="$bt_dirs $d"
+  done
+  echo "[build] system/bt module dirs present:$bt_dirs"
+  (cd "$SRC/bt" && find $bt_dirs \
+       \( -name '*.cc' -o -name '*.cpp' -o -name '*.c' \) 2>/dev/null) \
     | grep -vE '(^|/)(test|tests)/|_test\.cc$|_unittest\.cc$|_test_support\.cc$|hci_layer_android\.cc$|^osi/src/metrics\.cc$' \
     | sed 's#^#bt #' >> "$LIST"
   # external/aac -- Android.bp globs top-level "lib*/src/*.cpp" only
