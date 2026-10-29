@@ -222,10 +222,19 @@ jobs:
       - name: Zero-fill free space (keeps the re-sparsified image small)
         run: |
           set -uo pipefail
+          # NOTE: needs sudo -- /system root is 0755 root:root; a plain dd
+          # dies with EACCES and `|| true` would silently skip the fill
+          # (run 40923082802 shipped a 1.87 GB zip with stale deleted-app
+          # bytes in free space because of exactly that).
           df -h /mnt/sys
-          dd if=/dev/zero of=/mnt/sys/.zerofill bs=1M status=progress || true
+          sudo dd if=/dev/zero of=/mnt/sys/.zerofill bs=1M status=none || true
           sync
-          rm -f /mnt/sys/.zerofill
+          AVAIL_KB=$(df --output=avail -k /mnt/sys | tail -1 | tr -d ' ')
+          echo "avail after fill: ${AVAIL_KB} KiB (must be < 65536)"
+          if [ "$AVAIL_KB" -gt 65536 ]; then
+            echo "FATAL: zero-fill did not consume the free space"; exit 1
+          fi
+          sudo rm -f /mnt/sys/.zerofill
           sync
           df -h /mnt/sys
 
@@ -297,6 +306,12 @@ jobs:
           SZ=$(stat -c %s "$OUT/system.img")
           echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
           test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
+          # with free space truly zeroed, the sparse image must collapse to
+          # roughly the used data (~1.4 GiB); a >2 GB sparse means the
+          # zero-fill silently failed again
+          if [ "$SZ" -gt 2000000000 ]; then
+            echo "FATAL: sparse system.img is $SZ bytes -- free space not zeroed?"; exit 1
+          fi
           df -h "$RUNNER_TEMP"
 
       - name: Assemble the flash package (official scatter + private parts)
