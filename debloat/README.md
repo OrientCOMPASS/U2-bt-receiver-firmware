@@ -70,8 +70,57 @@ CI **cannot** flash hardware — the definitive boot test is on-device
   before deleting anything, and reports dangling `etc/permissions`
   references (left in place; PMS ignores unknown packages).
 
+## Phase 1 probe results (run 40922183963, artifact `fw-probe-report`)
+
+* **95 APK records** in app/, priv-app/, vendor/app/, vendor/priv-app/,
+  preload/.  Baseline has NO telephony UI apps (no TeleService/Dialer/
+  Contacts/Mms) -- the vendor already stripped them; `com.android.phone`
+  is not in the REQUIRED boot-critical assertion for this reason.
+* **`/system/preload/hotapps/` = 993.0 MiB of 15 third-party APKs**
+  (Bilibili, iQIYI lite, QQ Music, NetEase Cloud Music, Xigua Video,
+  Ximalaya, Tomato/Qimao novels, Kuaikan comics, Moon+ Reader Pro, Kugou
+  lite, Zapya, Eudic, ...).  `/system/preinstall/` is empty.  The MTK
+  preload service copies `preload/` APKs into /data/app on first boot --
+  this is where the device's bloat actually lands.
+* **userdata.img and cache.img ship empty** (lost+found only) -- nothing
+  to debloat there; they pass through untouched.
+* **dm-verity metadata EXISTS**: 46 MiB trailing area beyond the ext4 fs
+  (3,095,396,352 - 3,047,079,936 B); full-area scan found the footer magic
+  `0xb001b001` at offset 3,071,078,400 (right after the ~24 MiB hashtree).
+  With the stock fstab `ro wait,verify` an edited system.img could never
+  mount => the verity-off boot repack is MANDATORY, and the stale
+  hashtree/footer tail is zeroed after the edit (nothing reads it once the
+  verify flag is gone).
+* Stock boot ramdisk (64 entries): `fstab.mt6735` 0640, `verity_key`
+  present, `init.mt6735.rc`, `enableswap.sh`, zygote64_32, default.prop
+  `ro.secure=1 ro.debuggable=0` (user build), `bs.fake.ram=1.5
+  bs.fake.rom=8`.  Kernel md5 `4128dc54373f68008afd1eb6ed25c105` matches
+  the reference.  Boot carries a 1320 B MTK signature tail.
+* No `/system/etc/install-recovery.sh` => the `recovery-from-boot.p`
+  leftover cannot rewrite our repacked boot on first start.
+* `/system/data/` holds a single `recovery_rootcheck` blob (110 KiB) --
+  left untouched (not an app).
+
+## Curation decision (remove-list v0)
+
+**Removed (4 entries, ~1.01 GiB):** `preload/hotapps` (15 APKs, 993 MiB),
+`app/BsHotApps` (com.android.hotapps promo store, 13 MiB -- not an AOSP
+package despite the name), `vendor/priv-app/Baidu_Location`
+(com.baidu.map.location, 2.4 MiB -- no references in etc/permissions or
+preferred-apps; GPS/AGPS unaffected), `priv-app/ValidationTools`
+(com.teksun.factorytest ODM factory tool, 1.4 MiB).
+
+**Kept:** every AOSP platform app (incl. WebView, LatinIME, Gallery2,
+DeskClock, Exchange2, PicoTts), every MediaTek BSP app (incl. MiraVision
+60 MiB, EngineerMode, Camera, MTKLogger, BtTool, YGPS...), FMRadio,
+WfoService.  Rationale: first-party platform/BSP components are not
+"third-party preloads"; MiraVision/EngineerMode/Camera are attractive
+future-debloat candidates for the BT-receiver product but out of scope
+for THIS boot experiment -- one variable class at a time.
+
 ## Results
 
-* phase 1 probe: see the `fw-probe-report` artifact of the latest fw-probe
-  run (REPORT.md appends to the run summary).
-* phase 2 build: release `firmware-debloat-*` (zip + VERIFICATION.md).
+* phase 1 probe: run 40922183963 SUCCESS, artifact `fw-probe-report`
+  (REPORT.md also lands in the run summary).
+* phase 2 build: see release `firmware-debloat-*` (zip + VERIFICATION.md)
+  and the `fw-debloat-report` artifact of the fw-debloat run.

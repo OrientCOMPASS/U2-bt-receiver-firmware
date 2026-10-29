@@ -1,11 +1,34 @@
-# debloat/remove-list.txt -- curated third-party preload removal list.
+# debloat/remove-list.txt -- curated third-party preload removal list for the
+# official KeenPlus U2 7.0 baseline (B04_35_1.5_8_3inch_M304_ST7701SN_20251016).
 #
-# One system-relative path per line; ONLY top-level app directories under
-#   app/  priv-app/  vendor/app/  vendor/priv-app/
-# are accepted (scripts/debloat_system.py enforces this; '#' comments and
-# blank lines are ignored).  fw-debloat refuses to run while this file has
-# no entries.
+# Curated from the fw-probe run 40922183963 inventory (artifact
+# fw-probe-report/apps_system.json, 95 APK records).  Policy: remove apps
+# that are NEITHER AOSP platform NOR MediaTek BSP; keep everything else
+# (see debloat/README.md for the full rationale and the keep-list).
 #
-# CURATE from the fw-probe run's apps_system.json inventory: keep AOSP
-# platform packages, MTK packages and anything boot-critical; remove
-# third-party preloads.
+# Paths are system-relative, top-level app dirs only
+# (scripts/debloat_system.py enforces the shape).
+
+# --- MTK first-boot preload drop: 15 third-party APKs, 993.0 MiB total ---
+# com.qiyi.video.lite (iQIYI lite), com.jiongji.andriod.card, tv.danmaku.bili
+# (Bilibili), com.diandienglish.ddrepeator, com.dragon.read (Tomato novels),
+# com.flyersoft.moonreaderp (Moon+ Reader Pro), com.kuaikan.comic,
+# com.dewmobile.kuaiya (Zapya), com.kugou.android.lite, com.eusoft.eudic,
+# com.kmxs.reader, com.tencent.qqmusic, com.netease.cloudmusic,
+# com.ss.android.article.video (Xigua Video), com.ximalaya.ting.android
+preload/hotapps
+
+# --- "Hot Apps" promotion store front for the drop above, 13.0 MiB ---
+# com.android.hotapps (vendor "BsHotApps"; not an AOSP package despite the
+# com.android.* name -- no such package exists in AOSP 7.0)
+app/BsHotApps
+
+# --- Baidu network-location provider, 2.4 MiB ---
+# com.baidu.map.location (third-party NLP backend; GPS/AGPS unaffected;
+# no references in /system/etc/permissions or preferred-apps -- probed)
+vendor/priv-app/Baidu_Location
+
+# --- ODM factory test tool, 1.4 MiB ---
+# com.teksun.factorytest (priv-app/ValidationTools; factory-line only,
+# no runtime function on a shipped device)
+priv-app/ValidationTools
