@@ -90,12 +90,27 @@ class TestDebloat(unittest.TestCase):
             build_fake_system(mnt)
             for bad in ("../etc", "etc/permissions", "app/Junk/oat",
                         "/app/Junk", "app/", "framework", "preload",
-                        "preinstall/x/y"):
+                        "preinstall/x/y", "vendor/operator/app/../../etc",
+                        "vendor/operator/.."):
                 lst = os.path.join(td, "list.txt")
                 write_list(lst, [bad])
                 rc, _ = run_main(["--mount", mnt, "--list", lst])
                 self.assertEqual(rc, 2, f"path {bad!r} must be rejected")
             self.assertTrue(os.path.isdir(os.path.join(mnt, "app/Junk")))
+
+    def test_allows_vendor_operator_subtree(self):
+        with tempfile.TemporaryDirectory() as td:
+            mnt = os.path.join(td, "sys")
+            build_fake_system(mnt)
+            payload = os.path.join(mnt, "vendor", "operator", "app", "HiBy")
+            os.makedirs(payload)
+            with open(os.path.join(payload, "HiBy.apk"), "wb") as f:
+                f.write(b"PK\x03\x04" + b"\x00" * 60)
+            lst = os.path.join(td, "list.txt")
+            write_list(lst, ["vendor/operator/app/HiBy", "vendor/operator"])
+            rc, _ = run_main(["--mount", mnt, "--list", lst])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(payload))
 
     def test_rejects_missing_target(self):
         with tempfile.TemporaryDirectory() as td:

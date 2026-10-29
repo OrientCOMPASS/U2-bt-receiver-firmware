@@ -8,8 +8,10 @@ ignored.  Safety rails (all enforced, any violation aborts before deleting
 anything):
 
   * every path must match ^(app|priv-app|vendor/app|vendor/priv-app|preload|
-    preinstall)/[^/]+$ -- top-level app directories only (preload/preinstall
-    are the MTK first-boot copy-to-/data sources), no nesting, no '..', no
+    preinstall)/[^/]+$  or  ^vendor/operator(/[^/]+)*$ -- top-level app
+    directories (preload/preinstall are the MTK first-boot copy-to-/data
+    sources) plus the vendor/operator payload subtree (probe v7: the ODM
+    installer payload lives in vendor/operator/app/*), no '.', no '..', no
     absolute paths
   * every path must exist as a directory on the mount
   * nothing outside the listed directories is ever touched
@@ -36,7 +38,8 @@ import sys
 from typing import Any, Dict, List, Optional, Set
 
 SAFE_PATH = re.compile(
-    r"^(app|priv-app|vendor/app|vendor/priv-app|preload|preinstall)/[^/]+$")
+    r"^(app|priv-app|vendor/app|vendor/priv-app|preload|preinstall)/[^/]+$"
+    r"|^vendor/operator(/[^/]+)*$")   # operator pack payload subtree
 
 
 def load_list(path: str) -> List[str]:
@@ -48,6 +51,8 @@ def load_list(path: str) -> List[str]:
                 continue
             if s.startswith("/") or "\\" in s:
                 raise ValueError(f"{path}:{ln}: path must be system-relative: {s!r}")
+            if any(seg in (".", "..") for seg in s.split("/")):
+                raise ValueError(f"{path}:{ln}: '.'/'..' segments refused: {s!r}")
             out.append(s)
     return out
 

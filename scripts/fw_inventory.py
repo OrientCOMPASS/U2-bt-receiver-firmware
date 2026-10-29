@@ -255,7 +255,15 @@ def components_apk(apk_path: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 APP_ROOTS = ["app", "priv-app", "vendor/app", "vendor/priv-app",
-             "overlay", "vendor/overlay", "preload", "preinstall"]
+             "overlay", "vendor/overlay", "preload", "preinstall",
+             # vendor/operator/app: the ODM "operator pack" payload dir --
+             # NOT scanned by PackageManagerService; a modified
+             # PackageInstaller (odex references persist.sys.install.by.pwd)
+             # plus ValidationTools' AutoInstallService copied/installed
+             # these to /data on first boot (probe v7, run 40940965846:
+             # HiBy/WDJ/kuake/mxsq/wanneglianbo = the five apps the user
+             # saw appear after flashing debloat v0).
+             "vendor/operator/app"]
 
 
 def _dir_size(path: str) -> int:

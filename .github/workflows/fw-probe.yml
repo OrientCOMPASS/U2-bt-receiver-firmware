@@ -534,6 +534,50 @@ jobs:
           sudo umount /mnt/sys
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: vendor-operator dissection + unrestricted APK sweep (probe v8)
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== vendor/operator full tree:"
+          { sudo find /mnt/sys/vendor/operator -exec ls -ld {} \; 2>/dev/null \
+              | sed 's|/mnt/sys/||' ; } | tee "$P/vendor_operator_tree.txt" || true
+          echo "== vendor/operator sizes:"
+          { sudo du -sh /mnt/sys/vendor/operator 2>/dev/null \
+              | sed 's|/mnt/sys/||' ; } | tee "$P/vendor_operator_du.txt" || true
+          { sudo du -sh /mnt/sys/vendor/operator/app/* 2>/dev/null \
+              | sed 's|/mnt/sys/||' ; } | tee -a "$P/vendor_operator_du.txt" || true
+          echo "== non-APK files under vendor/operator (configs?):"
+          { sudo find /mnt/sys/vendor/operator -type f ! -name '*.apk' 2>/dev/null \
+              | while read -r f; do
+                  echo "### ${f#/mnt/sys/}"; sudo file "$f"
+                  sudo head -c 2500 "$f" | strings | head -50
+                done ; } | tee "$P/vendor_operator_configs.txt" || true
+          echo "== vendor tree depth 4 (any other hidden dirs?):"
+          { sudo find /mnt/sys/vendor -maxdepth 4 -type d 2>/dev/null \
+              | sed 's|/mnt/sys/||' ; } | tee "$P/vendor_tree4.txt" | tail -80
+          echo "== ALL *.apk in image, minus known app roots:"
+          { sudo find /mnt/sys -name '*.apk' 2>/dev/null | sed 's|/mnt/sys/||' \
+              | grep -vE '^(app|priv-app|vendor/app|vendor/priv-app|preload|preinstall|overlay|vendor/overlay|framework|vendor/framework|vendor/plugin)/' ; } \
+            | tee "$P/apks_outside_roots.txt" || true
+          echo "== manifests of outside-root APKs:"
+          { while read -r rel; do
+              m=$(python3 scripts/fw_inventory.py manifest "/mnt/sys/$rel" 2>/dev/null | tr -d '\n' || echo '{}')
+              echo "$rel <- $m"
+            done < "$P/apks_outside_roots.txt" ; } | tee "$P/apks_outside_manifests.txt" || true
+          echo "== PackageInstaller.odex vendor-hook strings:"
+          { sudo strings -a /mnt/sys/priv-app/PackageInstaller/oat/arm64/PackageInstaller.odex 2>/dev/null \
+              | grep -aiE 'vendor/operator|operator|install\.by|autoinstall|uninstall|camera|persist\.sys|/sdcard|\.apk|InstallPwd' \
+              | sort -u | head -80 ; } | tee "$P/pkginstaller_hook_strings.txt" || true
+          echo "== services.odex install-context strings:"
+          { sudo strings -a /mnt/sys/framework/oat/arm64/services.odex 2>/dev/null \
+              | grep -aiE 'installApk|enabledDisableApps|disableapplist|operator|autoInstall|uninstallApk|by\.pwd|by\.wifi' \
+              | sort -u | head -50 ; } | tee "$P/services_install_strings.txt" || true
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail

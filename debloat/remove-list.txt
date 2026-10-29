@@ -53,3 +53,26 @@ vendor/app/Camera
 # -- largest remaining single reducible item; PQ service itself lives in
 # the HWC/SurfaceFlinger vendor stack and is untouched by removing the UI.
 vendor/app/MiraVision
+
+# --- v2 (2026-10-30): the OPERATOR PACK payload (the real dropper source) ---
+# Probe v7 (run 40940965846) whole-image grep found the five apps the user
+# saw installed on first boot hiding in /system/vendor/operator/app/ --
+# a payload dir NO previous inventory covered (PackageManager never scans
+# it; the v2 hidden-APK find excluded it via the */app/* filter).  The
+# executor is the VENDOR-MODIFIED PackageInstaller (its odex references
+# persist.sys.install.by.pwd -- the gate prop that boot default.prop ships
+# as =1) with a services.odex 'installApk' hook; ValidationTools'
+# autoInstallapk/AutoUninstallApkService classes (removed in v0) were the
+# factory-line variant.  Nothing is downloaded: the APKs ship in the
+# image and are installed locally on first boot.  Removing the payload
+# kills the mechanism regardless of gate state.
+# 夸克 Quark:
+vendor/operator/app/kuake
+# 豌豆荚 Wandoujia:
+vendor/operator/app/WDJ
+# 海贝音乐 HiBy Music:
+vendor/operator/app/HiBy
+# 萌新社区:
+vendor/operator/app/mxsq
+# 万能联播:
+vendor/operator/app/wanneglianbo
