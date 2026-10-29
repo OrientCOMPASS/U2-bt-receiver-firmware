@@ -286,9 +286,10 @@ SENTINELS=(
 )
 
 verify_headers() {
-  local s repo missing=0 arr=SENTINELS
-  [ "$TREE" = nougat ] && arr=SENTINELS_NOUGAT
-  for s in "${!arr[@]}"; do
+  local s repo missing=0 arrname=SENTINELS
+  [ "$TREE" = nougat ] && arrname=SENTINELS_NOUGAT
+  local -n sentinels="$arrname"
+  for s in "${sentinels[@]}"; do
     if [ ! -f "$SRC/$s" ]; then
       repo="${s%%/*}"
       echo "[verify] MISSING $s -- healing $repo with a full checkout"
