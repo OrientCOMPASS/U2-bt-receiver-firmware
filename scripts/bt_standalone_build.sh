@@ -181,8 +181,14 @@ setup_sources() {
     clone_sparse  native  "$AOSP/frameworks/native" \
         include libs/binder/include libs/ui/include libs/gui/include libs/nativewindow/include
   fi
-  clone_sparse  av        "$AOSP/frameworks/av" \
-      media/libaudioclient/include media/libmedia/include media/libaudiohal/include include
+  if [ "$TREE" = nougat ]; then
+    # N: frameworks/av keeps the legacy top-level include/ tree
+    # (include/media/AudioTrack.h etc.); per-lib include dirs came in O.
+    clone_sparse  av      "$AOSP/frameworks/av" include
+  else
+    clone_sparse  av      "$AOSP/frameworks/av" \
+        media/libaudioclient/include media/libmedia/include media/libaudiohal/include include
+  fi
   clone_sparse  sysmedia  "$AOSP/system/media" audio/include audio_utils/include
   if [ ! -d "$SRC/gtest" ]; then
     # external/googletest carries NO android-7.* tags at all; we only need
@@ -278,7 +284,7 @@ SENTINELS_NOUGAT=(
   "core/include/utils/RefBase.h"
   "core/include/log/log.h"
   "native/include/binder/Parcel.h"
-  "av/media/libmedia/include/media/AudioTrack.h"
+  "av/include/media/AudioTrack.h"
   "sysmedia/audio/include/system/audio.h"
   "tinyxml2/tinyxml2.h"
   "aac/libAACdec/include/aacdecoder_lib.h"
