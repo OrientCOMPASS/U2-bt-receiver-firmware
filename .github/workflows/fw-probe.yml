@@ -384,6 +384,65 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           sudo umount /mnt/sys
 
+      - name: Component/permission sweep + injected-package scan (probe v5)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/baseline"; P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$B/system.raw.img" /mnt/sys
+          echo "== manifest components+permissions of EVERY system APK:"
+          : > "$P/all_components.json"
+          echo "[" > "$P/all_components.json"
+          first=1
+          while read -r apk; do
+            rel="${apk#/mnt/sys/}"
+            j=$(python3 scripts/fw_inventory.py components "$apk" 2>/dev/null || echo '{}')
+            [ "$first" = 1 ] || echo "," >> "$P/all_components.json"
+            first=0
+            printf '{"apk":"%s","manifest":%s}\n' "$rel" "$j" >> "$P/all_components.json"
+          done < <(sudo find /mnt/sys/app /mnt/sys/priv-app /mnt/sys/vendor/app \
+                     /mnt/sys/vendor/priv-app /mnt/sys/preload /mnt/sys/preinstall \
+                     -name '*.apk' 2>/dev/null | sort)
+          echo "]" >> "$P/all_components.json"
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          data = json.load(open(os.path.join(P, "all_components.json")))
+          dangerous = []
+          for rec in data:
+              m = rec.get("manifest") or {}
+              perms = [c.get("name", "") for c in m.get("components", [])
+                       if c.get("el", "").startswith("uses-permission")]
+              hits = [p for p in perms if any(k in p.upper() for k in
+                      ("INSTALL_PACKAGES", "DELETE_PACKAGES", "INTERNET"))]
+              comps = [c for c in m.get("components", [])
+                       if c.get("el") in ("service", "receiver", "provider")]
+              if hits or comps:
+                  dangerous.append({"apk": rec["apk"], "package": m.get("package"),
+                                    "perms_interesting": hits,
+                                    "services_receivers_providers": [
+                                        {k: v for k, v in c.items()} for c in comps]})
+          with open(os.path.join(P, "components_dangerous.json"), "w") as f:
+              json.dump(dangerous, f, indent=1)
+          print(f"{len(data)} APKs scanned; {len(dangerous)} with interesting "
+                f"perms or non-activity components")
+          for d in dangerous:
+              print(json.dumps(d, ensure_ascii=False)[:400])
+          PY
+          echo "== injected-package scan: class descriptors in every odex/oat:"
+          : > "$P/odex_packages.txt"
+          while read -r rel; do
+            f="/mnt/sys/$rel"
+            { sudo strings -a "$f" 2>/dev/null || true; } \
+              | grep -aoE 'L[a-z][a-z0-9_]+/[a-z0-9_]+/' | sort -u \
+              | grep -vE '^L(android|androidx|java|javax|dalvik|libcore|sun|org|com/android|com/google|com/mediatek|com/hp|com/ibm|com/sun|com/hi|net|kotlin|okhttp3|okio|junit)/' \
+              | sed "s|^|$rel: |" >> "$P/odex_packages.txt" || true
+          done < "$P/vdex_list.txt"
+          sort -u "$P/odex_packages.txt" | tee "$P/odex_packages_sorted.txt" | head -120
+          sudo umount /mnt/sys
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+
       - name: userdata/cache inventory (preload apps?)
         run: |
           set -euo pipefail
