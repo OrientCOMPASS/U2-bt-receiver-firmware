@@ -1,0 +1,327 @@
+# --------------------------------------------------------------------------- #
+# fw-rawpack.yml -- re-encode an existing flash package's system.img from
+# sparse to RAW (non-sparse) WITHOUT touching any content, and publish it.
+#
+# Why: the user's SP Flash Tool/DA deterministically dies at 92% on our sparse
+# system images (FILL-write path over the late-image zero region -- see
+# docs/NOUGAT_BT_SWAP.md §4.4).  RAW images only use the plain write path that
+# v0/v1 proved works on that host.
+#
+# Use cases:
+#   * bisect: flash debloat-v2-raw to separate "v2 base" from "BT swap" as the
+#     cause of a boot problem (default inputs do exactly this);
+#   * rescue: v2-raw is flashable on the affected host while sparse v2 is not.
+#
+# Guarantees asserted here (content is NEVER modified):
+#   * raw size == partition size; e2fsck -fn clean; NOT sparse-encoded
+#   * stock bluetooth.default.so md5 == STOCK_BT_MD5 (proves no BT swap)
+#   * every non-system package entry md5-identical to the base package
+#   * boot.img kernel md5 == stock; fstab verity-off
+#   * APK inventory: 74 records; boot-critical packages present
+# --------------------------------------------------------------------------- #
+name: fw-rawpack
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'Source release tag'
+        default: 'firmware-debloat-v2-20261030'
+        required: true
+      base_asset:
+        description: 'Source zip asset name in that release'
+        default: 'U2_7.0_debloat_v2.zip'
+        required: true
+      pkg_name:
+        description: 'Output package (folder/zip base) name'
+        default: 'U2_7.0_debloat_v2_raw'
+        required: true
+      fw_tag:
+        description: 'Output release tag'
+        default: 'firmware-debloat-v2-raw-20261030'
+        required: true
+      publish:
+        description: 'Publish the GitHub release when every check passes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
+  SYSTEM_PARTITION_BYTES: '3095396352'
+  STOCK_BT_MD5: e0dd373e4632316a0348e6ec0a288347
+  PKG: ${{ inputs.pkg_name }}
+  FW_TAG: ${{ inputs.fw_tag }}
+  BASE_TAG: ${{ inputs.base_tag }}
+  BASE_ASSET: ${{ inputs.base_asset }}
+
+jobs:
+  rawpack:
+    name: re-encode system.img to raw + validate + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils attr e2fsprogs binutils jq
+          df -h "$RUNNER_TEMP" /
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Download base package (release asset)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          tag = os.environ["BASE_TAG"]; asset = os.environ["BASE_ASSET"]
+          r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+              headers={"Accept":"application/vnd.github+json","User-Agent":"fw-rawpack",
+                       "Authorization":f"Bearer {tok}"})
+          rel = json.loads(urllib.request.urlopen(r).read())
+          url = None
+          for a in rel["assets"]:
+              if a["name"] == asset:
+                  url = a["browser_download_url"]
+          assert url, f"asset {asset} not found in release {tag}"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "base.zip")
+          rq = urllib.request.Request(url, headers={"User-Agent":"fw-rawpack"})
+          with urllib.request.urlopen(rq) as src, open(dest, "wb") as out:
+              while True:
+                  b = src.read(1 << 22)
+                  if not b: break
+                  out.write(b)
+          print("base.zip:", os.path.getsize(dest), "bytes")
+          PY
+          md5sum "$RUNNER_TEMP/base.zip"
+
+      - name: Unzip base + passthrough manifest
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; W="$RUNNER_TEMP/pkgwork"
+          mkdir -p "$P"
+          rm -rf "$W"; mkdir -p "$W"
+          unzip -oq "$RUNNER_TEMP/base.zip" -d "$W"
+          BASEDIR="$(find "$W" -maxdepth 1 -mindepth 1 -type d | head -1)"
+          test -n "$BASEDIR"
+          echo "BASEDIR=$BASEDIR" | tee -a "$GITHUB_ENV"
+          ls -l "$BASEDIR"
+          (cd "$BASEDIR" && find . -type f ! -name system.img ! -name MD5SUMS.txt -print0 \
+            | sort -z | xargs -0 md5sum) > "$P/base_manifest.md5"
+          wc -l "$P/base_manifest.md5"
+          md5sum "$BASEDIR/system.img" | awk '{print $1}' > "$P/base_system_sparse_md5.txt"
+          cat "$P/base_system_sparse_md5.txt"
+          rm -f "$RUNNER_TEMP/base.zip"   # disk hygiene
+
+      - name: Desparse system.img -> raw, size guard, e2fsck read-only
+        run: |
+          set -euo pipefail
+          python3 scripts/mtk_sparse2raw.py "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img" -q 2>/dev/null \
+            || simg2img "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img"
+          SZ=$(stat -c %s "$RUNNER_TEMP/system.raw.img")
+          echo "raw system.img: $SZ bytes"
+          test "$SZ" -eq "$SYSTEM_PARTITION_BYTES"
+          MAGIC=$(head -c 4 "$RUNNER_TEMP/system.raw.img" | od -An -tx1 | tr -d ' \n')
+          test "$MAGIC" != "3aff26ed"
+          sudo e2fsck -fn "$RUNNER_TEMP/system.raw.img"
+          echo "[rawpack] e2fsck -fn: clean"
+
+      - name: Mount ro + content spot checks (stock BT .so, apps, framework)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro "$RUNNER_TEMP/system.raw.img" /mnt/sys
+          sudo md5sum /mnt/sys/lib/hw/bluetooth.default.so | awk '{print $1}' > "$P/bt_md5_in_image.txt"
+          GOT=$(cat "$P/bt_md5_in_image.txt")
+          echo "in-image bluetooth.default.so md5: $GOT (stock want $STOCK_BT_MD5)"
+          test "$GOT" = "$STOCK_BT_MD5"
+          echo "[rawpack] stock BT stack confirmed -- this package has NO swap"
+          sudo python3 scripts/fw_inventory.py apps /mnt/sys --out "$P/apps.json" > /dev/null
+          test -f /mnt/sys/framework/framework-res.apk
+          grep -m1 ro.build.fingerprint /mnt/sys/build.prop | tee "$P/fingerprint.txt"
+          sudo umount /mnt/sys
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          apps = json.load(open(os.path.join(P, "apps.json")))
+          pkgs = {a.get("package") for a in apps if a.get("package")}
+          REQUIRED = ["com.android.systemui", "com.android.settings",
+                      "com.android.bluetooth", "com.android.packageinstaller",
+                      "com.android.providers.settings", "com.android.shell"]
+          lost = [p for p in REQUIRED if p not in pkgs]
+          assert not lost, f"boot-critical packages lost: {lost}"
+          assert len(apps) == 74, f"APK record count changed: {len(apps)} != 74"
+          print(f"[rawpack] apps OK: {len(apps)} records, boot-critical present")
+          PY
+
+      - name: Swap in raw image + MD5SUMS.txt + rezip
+        run: |
+          set -euo pipefail
+          mv "$RUNNER_TEMP/system.raw.img" "$BASEDIR/system.img"
+          (cd "$BASEDIR" && for f in *; do
+             [ "$f" = MD5SUMS.txt ] || md5sum "$f"; done > MD5SUMS.txt)
+          cat "$BASEDIR/MD5SUMS.txt"
+          cp "$BASEDIR/MD5SUMS.txt" "$RUNNER_TEMP/probe/MD5SUMS.txt"
+          NEWPKG="$RUNNER_TEMP/$PKG"
+          rm -rf "$NEWPKG"
+          mv "$BASEDIR" "$NEWPKG"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import repack_firmware as rf
+          pkg = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"])
+          out = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"] + ".zip")
+          n = rf.zip_package(pkg, out)
+          print(f"[rawpack] package zip: {n} bytes -> {out}")
+          PY
+          md5sum "$RUNNER_TEMP/$PKG.zip" | tee "$RUNNER_TEMP/probe/package_md5.txt"
+          df -h "$RUNNER_TEMP"
+
+      - name: Validate the final package end to end
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; CHK="$RUNNER_TEMP/chk"
+          rm -rf "$CHK"; mkdir -p "$CHK"
+          (cd "$CHK" && unzip -oq "$RUNNER_TEMP/$PKG.zip")
+          ls -l "$CHK/$PKG"
+          SCAT="$(find "$CHK/$PKG" -name '*_scatter.txt' | head -1)"
+          python3 scripts/mtk_scatter.py validate "$SCAT" "$CHK/$PKG" | tee "$P/scatter_validate.txt"
+          (cd "$CHK/$PKG" && find . -type f ! -name system.img ! -name MD5SUMS.txt -print0 \
+            | sort -z | xargs -0 md5sum) > "$P/final_manifest.md5"
+          diff "$P/base_manifest.md5" "$P/final_manifest.md5"
+          echo "[verify] all $(wc -l < "$P/final_manifest.md5") non-system entries byte-identical to base"
+          SZ=$(stat -c %s "$CHK/$PKG/system.img")
+          test "$SZ" -eq "$SYSTEM_PARTITION_BYTES"
+          MAGIC=$(head -c 4 "$CHK/$PKG/system.img" | od -An -tx1 | tr -d ' \n')
+          test "$MAGIC" != "3aff26ed"
+          echo "[verify] packaged system.img: raw, $SZ bytes == partition size"
+          (cd "$CHK/$PKG" && md5sum -c MD5SUMS.txt 2>/dev/null | grep -c ': OK$' || true) | tee "$P/md5sums_ok.txt"
+          test "$(cat "$P/md5sums_ok.txt")" -ge 11
+          mv "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+          sudo mkdir -p /mnt/chk
+          sudo mount -o loop,ro "$CHK/system.raw.img" /mnt/chk
+          sudo md5sum /mnt/chk/lib/hw/bluetooth.default.so | awk '{print $1}' > "$P/final_bt_md5.txt"
+          test "$(cat "$P/final_bt_md5.txt")" = "$STOCK_BT_MD5"
+          echo "[verify] in-package system.img mounts; stock BT stack intact"
+          sudo umount /mnt/chk
+          rm -f "$CHK/system.raw.img"
+          # boot passthrough sanity (kernel md5 + verity-off fstab)
+          rm -rf "$P/pkgboot" "$P/pkgrd"
+          python3 scripts/mtk_bootimg.py unpack "$CHK/$PKG/boot.img" "$P/pkgboot"
+          GOT=$(md5sum "$P/pkgboot/kernel.bin" | cut -d' ' -f1)
+          echo "package boot kernel md5: $GOT (want $KERNEL_MD5)"
+          test "$GOT" = "$KERNEL_MD5"
+          mkdir -p "$P/pkgrd"
+          (cd "$P/pkgrd" && gzip -dc "$P/pkgboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          found=0
+          for f in "$P/pkgrd"/fstab*; do
+            [ -f "$f" ] || continue
+            found=1
+            if grep -E '/system' "$f" | grep -q 'verify'; then
+              echo "FATAL: packaged boot fstab verifies /system"; exit 1
+            fi
+          done
+          test "$found" = 1
+          echo "[verify] boot.img: stock kernel, verity still off"
+          # scratch dirs have root-owned cpio modes -- drop before artifact upload
+          rm -rf "$P/pkgrd" "$P/pkgboot"
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          df -h "$RUNNER_TEMP"
+
+      - name: Write VERIFICATION.md
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          PKG = os.environ["PKG"]
+          zip_path = os.path.join(os.environ["RUNNER_TEMP"], PKG + ".zip")
+          md5 = subprocess.run(["md5sum", zip_path], capture_output=True, text=True).stdout.split()[0]
+          rd = lambda n: open(os.path.join(P, n)).read().strip()
+          L = []
+          L.append(f"# VERIFICATION -- {PKG}.zip\n")
+          L.append(f"- package md5: `{md5}`  ({os.path.getsize(zip_path)} bytes)")
+          L.append(f"- source package: `{os.environ['BASE_TAG']}` / `{os.environ['BASE_ASSET']}`")
+          L.append("- transformation: system.img re-encoded sparse -> **RAW** (content untouched)")
+          L.append(f"  - raw size {os.environ['SYSTEM_PARTITION_BYTES']} bytes == partition size; NOT sparse-encoded")
+          L.append(f"  - e2fsck -fn clean; in-image bluetooth.default.so md5 `{rd('bt_md5_in_image.txt')}` == STOCK (no BT swap in this package)")
+          L.append(f"  - fingerprint: {rd('fingerprint.txt')}")
+          L.append("- every non-system.img entry md5-identical to the source package")
+          L.append("- boot.img: kernel md5 == stock, fstab verity-off (inherited)")
+          L.append("- APK inventory: 74 records; boot-critical packages present")
+          L.append("- MD5SUMS.txt inside the zip lists every file (extraction-integrity check)\n")
+          L.append("## Why RAW\n")
+          L.append("The user's SP Flash Tool/DA deterministically crashes at 92% on our *sparse*")
+          L.append("system images (FILL-write path over the late-image zero region; v0/v1 wrote")
+          L.append("the same blocks as RAW chunks fine -- see docs/NOUGAT_BT_SWAP.md §4.4).")
+          L.append("A raw system.img only uses the plain write path.\n")
+          L.append("## Purpose\n")
+          L.append("Bisect + rescue: identical to the source package except the encoding.")
+          L.append("If this boots normally, the v2 base is exonerated; if it hangs the same way,")
+          L.append("the problem is in the v2 base itself (not the BT swap).\n")
+          L.append("## Flash\n")
+          L.append("SP Flash Tool -> load the scatter from the zip -> **Download Only**.")
+          L.append("Rescue: official baseline zip from release `base_firmware`.")
+          txt = "\n".join(L) + "\n"
+          with open(os.path.join(P, "VERIFICATION.md"), "w") as f:
+              f.write(txt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(txt)
+          print(txt)
+          PY
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          NAME="U2 debloat-v2 RAW re-encode (bisect/rescue; no BT swap)"
+          {
+            echo "KeenPlus U2 -- **debloat-v2 re-encoded with a RAW (non-sparse) system.img**."
+            echo
+            echo "Content is byte-identical to \`$BASE_TAG\` except the encoding of"
+            echo "\`system.img\` (raw, 3,095,396,352 bytes == partition size). NO Bluetooth"
+            echo "swap in this package -- the stock MTK stack md5 is asserted in-image."
+            echo
+            echo "**Why:** SP Flash Tool on the user host deterministically dies at 92% on"
+            echo "our sparse images (DA FILL-write path; see docs/NOUGAT_BT_SWAP.md §4.4)."
+            echo "RAW images only use the plain write path proven by v0/v1."
+            echo
+            echo "**Use:** flash this to bisect the boot-hang report: if it boots fine, the"
+            echo "v2 base is OK and the BT-swap stack is implicated; if it hangs identically,"
+            echo "the v2 base is implicated. Also serves as a flashable rescue image of v2."
+            echo
+            echo "**Flash:** SP Flash Tool -> scatter from the zip -> Download Only."
+            echo "After extracting, verify every file against MD5SUMS.txt inside the zip."
+          } > "$RUNNER_TEMP/NOTES.md"
+          python3 scripts/publish_release.py \
+            --tag "$FW_TAG" --name "$NAME" \
+            --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
+            --files "$RUNNER_TEMP/$PKG.zip" "$P/VERIFICATION.md" "$P/MD5SUMS.txt"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-rawpack-report
+          path: ${{ runner.temp }}/probe/
+          if-no-files-found: warn
