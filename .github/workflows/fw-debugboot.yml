@@ -139,12 +139,16 @@ jobs:
             wc -c "$RUNNER_TEMP/adbkey.pub"
             KEYARG=(--adb-pubkey-file "$RUNNER_TEMP/adbkey.pub")
           fi
+          AUTHARG=()
+          if [ -f debug/operator_adbkey.pub ]; then
+            AUTHARG=(--adb-authkeys-file debug/operator_adbkey.pub)
+          fi
           python3 scripts/mtk_bootimg.py adb-enable \
             "$P/boot_stock.img" "$P/boot_debug.img" \
             --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
             --x509 "$RUNNER_TEMP/keys/testkey.x509.pem" \
             --assert-kernel-md5 "$KERNEL_MD5" \
-            "${KEYARG[@]}"
+            "${KEYARG[@]}" "${AUTHARG[@]}"
           ls -l "$P/boot_stock.img" "$P/boot_debug.img"
 
       - name: Independent validation (kernel identical, diffs minimal, tail valid)
@@ -168,6 +172,9 @@ jobs:
           nd = {n for n, _ in mb.parse_cpio_index(bytes(hd["ramdisk"]))}
           seeded = bool(os.environ.get("ADB_PUBKEY", "").strip())
           allowed_extra = {mb.ADB_KEY_FILE} if seeded else set()
+          authkeys_src = "debug/operator_adbkey.pub"
+          if os.path.exists(authkeys_src):
+              allowed_extra.add(mb.ADB_AUTHKEYS_FILE)
           assert ns <= nd and (nd - ns) <= allowed_extra, \
               f"ramdisk file list changed: {ns ^ nd}"
           print(f"[check] ramdisk file list = stock + {sorted(nd - ns)} "
@@ -203,6 +210,12 @@ jobs:
                   kk = rd(rd_, mb.ADB_KEY_FILE).strip()
                   assert kk == os.environ["ADB_PUBKEY"].strip(), "seeded key mismatch"
                   print("[check] adb_keys seeding: rc block + /adbkey.pub verified")
+              if os.path.exists(authkeys_src):
+                  ak = rd(rd_, mb.ADB_AUTHKEYS_FILE)
+                  want = "".join(l.strip() + "\n"
+                                 for l in open(authkeys_src) if l.strip())
+                  assert ak == want, "/adb_keys content mismatch"
+                  print("[check] /adb_keys seeded (MTK ramdisk-adbd pre-auth path)")
               # every other ramdisk file byte-identical
               others = 0
               for name in sorted(nd):

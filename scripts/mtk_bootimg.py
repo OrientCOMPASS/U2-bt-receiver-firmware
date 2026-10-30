@@ -511,6 +511,18 @@ on property:sys.usb.config=mtp
 # a key found in adb_keys as pre-authorized -- no dialog needed.
 ADB_KEY_FILE = "adbkey.pub"   # seeded at the ramdisk root as /adbkey.pub
 ADB_KEYSEED_MARKER = "### repo-debug-boot adb key seeding ###"
+
+# MTK puts adbd in the BOOT RAMDISK (/sbin/adbd; this build has NO
+# /system/bin/adbd at all).  Evidence from the on-device binary (2026-10-30):
+#   * it reads BOTH /adb_keys (ramdisk root) AND /data/misc/adb/adb_keys;
+#   * it contains NO reference to ro.adb.secure -- auth cannot be turned off
+#     via any prop on this device (explains 'device unauthorized' despite the
+#     default.prop flip);
+#   * stock init.rc runs `restorecon /adb_keys`, and the stock sepolicy has
+#     u:object_r:adb_keys_file:s0 -- the ramdisk-root key file is the
+#     ODM-intended pre-authorization path.  Seed the operator's host key
+#     there and adbd authorizes the host with no dialog and no /data access.
+ADB_AUTHKEYS_FILE = "adb_keys"   # seeded at the ramdisk root as /adb_keys
 ADB_KEYSEED_RC = """
 # ### repo-debug-boot adb key seeding ###
 # Pre-authorize the operator's adb host key (notes: ADB_KEYSEED_MARKER in
@@ -578,6 +590,19 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
         log(f"adb pubkey: blob {len(tok)} chars, "
             f"comment {raw[len(tok):].strip() or '-'!r}")
 
+    authkeys = ""
+    if getattr(args, "adb_authkeys_file", ""):
+        import re
+        lines = [l.strip() for l in
+                 open(args.adb_authkeys_file, "r", encoding="utf-8")
+                 if l.strip()]
+        for l in lines:
+            tok = l.split()[0]
+            assert re.fullmatch(r"[A-Za-z0-9+/=]{100,}", tok), \
+                f"authkeys line does not look like an adbkey.pub blob: {l[:40]}..."
+        authkeys = "\n".join(lines) + "\n"
+        log(f"adb authkeys: {len(lines)} key line(s) for /adb_keys")
+
     with _workdir() as td:
         rd = os.path.join(td, "rd")
         extract_ramdisk(ramdisk_gz, rd)
@@ -605,6 +630,13 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
             _sudo_write(kp, (key_line + "\n").encode("utf-8"))
             _run(_sudo() + ["chmod", "0644", kp])
             log(f"/{ADB_KEY_FILE}: seeded ({len(key_line)} chars)")
+        # 4) /adb_keys -- read directly by MTK's /sbin/adbd (ramdisk adbd);
+        #    init.rc's `restorecon /adb_keys` gives it adb_keys_file label.
+        if authkeys:
+            akp = os.path.join(rd, ADB_AUTHKEYS_FILE)
+            _sudo_write(akp, authkeys.encode("utf-8"))
+            _run(_sudo() + ["chmod", "0444", akp])
+            log(f"/{ADB_AUTHKEYS_FILE}: seeded ({len(authkeys)} bytes)")
         restore_mtimes(rd, idx)
         new_ramdisk = repack_ramdisk(rd)
 
@@ -623,7 +655,8 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
     assert bytes(h2["kernel"]) == kernel, "kernel changed in rebuild"
     assert h2["page_size"] == h["page_size"], "page size changed"
     idx2 = parse_cpio_index(bytes(h2["ramdisk"]))                # type: ignore
-    expect_names = names | ({ADB_KEY_FILE} if key_line else set())
+    expect_names = names | ({ADB_KEY_FILE} if key_line else set()) \
+                         | ({ADB_AUTHKEYS_FILE} if authkeys else set())
     assert {n for n, _ in idx2} == expect_names, "ramdisk file list changed"
     with _workdir() as td:
         rd = os.path.join(td, "rd2")
@@ -647,6 +680,12 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
                 .decode("utf-8").strip()
             assert kp2 == key_line, "seeded pubkey content mismatch"
             log("self-check: /adbkey.pub + keyseed rc verified in rebuilt ramdisk")
+        if authkeys:
+            ak2 = _sudo_read(os.path.join(rd, ADB_AUTHKEYS_FILE)) \
+                .decode("utf-8")
+            assert ak2 == authkeys, "/adb_keys content mismatch"
+            log("self-check: /adb_keys verified in rebuilt ramdisk "
+                f"({len(ak2)} bytes)")
         if not args.no_sign:
             assert check_tail_parses(tail), "signature tail not valid DER"
     with open(args.out, "wb") as f:
@@ -704,6 +743,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="one-line adbkey.pub to seed into "
                         "/data/misc/adb/adb_keys at boot (pre-authorizes that "
                         "host with no on-screen dialog)")
+    a.add_argument("--adb-authkeys-file", default="",
+                   help="adb_keys file (one pubkey per line) seeded at the "
+                        "ramdisk root as /adb_keys -- read directly by the "
+                        "MTK ramdisk adbd; the reliable pre-authorization path")
     a.set_defaults(fn=cmd_adb_enable)
 
     args = ap.parse_args(argv)
