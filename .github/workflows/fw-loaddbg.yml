@@ -1,0 +1,310 @@
+# fw-loaddbg.yml -- emulator-based load analysis of the swapped BT stack.
+#
+# The device hangs at first boot with the swapped bluetooth.default.so on a
+# boot-validated base (v1) in BOTH encodings, while every static gate passed.
+# This workflow emulates the device's exact load path in CI:
+#
+#   qemu-arm (TCG) + the REAL /system/bin/linker (bionic, Android 7.0) from
+#   the firmware image + the REAL /system/lib + /system/vendor/lib closure,
+#   dlopen()ing the swapped .so exactly like libbluetooth_jni does via
+#   hw_get_module -> dlopen(RTLD_NOW) -> dlsym("HMI") -> methods->open().
+#
+# Matrix: ours vs stock (control) x {hal load, halopen init-path} + the MTK
+# vendor libs.  RTLD_NOW forces immediate binding of every undefined symbol,
+# so any resolution/relocation problem fails loudly; hangs are caught by
+# `timeout` and re-run under qemu -strace to show the blocking syscall.
+#
+# A full-system Android emulation of this firmware remains infeasible (the
+# stock MTK kernel has no virtio/goldfish drivers); this is the deepest
+# controller-free analysis possible -- anything past methods->open()'s first
+# hardware touch needs on-device logs (fw-debugboot).
+name: fw-loaddbg
+
+on:
+  workflow_dispatch:
+    inputs:
+      fw_tag:
+        description: 'Release tag of the BT-swap package to analyze'
+        default: 'firmware-btswap-v1-20261030'
+        required: true
+      fw_asset:
+        description: 'Its zip asset name'
+        default: 'U2_7.0_bt_sink_v1.zip'
+        required: true
+      stock_artifact_run:
+        description: 'fw-probe run id whose artifact carries the STOCK BT .so (control)'
+        default: '40630128218'
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  STOCK_BT_MD5: e0dd373e4632316a0348e6ec0a288347
+  OURS_EXPECT_MD5: c561b6128e9293bde3280f7aca3d5b17
+  FW_TAG: ${{ inputs.fw_tag }}
+  FW_ASSET: ${{ inputs.fw_asset }}
+  STOCK_RUN: ${{ inputs.stock_artifact_run }}
+
+jobs:
+  loaddbg:
+    name: qemu-arm + real bionic linker load matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install qemu-user + image tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static e2fsprogs
+          qemu-arm-static --version | head -1
+          mkdir -p "$RUNNER_TEMP/logs" "$RUNNER_TEMP/bin"
+
+      - name: Locate or fetch the NDK (armv7a, API 24 clang)
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_HOME:-}"
+          [ -n "$NDK" ] && [ -d "$NDK" ] || NDK="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$NDK" ]; then
+            echo "no preinstalled NDK -- downloading r27c"
+            curl -fsSL -o "$RUNNER_TEMP/ndk.zip" \
+              "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+            unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+            NDK="$RUNNER_TEMP/android-ndk-r27c"
+            rm -f "$RUNNER_TEMP/ndk.zip"
+          fi
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang"
+          test -x "$CC" || { echo "FATAL: NDK clang not found at $CC"; exit 1; }
+          echo "NDK=$NDK" | tee -a "$GITHUB_ENV"
+          echo "ARM_CC=$CC" | tee -a "$GITHUB_ENV"
+
+      - name: Build the smoke-test harness (ARM32, bionic, API 24)
+        run: |
+          set -euo pipefail
+          "$ARM_CC" -O1 -Wall -Wextra scripts/smoke/test_dlopen.c \
+            -o "$RUNNER_TEMP/bin/test_dlopen"
+          file "$RUNNER_TEMP/bin/test_dlopen"
+          readelf -l "$RUNNER_TEMP/bin/test_dlopen" | grep -A1 INTERP
+          readelf -l "$RUNNER_TEMP/bin/test_dlopen" | grep -q "/system/bin/linker" \
+            || { echo "FATAL: harness interpreter is not /system/bin/linker"; exit 1; }
+          echo "[harness] ARM32 PIE, interpreter = /system/bin/linker (device's own loader)"
+
+      - name: Download firmware package + extract the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/work"; mkdir -p "$W"
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          tag, asset = os.environ["FW_TAG"], os.environ["FW_ASSET"]
+          r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+              headers={"Accept":"application/vnd.github+json","User-Agent":"fw-loaddbg",
+                       "Authorization":f"Bearer {tok}"})
+          rel = json.loads(urllib.request.urlopen(r).read())
+          url = next(a["browser_download_url"] for a in rel["assets"] if a["name"] == asset)
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "work", "fw.zip")
+          with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent":"fw-loaddbg"})) as src, \
+               open(dest, "wb") as out:
+              while True:
+                  b = src.read(1 << 22)
+                  if not b: break
+                  out.write(b)
+          print("fw.zip:", os.path.getsize(dest), "bytes")
+          PY
+          unzip -oq "$W/fw.zip" -d "$W/x"
+          SPARSE="$(find "$W/x" -name system.img | head -1)"
+          python3 scripts/mtk_sparse2raw.py "$SPARSE" "$W/system.raw.img" -q
+          rm -rf "$W/fw.zip" "$W/x" "$SPARSE"
+          ls -l "$W/system.raw.img"
+          SYS="$W/sysroot"; mkdir -p "$SYS/system/bin" "$SYS/data"
+          debugfs -R "dump /system/bin/linker $SYS/system/bin/linker" "$W/system.raw.img" 2>/dev/null
+          debugfs -R "rdump /system/lib $SYS/system" "$W/system.raw.img" 2>/dev/null
+          debugfs -R "rdump /system/vendor/lib $SYS/system/vendor" "$W/system.raw.img" 2>/dev/null
+          chmod +x "$SYS/system/bin/linker"
+          test -f "$SYS/system/lib/hw/bluetooth.default.so"
+          md5sum "$SYS/system/lib/hw/bluetooth.default.so"
+          GOT=$(md5sum "$SYS/system/lib/hw/bluetooth.default.so" | awk '{print $1}')
+          test "$GOT" = "$OURS_EXPECT_MD5" || echo "WARN: in-image .so md5 $GOT != $OURS_EXPECT_MD5"
+          echo "SYSROOT=$SYS" | tee -a "$GITHUB_ENV"
+          rm -f "$W/system.raw.img"   # disk hygiene; sysroot extracted
+          du -sh "$SYS"; find "$SYS" -name '*.so' | wc -l
+
+      - name: Fetch the STOCK bluetooth.default.so (control)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/work"; mkdir -p "$W/stock"
+          python3 - <<'PY' || echo "STOCK_CONTROL=0" | tee -a "$GITHUB_ENV"
+          import hashlib, io, json, os, urllib.request, zipfile
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          H = {"Accept":"application/vnd.github+json","User-Agent":"fw-loaddbg",
+               "Authorization":f"Bearer {tok}"}
+          class NoAuth(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return urllib.request.Request(newurl, headers={"User-Agent":"fw-loaddbg"})
+          op = urllib.request.build_opener(NoAuth)
+          want = os.environ["STOCK_BT_MD5"]
+          W = os.path.join(os.environ["RUNNER_TEMP"], "work")
+          out = os.path.join(W, "stock", "bluetooth.default.so")
+          # path 1: fw-probe artifact carrying the extracted baseline BT files
+          arts = json.load(op.open(urllib.request.Request(
+              f"{api}/actions/runs/{os.environ['STOCK_RUN']}/artifacts", headers=H)))["artifacts"]
+          cand = [a for a in arts if "bt" in a["name"].lower()]
+          for a in cand:
+              blob = op.open(urllib.request.Request(a["archive_download_url"], headers=H)).read()
+              z = zipfile.ZipFile(io.BytesIO(blob))
+              for n in z.namelist():
+                  if n.endswith("lib/hw/bluetooth.default.so"):
+                      d = z.read(n)
+                      if hashlib.md5(d).hexdigest() == want:
+                          open(out, "wb").write(d)
+                          print(f"stock control from artifact {a['name']}:{n} ({len(d)} B)")
+                          raise SystemExit(0)
+          raise SystemExit("artifact path failed")
+          PY
+          if [ ! -f "$W/stock/bluetooth.default.so" ]; then
+            echo "artifact path failed -- fallback: debloat-v1 release zip"
+            python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          r = urllib.request.Request(f"{api}/releases/tags/firmware-debloat-v1-20261030",
+              headers={"Accept":"application/vnd.github+json","User-Agent":"fw-loaddbg",
+                       "Authorization":f"Bearer {tok}"})
+          rel = json.loads(urllib.request.urlopen(r).read())
+          url = next(a["browser_download_url"] for a in rel["assets"]
+                     if a["name"] == "U2_7.0_debloat_v1.zip")
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "work", "v1.zip")
+          with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent":"fw-loaddbg"})) as src, \
+               open(dest, "wb") as o:
+              while True:
+                  b = src.read(1 << 22)
+                  if not b: break
+                  o.write(b)
+          print("v1.zip:", os.path.getsize(dest))
+          PY
+            unzip -oq "$W/v1.zip" -d "$W/x1"
+            S1="$(find "$W/x1" -name system.img | head -1)"
+            python3 scripts/mtk_sparse2raw.py "$S1" "$W/s1.raw.img" -q
+            debugfs -R "dump /system/lib/hw/bluetooth.default.so $W/stock/bluetooth.default.so" "$W/s1.raw.img" 2>/dev/null
+            rm -rf "$W/v1.zip" "$W/x1" "$S1" "$W/s1.raw.img"
+          fi
+          md5sum "$W/stock/bluetooth.default.so"
+          GOT=$(md5sum "$W/stock/bluetooth.default.so" | awk '{print $1}')
+          test "$GOT" = "$STOCK_BT_MD5" || { echo "FATAL: control is not the stock .so"; exit 1; }
+          echo "STOCK_CONTROL=1" | tee -a "$GITHUB_ENV"
+          echo "[control] stock bluetooth.default.so ready ($GOT)"
+
+      - name: Load matrix under qemu-arm (real linker, real libs)
+        run: |
+          set -uo pipefail
+          L="$RUNNER_TEMP/logs"; SYS="$SYSROOT"; W="$RUNNER_TEMP/work"
+          STOCK_CONTROL="${STOCK_CONTROL:-0}"
+          OURS="$SYS/system/lib/hw/bluetooth.default.so"
+          STOCK="$W/stock/bluetooth.default.so"
+          VEND="$SYS/system/vendor/lib/libbt-vendor.so"
+          MTK="$SYS/system/vendor/lib/libbluetooth_mtk.so"
+          GATE_FAIL=0
+          run_case() {  # name so mode timeout [gate|info]
+            local name="$1" so="$2" mode="$3" to="$4" kind="${5:-info}"
+            echo "" | tee -a "$L/matrix.txt"
+            echo "===== [$kind] $name: $(basename "$so") mode=$mode timeout=${to}s =====" | tee -a "$L/matrix.txt"
+            if [ ! -f "$so" ]; then
+              echo "SKIP: $so not present" | tee -a "$L/matrix.txt"; return 0
+            fi
+            timeout "$to" env ANDROID_ROOT=/system ANDROID_DATA=/data \
+              LD_LIBRARY_PATH=/system/lib:/system/vendor/lib \
+              qemu-arm-static -cpu max -L "$SYS" \
+              "$RUNNER_TEMP/bin/test_dlopen" "$so" "$mode" \
+              > "$L/$name.log" 2>&1
+            local rc=$?
+            cat "$L/$name.log" | tee -a "$L/matrix.txt"
+            case "$rc" in
+              0)   echo "RESULT $name: PASS (exit 0)" | tee -a "$L/matrix.txt" ;;
+              124) echo "RESULT $name: TIMEOUT after ${to}s -- never returned" | tee -a "$L/matrix.txt" ;;
+              *)   echo "RESULT $name: exit $rc" | tee -a "$L/matrix.txt" ;;
+            esac
+            if [ "$rc" -ne 0 ]; then
+              echo "--- re-run with -strace (tail 60) ---" | tee -a "$L/matrix.txt"
+              timeout "$to" env ANDROID_ROOT=/system ANDROID_DATA=/data \
+                LD_LIBRARY_PATH=/system/lib:/system/vendor/lib \
+                qemu-arm-static -cpu max -strace -L "$SYS" \
+                "$RUNNER_TEMP/bin/test_dlopen" "$so" "$mode" \
+                > "$L/$name.strace.log" 2>&1 || true
+              tail -60 "$L/$name.strace.log" | tee -a "$L/matrix.txt"
+            fi
+            if [ "$kind" = "gate" ] && [ "$rc" -ne 0 ]; then GATE_FAIL=1; fi
+          }
+          run_case ours_hal      "$OURS"  hal     60 gate
+          run_case stock_hal     "$STOCK" hal     60 ${STOCK_CONTROL:+gate}
+          run_case vendor_iface  "$VEND"  vendor  60 gate
+          run_case mtk_iface     "$MTK"   vendor  60 info
+          run_case ours_halopen  "$OURS"  halopen 45 info
+          run_case stock_halopen "$STOCK" halopen 45 info
+          echo "" | tee -a "$L/matrix.txt"
+          if [ "$GATE_FAIL" = 1 ]; then
+            echo "MATRIX VERDICT: GATE FAILURE -- load-path problem reproduced" | tee -a "$L/matrix.txt"
+          else
+            echo "MATRIX VERDICT: all gates passed -- load path is clean under the real linker" | tee -a "$L/matrix.txt"
+          fi
+          exit "$GATE_FAIL"
+
+      - name: Static delta report (ours vs stock)
+        run: |
+          set -euo pipefail
+          L="$RUNNER_TEMP/logs"; SYS="$SYSROOT"; W="$RUNNER_TEMP/work"
+          {
+            echo "## dynamic section (INIT/FINI/FLAGS/NEEDED)"
+            for f in "$SYS/system/lib/hw/bluetooth.default.so" "$W/stock/bluetooth.default.so"; do
+              echo "--- $f"; readelf -d "$f" | grep -E "INIT|FINI|FLAGS|NEEDED|SONAME" || true
+            done
+            echo
+            echo "## GLOBAL DEFAULT exports"
+            for f in "$SYS/system/lib/hw/bluetooth.default.so" "$W/stock/bluetooth.default.so"; do
+              n=$(readelf --dyn-syms -W "$f" | awk '$5=="GLOBAL" && $6=="DEFAULT" && $7!="UND"' | wc -l)
+              echo "--- $f: $n exports"
+            done
+            echo
+            echo "## export overlap (interposition candidates if ever RTLD_GLOBAL)"
+            comm -12 \
+              <(readelf --dyn-syms -W "$SYS/system/lib/hw/bluetooth.default.so" | awk '$5=="GLOBAL" && $6=="DEFAULT" && $7!="UND" {print $8}' | sort -u) \
+              <(readelf --dyn-syms -W "$W/stock/bluetooth.default.so" | awk '$5=="GLOBAL" && $6=="DEFAULT" && $7!="UND" {print $8}' | sort -u) \
+              | head -40 || true
+          } > "$L/static_delta.txt" 2>&1
+          cat "$L/static_delta.txt"
+
+      - name: Summary + artifact
+        if: always()
+        run: |
+          set -uo pipefail
+          L="$RUNNER_TEMP/logs"
+          {
+            echo "# fw-loaddbg report (qemu-arm + real bionic linker)"
+            echo
+            echo '```'
+            cat "$L/matrix.txt" 2>/dev/null | tail -120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          chmod -R a+rX "$L" 2>/dev/null || true
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-loaddbg-report
+          path: ${{ runner.temp }}/logs/
+          if-no-files-found: warn

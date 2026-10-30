@@ -9,11 +9,16 @@
  * dlopen(path, RTLD_NOW) -> dlsym("HMI")).
  *
  * Usage:
- *   test_dlopen <path-to.so> [hal|vendor]
+ *   test_dlopen <path-to.so> [hal|vendor|halopen]
  *     hal    (default): expect HAL_MODULE_INFO_SYM == exported symbol "HMI";
  *                       print tag/module_api_version/hal_api_version/id/name.
  *     vendor:           expect BLUETOOTH_VENDOR_LIB_INTERFACE (16-byte
  *                       bt_vendor_interface_t); print size/init/op/cleanup.
+ *     halopen:          hal checks, then call methods->open("bluetooth") --
+ *                       the exact JNI init path -- to exercise the stack's
+ *                       bring-up/error handling under a controller-less
+ *                       environment (exit 4 = open returned an error;
+ *                       a TIMEOUT by the caller = open never returned).
  * Exit 0 = loaded & entry symbol sane; 2 = dlopen/linker failure;
  * 3 = entry symbol missing/insane.
  */
@@ -72,6 +77,28 @@ int main(int argc, char **argv) {
            m->id ? m->id : "(null)", m->name ? m->name : "(null)");
     if (m->tag != 0x4d4f4448u /* HW_MODULE_MAGIC (0xA5M0B1E?) -- informational */ ) {
         printf("[smoke] note: tag differs from expected magic (informational)\n");
+    }
+    if (strcmp(mode, "halopen") == 0) {
+        /* Walk the EXACT device path: JNI does module->methods->open(module,
+         * "bluetooth", &device) at BT enable.  Under qemu there is no
+         * controller/UART, so this exercises the init error path: a stack
+         * that returns an error promptly is well-behaved; one that blocks
+         * forever here would also block the device's BT process. */
+        struct hw_module_methods_t {
+            int (*open)(const struct hw_module_t *, const char *, void **);
+        } *methods = (struct hw_module_methods_t *)m->methods;
+        if (!methods || !methods->open) {
+            printf("[smoke] FAIL: methods->open missing\n");
+            return 3;
+        }
+        printf("[smoke] calling methods->open(\"bluetooth\") -- init path, "
+               "no controller under qemu ...\n");
+        void *dev = NULL;
+        int rc = methods->open((const struct hw_module_t *)m, "bluetooth", &dev);
+        printf("[smoke] open() returned %d (device=%p)\n", rc, dev);
+        if (rc != 0) { printf("[smoke] OPEN-FAIL rc=%d (error path taken)\n", rc); return 4; }
+        printf("[smoke] PASS halopen\n");
+        return 0;
     }
     printf("[smoke] PASS hal\n");
     return 0;
