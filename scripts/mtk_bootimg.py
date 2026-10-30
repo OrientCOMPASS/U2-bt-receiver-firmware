@@ -554,9 +554,22 @@ ADB_ROOTEXEC_RC = """
 #   repo.exec=1             -- operator on-demand: adb shell setprop repo.exec 1
 #                              (re-fire: setprop repo.exec 0; setprop repo.exec 1)
 #   on boot                 -- parse/fire marker only (diagnostic ladder)
+# v7: explicit seclabel.  v6 proved on-device that the property trigger fires
+# and init finds the service, but Service::Start() aborted with "Service
+# repoexec does not have a SELinux domain defined." -- AOSP 7.0 service.cpp
+# computes security_compute_create(init_ctx, getfilecon(binary)) and rejects
+# when the result equals init's own context (no transition rule).  Device
+# labels: /system/bin/sh = shell_exec (NO init->shell transition on this
+# modified MTK policy!), /system/bin/preinstall.sh = system_file (HAS one --
+# which is why ctl.start preinstall ran as uid 0 in the shell domain).
+# With an explicit seclabel, service.cpp uses it verbatim (no lookup):
+#   if (!seclabel_.empty()) { scon = seclabel_; }
+# u:r:shell:s0 replicates the proven preinstall execution shape (uid 0,
+# shell domain, Permissive).
 service repoexec /system/bin/sh /data/local/tmp/rootexec.sh
     disabled
     oneshot
+    seclabel u:r:shell:s0
 
 on boot
     write /dev/kmsg repo-rootexec-v6-onboot
@@ -730,9 +743,11 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
                     "/data/local/tmp/rootexec.sh") in rc2, "repoexec service missing"
             assert rc2.count("start repoexec") == 3, "expected 3 start repoexec triggers"
             assert "on property:repo.exec=1" in rc2, "on-demand trigger missing"
+            assert "    seclabel u:r:shell:s0\n" in rc2, \
+                "v7 seclabel missing (service start would be rejected)"
             assert "\n    exec /system/bin/sh" not in rc2, \
                 "v5 exec builtin must be gone (never ran on MTK init)"
-            log("self-check: root executor v6 (service repoexec + 4 triggers) verified")
+            log("self-check: root executor v7 (service repoexec + seclabel + 4 triggers) verified")
         if key_line:
             assert ADB_KEYSEED_MARKER in rc2, "keyseed marker vanished"
             assert "copy /adbkey.pub /data/misc/adb/adb_keys" in rc2
