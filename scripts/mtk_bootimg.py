@@ -499,6 +499,31 @@ on property:sys.usb.config=mtp
     write /sys/class/android_usb/android0/enable 1
 """
 
+# On-device evidence (2026-10-30): with ONLY the patch above, the host saw
+# `device unauthorized`.  adbd + gadget came up (so the rc keepalive works),
+# but /system/build.prop's ro.adb.secure=1 overrides the default.prop flip
+# (build.prop is loaded later; ro props are first-set-wins), and the on-screen
+# confirmation dialog can never be answered while bootanim loops.  The fix
+# that does NOT depend on any ro prop: seed the operator's host public key
+# into /data/misc/adb/adb_keys from init (rc builtins run in the init domain,
+# which owns /data setup), then restorecon so the file carries
+# u:object_r:adb_data_file:s0 and adbd is permitted to read it.  adbd treats
+# a key found in adb_keys as pre-authorized -- no dialog needed.
+ADB_KEY_FILE = "adbkey.pub"   # seeded at the ramdisk root as /adbkey.pub
+ADB_KEYSEED_MARKER = "### repo-debug-boot adb key seeding ###"
+ADB_KEYSEED_RC = """
+# ### repo-debug-boot adb key seeding ###
+# Pre-authorize the operator's adb host key (notes: ADB_KEYSEED_MARKER in
+# scripts/mtk_bootimg.py).  copy overwrites adb_keys with exactly this key --
+# acceptable on a forensics image; runs on every boot (idempotent).
+on post-fs-data
+    mkdir /data/misc/adb 0770 system shell
+    copy /adbkey.pub /data/misc/adb/adb_keys
+    chown system shell /data/misc/adb/adb_keys
+    chmod 0640 /data/misc/adb/adb_keys
+    restorecon /data/misc/adb/adb_keys
+"""
+
 
 def edit_default_props(text: str, props: Dict[str, str]) -> Tuple[str, int]:
     """Set/replace `key=value` lines in default.prop text.
@@ -541,6 +566,18 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
     assert "default.prop" in names, "ramdisk has no default.prop"
     assert args.rc_file in names, f"ramdisk has no {args.rc_file}"
 
+    key_line = ""
+    if getattr(args, "adb_pubkey_file", ""):
+        import re
+        raw = open(args.adb_pubkey_file, "r", encoding="utf-8").read().strip()
+        assert raw and "\n" not in raw, "pubkey file must hold ONE line"
+        tok = raw.split()[0]
+        assert re.fullmatch(r"[A-Za-z0-9+/=]{100,}", tok), \
+            "pubkey does not look like an adbkey.pub base64 blob"
+        key_line = raw
+        log(f"adb pubkey: blob {len(tok)} chars, "
+            f"comment {raw[len(tok):].strip() or '-'!r}")
+
     with _workdir() as td:
         rd = os.path.join(td, "rd")
         extract_ramdisk(ramdisk_gz, rd)
@@ -556,10 +593,18 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
         rcp = os.path.join(rd, args.rc_file)
         rct = _sudo_read(rcp).decode("utf-8", "surrogateescape")
         assert ADB_RC_MARKER not in rct, "rc file already patched"
-        _sudo_write(rcp, (rct.rstrip("\n") + "\n" + ADB_RC_PATCH)
+        patch = ADB_RC_PATCH + (ADB_KEYSEED_RC if key_line else "")
+        _sudo_write(rcp, (rct.rstrip("\n") + "\n" + patch)
                     .encode("utf-8", "surrogateescape"))
         log(f"{args.rc_file}: appended adb keepalive "
-            f"(on-boot config + mtp->mtp,adb gadget force)")
+            f"(on-boot config + mtp->mtp,adb gadget force)"
+            + (" + adb_keys seeding" if key_line else ""))
+        # 3) the operator's host pubkey at the ramdisk root
+        if key_line:
+            kp = os.path.join(rd, ADB_KEY_FILE)
+            _sudo_write(kp, (key_line + "\n").encode("utf-8"))
+            _run(_sudo() + ["chmod", "0644", kp])
+            log(f"/{ADB_KEY_FILE}: seeded ({len(key_line)} chars)")
         restore_mtimes(rd, idx)
         new_ramdisk = repack_ramdisk(rd)
 
@@ -578,7 +623,8 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
     assert bytes(h2["kernel"]) == kernel, "kernel changed in rebuild"
     assert h2["page_size"] == h["page_size"], "page size changed"
     idx2 = parse_cpio_index(bytes(h2["ramdisk"]))                # type: ignore
-    assert {n for n, _ in idx2} == names, "ramdisk file list changed"
+    expect_names = names | ({ADB_KEY_FILE} if key_line else set())
+    assert {n for n, _ in idx2} == expect_names, "ramdisk file list changed"
     with _workdir() as td:
         rd = os.path.join(td, "rd2")
         extract_ramdisk(bytes(h2["ramdisk"]), rd)                # type: ignore
@@ -593,6 +639,14 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
             .decode("utf-8", "surrogateescape")
         assert ADB_RC_MARKER in rc2, "rc marker vanished"
         assert "functions mtp,adb" in rc2 and "start adbd" in rc2, "rc patch broken"
+        if key_line:
+            assert ADB_KEYSEED_MARKER in rc2, "keyseed marker vanished"
+            assert "copy /adbkey.pub /data/misc/adb/adb_keys" in rc2
+            assert "restorecon /data/misc/adb/adb_keys" in rc2
+            kp2 = _sudo_read(os.path.join(rd, ADB_KEY_FILE)) \
+                .decode("utf-8").strip()
+            assert kp2 == key_line, "seeded pubkey content mismatch"
+            log("self-check: /adbkey.pub + keyseed rc verified in rebuilt ramdisk")
         if not args.no_sign:
             assert check_tail_parses(tail), "signature tail not valid DER"
     with open(args.out, "wb") as f:
@@ -646,6 +700,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help=f"ramdisk usb rc to patch (default: {ADB_RC_FILE})")
     a.add_argument("--assert-kernel-md5", default="",
                    help="abort unless the kernel md5 equals this hex string")
+    a.add_argument("--adb-pubkey-file", default="",
+                   help="one-line adbkey.pub to seed into "
+                        "/data/misc/adb/adb_keys at boot (pre-authorizes that "
+                        "host with no on-screen dialog)")
     a.set_defaults(fn=cmd_adb_enable)
 
     args = ap.parse_args(argv)

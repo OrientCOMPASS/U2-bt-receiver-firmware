@@ -34,6 +34,10 @@ on:
         description: 'Publish the GitHub release when every check passes'
         type: boolean
         default: true
+      adb_pubkey:
+        description: 'One-line adbkey.pub to pre-authorize (empty = skip seeding)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -43,6 +47,7 @@ env:
   BASE_TAG: ${{ inputs.base_tag }}
   BASE_ASSET: ${{ inputs.base_asset }}
   FW_TAG_IN: ${{ inputs.fw_tag }}
+  ADB_PUBKEY: ${{ inputs.adb_pubkey }}
 
 jobs:
   debugboot:
@@ -128,11 +133,18 @@ jobs:
         run: |
           set -euo pipefail
           P="$RUNNER_TEMP/probe"
+          KEYARG=()
+          if [ -n "${ADB_PUBKEY:-}" ]; then
+            printf '%s\n' "$ADB_PUBKEY" > "$RUNNER_TEMP/adbkey.pub"
+            wc -c "$RUNNER_TEMP/adbkey.pub"
+            KEYARG=(--adb-pubkey-file "$RUNNER_TEMP/adbkey.pub")
+          fi
           python3 scripts/mtk_bootimg.py adb-enable \
             "$P/boot_stock.img" "$P/boot_debug.img" \
             --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
             --x509 "$RUNNER_TEMP/keys/testkey.x509.pem" \
-            --assert-kernel-md5 "$KERNEL_MD5"
+            --assert-kernel-md5 "$KERNEL_MD5" \
+            "${KEYARG[@]}"
           ls -l "$P/boot_stock.img" "$P/boot_debug.img"
 
       - name: Independent validation (kernel identical, diffs minimal, tail valid)
@@ -154,8 +166,12 @@ jobs:
           print(f"[check] kernel md5 {kmd5} (stock, byte-identical)")
           ns = {n for n, _ in mb.parse_cpio_index(bytes(hs["ramdisk"]))}
           nd = {n for n, _ in mb.parse_cpio_index(bytes(hd["ramdisk"]))}
-          assert ns == nd, f"ramdisk file list changed: {ns ^ nd}"
-          print(f"[check] ramdisk file list identical ({len(nd)} entries)")
+          seeded = bool(os.environ.get("ADB_PUBKEY", "").strip())
+          allowed_extra = {mb.ADB_KEY_FILE} if seeded else set()
+          assert ns <= nd and (nd - ns) <= allowed_extra, \
+              f"ramdisk file list changed: {ns ^ nd}"
+          print(f"[check] ramdisk file list = stock + {sorted(nd - ns)} "
+                f"({len(nd)} entries)")
           rs = os.path.join(P, "rd_stock"); rd_ = os.path.join(P, "rd_debug")
           mb.extract_ramdisk(bytes(hs["ramdisk"]), rs)
           mb.extract_ramdisk(bytes(hd["ramdisk"]), rd_)
@@ -181,6 +197,12 @@ jobs:
               assert rcd.startswith(rcs.rstrip("\n")), "rc change is not append-only"
               assert mb.ADB_RC_MARKER in rcd and "start adbd" in rcd and "functions mtp,adb" in rcd
               print(f"[check] {mb.ADB_RC_FILE}: keepalive appended after stock content")
+              if seeded:
+                  assert mb.ADB_KEYSEED_MARKER in rcd, "keyseed rc missing"
+                  assert "copy /adbkey.pub /data/misc/adb/adb_keys" in rcd
+                  kk = rd(rd_, mb.ADB_KEY_FILE).strip()
+                  assert kk == os.environ["ADB_PUBKEY"].strip(), "seeded key mismatch"
+                  print("[check] adb_keys seeding: rc block + /adbkey.pub verified")
               # every other ramdisk file byte-identical
               others = 0
               for name in sorted(nd):
@@ -219,6 +241,10 @@ jobs:
               ro.secure=1 -> 0         persist.sys.usb.config=mtp -> mtp,adb
               init.mt6735.usb.rc: appended an adbd keepalive trigger, so adb
               comes up from init even if system_server never finishes booting.
+              init.mt6735.usb.rc: ALSO seeds the operator's adb host public
+              key into /data/misc/adb/adb_keys on every boot -- the host is
+              PRE-AUTHORIZED, no on-screen confirmation dialog is needed
+              (build.prop's ro.adb.secure=1 survives; the key makes it moot).
           - Kernel bytes are md5-asserted identical to stock.
           - /system is NOT touched: flash this ALONE and the current system
             (and its hang) stays exactly as-is -- with adb available.
@@ -247,7 +273,8 @@ jobs:
           3. Send back logcat.txt + props.txt + dmesg.txt + ps.txt.
              If logcat.txt is huge, the tail (last ~2000 lines) is enough:
              it repeats on every crash-loop cycle.
-          - "unauthorized": shouldn't happen (ro.adb.secure=0); re-plug once.
+          - "unauthorized": shouldn't happen (your host key is pre-seeded
+             into adb_keys at boot).  If it does: adb kill-server, re-plug.
           - No serial at all: install the Google USB driver (or the MTK
             driver pack) and retry; try another cable/port (data-capable!).
 
