@@ -1,0 +1,258 @@
+name: fw-imgdiff
+
+# Block-level + metadata-level diff of system.img between two releases.
+# Purpose: prove or disprove that the btswap in-place edit (loop-mount +
+# cat > bluetooth.default.so) damaged ANY OTHER file in the image, which would
+# explain a pre-adbd boot hang with a perfectly clean dlopen matrix.
+#   1) zip-entry CRC comparison across the two release zips
+#   2) sparse2raw both system.img; 4K-block diff; every differing block mapped
+#      back to a file path via debugfs icheck/ncheck on BOTH images
+#   3) ro-mount both (noload), full find-metadata sweep (mode/owner/size/mtime)
+#   4) dumpe2fs superblock comparison
+# Verdict CLEAN iff differing blocks map only to bluetooth.default.so, FS
+# metadata/journal/unallocated space, and the find sweep differs only there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_a:
+        description: "reference release tag (A)"
+        default: "firmware-debloat-v1-20261030"
+      asset_a:
+        description: "reference zip asset (A)"
+        default: "U2_7.0_debloat_v1.zip"
+      tag_b:
+        description: "release under test (B)"
+        default: "firmware-btswap-v1-20261030"
+      asset_b:
+        description: "zip asset under test (B)"
+        default: "U2_7.0_bt_sink_v1.zip"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  imgdiff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TAG_A: ${{ inputs.tag_a }}
+      ASSET_A: ${{ inputs.asset_a }}
+      TAG_B: ${{ inputs.tag_b }}
+      ASSET_B: ${{ inputs.asset_b }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs attr unzip > /dev/null
+          which debugfs dumpe2fs unzip
+
+      - name: Download both zips
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/work"; mkdir -p "$W"
+          echo "W=$W" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          W = os.path.join(os.environ["RUNNER_TEMP"], "work")
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          def get(tag, asset, dest):
+              r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+                  headers={"Accept": "application/vnd.github+json",
+                           "User-Agent": "fw-imgdiff",
+                           "Authorization": f"Bearer {tok}"})
+              rel = json.loads(urllib.request.urlopen(r).read())
+              url = next(a["browser_download_url"] for a in rel["assets"]
+                         if a["name"] == asset)
+              with urllib.request.urlopen(urllib.request.Request(
+                      url, headers={"User-Agent": "fw-imgdiff"})) as src, \
+                   open(dest, "wb") as out:
+                  while True:
+                      b = src.read(1 << 22)
+                      if not b:
+                          break
+                      out.write(b)
+              print(dest, os.path.getsize(dest), "bytes")
+          get(os.environ["TAG_A"], os.environ["ASSET_A"], f"{W}/a.zip")
+          get(os.environ["TAG_B"], os.environ["ASSET_B"], f"{W}/b.zip")
+          PY
+          df -h "$RUNNER_TEMP" | tail -1
+
+      - name: Zip-entry CRC comparison
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "$W/crc_compare.txt"
+          import os, zipfile
+          W = os.environ["W"]
+          za = zipfile.ZipFile(f"{W}/a.zip"); zb = zipfile.ZipFile(f"{W}/b.zip")
+          ia = {i.filename: (i.CRC, i.file_size) for i in za.infolist()}
+          ib = {i.filename: (i.CRC, i.file_size) for i in zb.infolist()}
+          only_a = sorted(set(ia) - set(ib)); only_b = sorted(set(ib) - set(ia))
+          diff = sorted(k for k in set(ia) & set(ib) if ia[k] != ib[k])
+          print(f"entries: A={len(ia)} B={len(ib)} "
+                f"identical={len(set(ia) & set(ib)) - len(diff)}")
+          print("only in A:", only_a or "-")
+          print("only in B:", only_b or "-")
+          print("CRC/size differ:")
+          for k in diff:
+              print(f"  {k}  A={ia[k]}  B={ib[k]}")
+          PY
+
+      - name: Extract system.img from both zips + sparse2raw
+        run: |
+          set -euo pipefail
+          for s in a b; do
+            unzip -oq "$W/$s.zip" -d "$W/x$s"
+            SP="$(find "$W/x$s" -name system.img | head -1)"
+            test -n "$SP"
+            ls -l "$SP"
+            python3 scripts/mtk_sparse2raw.py "$SP" "$W/$s.raw" -q
+            rm -rf "$W/$s.zip" "$W/x$s"
+            ls -l "$W/$s.raw"
+            df -h "$RUNNER_TEMP" | tail -1
+          done
+
+      - name: 4K block diff + map differing blocks to files (debugfs)
+        run: |
+          set -uo pipefail
+          python3 - <<'PY' | tee "$W/blockdiff.txt"
+          import json, os, subprocess
+          W = os.environ["W"]; BLK = 4096
+          sa = os.path.getsize(f"{W}/a.raw"); sb = os.path.getsize(f"{W}/b.raw")
+          print(f"sizes: A={sa} B={sb}")
+          fa = open(f"{W}/a.raw", "rb"); fb = open(f"{W}/b.raw", "rb")
+          regions = []; cur = None; off = 0; nb = 0
+          n = min(sa, sb); CH = 1 << 23
+          while off < n:
+              sz = min(CH, n - off)
+              a = fa.read(sz); b = fb.read(sz)
+              if a != b:
+                  for i in range(0, len(a), BLK):
+                      if a[i:i+BLK] != b[i:i+BLK]:
+                          nb += 1; s = off + i; e = s + BLK
+                          if cur and s - cur[1] <= 65536: cur[1] = e
+                          else:
+                              cur = [s, e]; regions.append(cur)
+              off += sz
+          print(f"differing 4K blocks: {nb}   merged regions: {len(regions)}")
+          for r in regions[:60]:
+              print(f"  region {r[0]}..{r[1]}  len={r[1]-r[0]}")
+          json.dump(regions, open(f"{W}/regions.json", "w"))
+          blks = sorted({x for s, e in regions for x in range(s//BLK, (e-1)//BLK+1)})
+          print(f"distinct differing block numbers: {len(blks)}")
+          def sh(args):
+              return subprocess.run(args, capture_output=True, text=True).stdout
+          for side, img in (("A", f"{W}/a.raw"), ("B", f"{W}/b.raw")):
+              imap = {}
+              for i in range(0, len(blks), 256):
+                  out = sh(["debugfs", "-R",
+                            "icheck " + " ".join(map(str, blks[i:i+256])), img])
+                  for line in out.splitlines():
+                      p = line.split()
+                      if len(p) >= 2 and p[0].isdigit():
+                          imap[int(p[0])] = p[1]
+              inodes = sorted({v for v in imap.values()
+                               if v.isdigit() and 11 < int(v)})
+              pmap = {}
+              for i in range(0, len(inodes), 256):
+                  out = sh(["debugfs", "-R",
+                            "ncheck " + " ".join(inodes[i:i+256]), img])
+                  for line in out.splitlines():
+                      p = line.split("\t")
+                      if len(p) >= 2 and p[0].strip().isdigit():
+                          pmap[p[0].strip()] = p[1].strip()
+              agg = {}
+              for blk in blks:
+                  ino = imap.get(blk)
+                  if ino is None or not ino.isdigit() or int(ino) == 0:
+                      key = "<metadata/unallocated>"
+                  elif int(ino) == 8:
+                      key = "<journal:inode8>"
+                  elif int(ino) < 12:
+                      key = f"<reserved-inode:{ino}>"
+                  else:
+                      key = pmap.get(ino, f"<inode:{ino}:no-path(deleted?)>")
+                  agg[key] = agg.get(key, 0) + 1
+              print(f"--- image {side}: differing-block mapping ---")
+              for k, v in sorted(agg.items(), key=lambda kv: -kv[1]):
+                  print(f"  {v:6d} blocks  {k}")
+              json.dump(agg, open(f"{W}/map_{side}.json", "w"), indent=1)
+          PY
+
+      - name: Metadata sweep (ro-mount noload) + superblock compare
+        run: |
+          set -uo pipefail
+          for s in a b; do
+            dumpe2fs -h "$W/$s.raw" > "$W/dumpe2fs_$s.txt" 2>/dev/null || true
+          done
+          diff "$W/dumpe2fs_a.txt" "$W/dumpe2fs_b.txt" > "$W/dumpe2fs_diff.txt" || true
+          echo "===== dumpe2fs diff ====="; cat "$W/dumpe2fs_diff.txt"
+          for s in a b; do
+            sudo mkdir -p "/mnt/img$s"
+            sudo mount -o loop,ro,noload "$W/$s.raw" "/mnt/img$s"
+            (cd "/mnt/img$s" && sudo find . -xdev -printf '%p|%m|%U|%G|%s|%T@\n' | sort) \
+              > "$W/find_$s.txt"
+            sudo umount "/mnt/img$s"
+          done
+          wc -l "$W/find_a.txt" "$W/find_b.txt"
+          diff "$W/find_a.txt" "$W/find_b.txt" > "$W/find_diff.txt" || true
+          echo "===== find metadata diff ====="; cat "$W/find_diff.txt"
+
+      - name: Verdict + artifact
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 - <<'PY' | tee "$W/VERDICT.txt"
+          import json, os
+          W = os.environ["W"]
+          ok = True
+          for side in ("A", "B"):
+              p = f"{W}/map_{side.lower()}.json"
+              if not os.path.exists(p):
+                  print(f"image {side}: NO MAPPING (blockdiff step failed?)")
+                  ok = False; continue
+              agg = json.load(open(p))
+              for k in agg:
+                  allowed = (k.endswith("bluetooth.default.so")
+                             or k.startswith("<metadata/unallocated>")
+                             or k.startswith("<journal:")
+                             or k.startswith("<reserved-inode:"))
+                  if not allowed:
+                      print(f"image {side}: UNEXPECTED differing-block owner: "
+                            f"{k} ({agg[k]} blocks)")
+                      ok = False
+          fd = f"{W}/find_diff.txt"
+          if os.path.exists(fd):
+              bad = [l for l in open(fd)
+                     if l[:1] in "<>" and "bluetooth.default.so" not in l]
+              for l in bad[:40]:
+                  print("metadata sweep UNEXPECTED:", l.rstrip())
+              if bad: ok = False
+          print()
+          print("VERDICT: CLEAN -- only bluetooth.default.so (+FS metadata/"
+                "journal) differs between A and B" if ok else
+                "VERDICT: CONTAMINATED -- files beyond the BT .so differ; "
+                "see listings above")
+          PY
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-imgdiff-report
+          path: |
+            ${{ runner.temp }}/work/crc_compare.txt
+            ${{ runner.temp }}/work/blockdiff.txt
+            ${{ runner.temp }}/work/regions.json
+            ${{ runner.temp }}/work/map_a.json
+            ${{ runner.temp }}/work/map_b.json
+            ${{ runner.temp }}/work/dumpe2fs_diff.txt
+            ${{ runner.temp }}/work/find_diff.txt
+            ${{ runner.temp }}/work/VERDICT.txt
+          if-no-files-found: warn
