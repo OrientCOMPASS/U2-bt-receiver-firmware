@@ -1,0 +1,402 @@
+# fw-debugsys.yml -- DEBUG SYSTEM package: adb root without authorization.
+#
+# Why this exists (on-device evidence, 2026-10-30):
+#   * debug boot v1/v2 brought adbd + the adb gadget up on the hanging device
+#     (host saw the interface), but the host got `device unauthorized`:
+#       - /system/build.prop's ro.adb.secure=1 OVERRIDES the ramdisk
+#         default.prop flip (build.prop is the authoritative source here);
+#       - the on-screen confirm dialog can never be answered (bootanim loop);
+#       - seeding /data/misc/adb/adb_keys from init rc (debug boot v2) did not
+#         authorize the host either -- most likely sepolicy blocks the init
+#         domain from creating adb_data_file (silent avc denial, no adb to
+#         read kmsg).
+#   * Fix at the authoritative source: flip the three gate props INSIDE
+#     /system/build.prop (ro.adb.secure=0, ro.secure=0, ro.debuggable=1).
+#     All three flips are same-byte-length -> the file is rewritten in place
+#     (same inode, mode, owner, security.selinux xattr, size).
+#   * The package also swaps in the debug boot v2 image (adbd keepalive rc),
+#     so the user can flash the WHOLE package with their proven habit
+#     (Download Only, all partitions) and still get the adb gadget.
+#
+# Base: firmware-btswap-v1-20261030 (v1 lineage = sparse-flash-proven on the
+# user host; carries the swapped BT stack -- the hang we are diagnosing).
+# system.img stays SPARSE (raw encoding is user-banned since 2026-10-29).
+# --------------------------------------------------------------------------- #
+name: fw-debugsys
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkg_name:
+        description: 'Package (folder/zip base) name'
+        default: 'U2_7.0_bt_sink_v1_debugsys'
+        required: true
+      fw_tag:
+        description: 'Release tag (empty = auto: firmware-debugsys-<date>)'
+        required: false
+        default: ''
+      base_tag:
+        description: 'Base firmware release tag (system donor)'
+        default: 'firmware-btswap-v1-20261030'
+        required: true
+      base_asset:
+        description: 'Base zip asset name in that release'
+        default: 'U2_7.0_bt_sink_v1.zip'
+        required: true
+      debugboot_tag:
+        description: 'Release tag carrying the debug boot image (adbd keepalive)'
+        default: 'firmware-debugboot-v2-20261030'
+        required: true
+      debugboot_asset:
+        description: 'Debug boot asset name in that release'
+        default: 'boot_debug.img'
+        required: true
+      publish:
+        description: 'Publish the GitHub release when every check passes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SYSTEM_PARTITION_BYTES: '3095396352'
+  BT_SO_MD5: c561b6128e9293bde3280f7aca3d5b17
+  PKG: ${{ inputs.pkg_name }}
+  FW_TAG_IN: ${{ inputs.fw_tag }}
+  BASE_TAG: ${{ inputs.base_tag }}
+  BASE_ASSET: ${{ inputs.base_asset }}
+  DBGBOOT_TAG: ${{ inputs.debugboot_tag }}
+  DBGBOOT_ASSET: ${{ inputs.debugboot_asset }}
+
+jobs:
+  debugsys:
+    name: flip build.prop adb gates + debug boot + repack + validate + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils attr e2fsprogs binutils
+          df -h "$RUNNER_TEMP" /
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Download base package + debug boot image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          T = os.environ["RUNNER_TEMP"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          def get(tag, asset, dest):
+              r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+                  headers={"Accept": "application/vnd.github+json",
+                           "User-Agent": "fw-debugsys",
+                           "Authorization": f"Bearer {tok}"})
+              rel = json.loads(urllib.request.urlopen(r).read())
+              url = next(a["browser_download_url"] for a in rel["assets"]
+                         if a["name"] == asset)
+              with urllib.request.urlopen(urllib.request.Request(
+                      url, headers={"User-Agent": "fw-debugsys"})) as src, \
+                   open(dest, "wb") as out:
+                  while True:
+                      b = src.read(1 << 22)
+                      if not b:
+                          break
+                      out.write(b)
+              print(dest, os.path.getsize(dest), "bytes")
+          get(os.environ["BASE_TAG"], os.environ["BASE_ASSET"], f"{T}/base.zip")
+          get(os.environ["DBGBOOT_TAG"], os.environ["DBGBOOT_ASSET"],
+              f"{T}/boot_debug.img")
+          PY
+          md5sum "$RUNNER_TEMP/base.zip" "$RUNNER_TEMP/boot_debug.img" \
+            | tee "$RUNNER_TEMP/probe_md5_raw.txt"
+
+      - name: Unzip base + passthrough manifest (all except system.img, boot.img)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; mkdir -p "$P"; W="$RUNNER_TEMP/pkgwork"
+          rm -rf "$W"; mkdir -p "$W"
+          unzip -oq "$RUNNER_TEMP/base.zip" -d "$W"
+          BASEDIR="$(find "$W" -maxdepth 1 -mindepth 1 -type d | head -1)"
+          test -n "$BASEDIR"
+          echo "BASEDIR=$BASEDIR" | tee -a "$GITHUB_ENV"
+          (cd "$BASEDIR" && find . -type f ! -name system.img ! -name boot.img \
+            -print0 | sort -z | xargs -0 md5sum) > "$P/base_manifest.md5"
+          wc -l "$P/base_manifest.md5"
+          md5sum "$RUNNER_TEMP/boot_debug.img" | awk '{print $1}' > "$P/boot_debug_md5.txt"
+          rm -f "$RUNNER_TEMP/base.zip"
+
+      - name: system.img sparse->raw, mount rw
+        run: |
+          set -euo pipefail
+          python3 scripts/mtk_sparse2raw.py "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img" -q 2>/dev/null \
+            || simg2img "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img"
+          test "$(stat -c %s "$RUNNER_TEMP/system.raw.img")" = "$SYSTEM_PARTITION_BYTES"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,rw "$RUNNER_TEMP/system.raw.img" /mnt/sys
+          df -h /mnt/sys
+
+      - name: Flip the three adb gate props in /system/build.prop (in place)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sudo ls -lni /mnt/sys/build.prop | tee "$P/prop_ls_before.txt"
+          sudo getfattr -n security.selinux --only-values /mnt/sys/build.prop \
+            2>/dev/null | tee "$P/prop_selinux_before.txt" || true
+          echo
+          sudo grep -nE '^(ro\.adb\.secure|ro\.secure|ro\.debuggable)=' \
+            /mnt/sys/build.prop | tee "$P/prop_before.txt"
+          sudo python3 - <<'PY'
+          import os
+          p = "/mnt/sys/build.prop"
+          data = open(p, "rb").read()
+          text = data.decode("utf-8", "surrogateescape")
+          flips = {"ro.adb.secure": ("1", "0"),
+                   "ro.secure": ("1", "0"),
+                   "ro.debuggable": ("0", "1")}
+          seen = {k: 0 for k in flips}
+          out = []
+          for line in text.splitlines(keepends=True):
+              s = line.rstrip("\r\n")
+              if s and not s.lstrip().startswith("#") and "=" in s:
+                  k, v = s.split("=", 1)
+                  if k in flips:
+                      assert v == flips[k][0], f"{k}={v!r} -- unexpected stock value"
+                      line = f"{k}={flips[k][1]}" + line[len(s):]
+                      seen[k] += 1
+              out.append(line)
+          new = "".join(out)
+          assert all(v == 1 for v in seen.values()), f"prop occurrences: {seen}"
+          assert len(new.encode()) == len(data), "byte length changed"
+          with open(p, "r+b") as f:          # same inode: mode/owner/xattr kept
+              f.write(new.encode("utf-8", "surrogateescape"))
+              f.truncate(len(data))
+              f.flush(); os.fsync(f.fileno())
+          print("build.prop flipped (in place, size identical):", seen)
+          PY
+          sync
+          sudo grep -nE '^(ro\.adb\.secure|ro\.secure|ro\.debuggable)=' \
+            /mnt/sys/build.prop | tee "$P/prop_after.txt"
+          sudo ls -lni /mnt/sys/build.prop | tee "$P/prop_ls_after.txt"
+          diff <(awk '{print $1, $3, $4, $5}' "$P/prop_ls_before.txt") \
+               <(awk '{print $1, $3, $4, $5}' "$P/prop_ls_after.txt")
+          sudo getfattr -n security.selinux --only-values /mnt/sys/build.prop \
+            2>/dev/null | tee "$P/prop_selinux_after.txt" || true
+          echo
+          if [ -s "$P/prop_selinux_before.txt" ]; then
+            cmp "$P/prop_selinux_before.txt" "$P/prop_selinux_after.txt"
+            echo "selinux xattr preserved: $(cat "$P/prop_selinux_after.txt")"
+          fi
+          # sanity: the swapped BT stack is still the one we shipped
+          sudo md5sum /mnt/sys/lib/hw/bluetooth.default.so | awk '{print $1}' \
+            > "$P/bt_md5_mid.txt"
+          test "$(cat "$P/bt_md5_mid.txt")" = "$BT_SO_MD5"
+          echo "[check] BT stack .so intact ($BT_SO_MD5)"
+
+      - name: Zero-fill free space (stale blocks must not ship)
+        run: |
+          set -uo pipefail
+          sudo dd if=/dev/zero of=/mnt/sys/.zerofill bs=1M status=none || true
+          sync
+          AVAIL_KB=$(df --output=avail -k /mnt/sys | tail -1 | tr -d ' ')
+          echo "avail after fill: ${AVAIL_KB} KiB"
+          if [ "$AVAIL_KB" -gt 65536 ]; then
+            echo "FATAL: zero-fill did not consume the free space"; exit 1
+          fi
+          sudo rm -f /mnt/sys/.zerofill
+          sync
+
+      - name: Unmount, e2fsck, re-sparsify, size guard
+        run: |
+          set -euo pipefail
+          sync
+          sudo umount /mnt/sys
+          rc=0; sudo e2fsck -fy "$RUNNER_TEMP/system.raw.img" || rc=$?
+          echo "e2fsck -fy rc=$rc (<=3 means clean or fixed)"
+          test "$rc" -le 3
+          sudo e2fsck -fn "$RUNNER_TEMP/system.raw.img"
+          img2simg "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img" 4096
+          SZ=$(stat -c %s "$RUNNER_TEMP/system.sparse.img")
+          echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
+          test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
+          if [ "$SZ" -gt 2000000000 ]; then
+            echo "FATAL: sparse system.img is $SZ bytes -- free space not zeroed?"; exit 1
+          fi
+
+      - name: Assemble the flash package (base parts + patched system + debug boot)
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/system.sparse.img" "$BASEDIR/system.img"
+          rm -f "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img"
+          cp "$RUNNER_TEMP/boot_debug.img" "$BASEDIR/boot.img"
+          NEWPKG="$RUNNER_TEMP/$PKG"
+          rm -rf "$NEWPKG"
+          mv "$BASEDIR" "$NEWPKG"
+          echo "NEWPKG=$NEWPKG" >> "$GITHUB_ENV"
+          (cd "$NEWPKG" && for f in *; do
+             [ "$f" = MD5SUMS.txt ] || md5sum "$f"; done > MD5SUMS.txt)
+          cat "$NEWPKG/MD5SUMS.txt"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import repack_firmware as rf
+          pkg = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"])
+          out = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"] + ".zip")
+          n = rf.zip_package(pkg, out)
+          print(f"[debugsys] package zip: {n} bytes -> {out}")
+          PY
+          ls -l "$RUNNER_TEMP/$PKG.zip"
+          df -h "$RUNNER_TEMP"
+
+      - name: Validate the final package end to end
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; CHK="$RUNNER_TEMP/chk"
+          rm -rf "$CHK"; mkdir -p "$CHK"
+          (cd "$CHK" && unzip -oq "$RUNNER_TEMP/$PKG.zip")
+          SCAT="$(find "$CHK/$PKG" -name '*_scatter.txt' | head -1)"
+          python3 scripts/mtk_scatter.py validate "$SCAT" "$CHK/$PKG" | tee "$P/scatter_validate.txt"
+          # passthrough: everything except system.img/boot.img byte-identical
+          (cd "$CHK/$PKG" && find . -type f ! -name system.img ! -name boot.img \
+            ! -name MD5SUMS.txt -print0 | sort -z | xargs -0 md5sum) > "$P/final_manifest.md5"
+          diff "$P/base_manifest.md5" "$P/final_manifest.md5"
+          echo "[verify] all $(wc -l < "$P/final_manifest.md5") passthrough entries byte-identical"
+          # boot.img == the published debug boot v2 image
+          md5sum "$CHK/$PKG/boot.img" | awk '{print $1}' > "$P/final_boot_md5.txt"
+          cmp "$P/final_boot_md5.txt" "$P/boot_debug_md5.txt"
+          echo "[verify] boot.img == debug boot v2 ($(cat "$P/final_boot_md5.txt"))"
+          # system round-trip
+          python3 scripts/mtk_sparse2raw.py "$CHK/$PKG/system.img" "$CHK/system.raw.img" -q 2>/dev/null \
+            || simg2img "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+          rm -f "$CHK/$PKG/system.img"
+          sudo e2fsck -fn "$CHK/system.raw.img"
+          sudo mkdir -p /mnt/chk
+          sudo mount -o loop,ro "$CHK/system.raw.img" /mnt/chk
+          sudo grep -E '^(ro\.adb\.secure|ro\.secure|ro\.debuggable)=' /mnt/chk/build.prop \
+            | tee "$P/prop_final.txt"
+          grep -qx 'ro.adb.secure=0' "$P/prop_final.txt"
+          grep -qx 'ro.secure=0'     "$P/prop_final.txt"
+          grep -qx 'ro.debuggable=1' "$P/prop_final.txt"
+          echo "[verify] in-package build.prop: all three adb gates flipped"
+          sudo getfattr -n security.selinux --only-values /mnt/chk/build.prop \
+            2>/dev/null > "$P/prop_selinux_final.txt" || true
+          if [ -s "$P/prop_selinux_before.txt" ]; then
+            cmp "$P/prop_selinux_before.txt" "$P/prop_selinux_final.txt"
+            echo "[verify] build.prop selinux context preserved: $(cat "$P/prop_selinux_final.txt")"
+          fi
+          sudo md5sum /mnt/chk/lib/hw/bluetooth.default.so | awk '{print $1}' \
+            > "$P/bt_md5_final.txt"
+          test "$(cat "$P/bt_md5_final.txt")" = "$BT_SO_MD5"
+          echo "[verify] swapped BT stack intact in the final image"
+          sudo umount /mnt/chk
+
+      - name: VERIFICATION.md
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          {
+            echo "# fw-debugsys VERIFICATION -- $(date -u +%FT%TZ)"
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Base: \`$BASE_TAG\` / \`$BASE_ASSET\` (btswap-v1: swapped BT sink stack, v1 payload)."
+            echo "Debug boot: \`$DBGBOOT_TAG\` / \`$DBGBOOT_ASSET\` (adbd keepalive + key seeding)."
+            echo
+            echo "## /system/build.prop gate flips (in place, same inode/size/xattr)"
+            echo '```'
+            cat "$P/prop_before.txt"; echo '``` -> ```'; cat "$P/prop_after.txt"
+            echo '```'
+            echo "inode/owner/mode/size before: $(cat "$P/prop_ls_before.txt")"
+            echo "inode/owner/mode/size after:  $(cat "$P/prop_ls_after.txt")"
+            echo "security.selinux: $(cat "$P/prop_selinux_after.txt" 2>/dev/null || echo n/a) (identical before/after/final)"
+            echo
+            echo "## Package checks"
+            echo "- passthrough entries byte-identical to base: $(wc -l < "$P/final_manifest.md5") files (manifest diff empty)"
+            echo "- boot.img == debug boot v2: $(cat "$P/final_boot_md5.txt")"
+            echo "- swapped BT stack .so md5 (mid + final): $(cat "$P/bt_md5_final.txt") == $BT_SO_MD5"
+            echo "- e2fsck -fn clean after rebuild; sparse system.img < 2 GB guard passed"
+            echo "- scatter validated (scripts/mtk_scatter.py)"
+            echo
+            echo "## Why (device evidence 2026-10-30)"
+            echo "debug boot v1/v2 got adbd + gadget up on the hanging device but the host"
+            echo "stayed 'device unauthorized': /system/build.prop ro.adb.secure=1 overrides"
+            echo "the ramdisk default.prop flip, the confirm dialog is unreachable (bootanim"
+            echo "loop), and init-rc adb_keys seeding was blocked (sepolicy, silent)."
+            echo "build.prop is the authoritative source -> flip it there."
+            echo
+            echo "## Flash + capture"
+            echo "SP Flash Tool -> scatter from the zip -> Download Only (all partitions OK,"
+            echo "proven habit) -> power on -> bootanim loop (expected) -> then on the PC:"
+            echo '```'
+            echo "adb kill-server"
+            echo "adb devices                # must now say: device  (NOT unauthorized)"
+            echo "adb logcat -b all -d -v threadtime > logcat.txt"
+            echo "adb shell getprop > props.txt"
+            echo "adb shell dmesg > dmesg.txt"
+            echo "adb shell ps > ps.txt"
+            echo '```'
+            echo "Send back logcat.txt (tail ~2000 lines is enough), props/dmesg/ps."
+          } > "$P/VERIFICATION.md"
+          wc -c "$P/VERIFICATION.md"
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          DATE=$(date -u +%Y%m%d)
+          FW_TAG="${FW_TAG_IN:-firmware-debugsys-$DATE}"
+          echo "FW_TAG=$FW_TAG" >> "$GITHUB_ENV"
+          NAME="U2 7.0 debug system (adb root, no auth) on btswap-v1 [$FW_TAG]"
+          {
+            echo "**DIAGNOSTIC PACKAGE -- flash this, then capture logs.**"
+            echo
+            echo "Same as \`$BASE_TAG\` (the hanging btswap-v1) EXCEPT:"
+            echo "- \`/system/build.prop\`: ro.adb.secure 1->0, ro.secure 1->0, ro.debuggable 0->1"
+            echo "  (in-place flip, inode/mode/size/SELinux xattr preserved, CI-verified);"
+            echo "- \`boot.img\` = debug boot v2 (adbd keepalive rc: the adb gadget comes up"
+            echo "  from init even though the framework never finishes booting)."
+            echo
+            echo "Result: with the device hanging at the boot animation, \`adb devices\`"
+            echo "shows **device** (no authorization dialog needed) and \`adb shell\` is root."
+            echo
+            echo "**Flash:** SP Flash Tool -> scatter from the zip -> Download Only,"
+            echo "all partitions (your proven procedure).  Never Format."
+            echo "**Capture:** \`adb logcat -b all -d -v threadtime > logcat.txt\`,"
+            echo "\`adb shell getprop > props.txt\`, \`adb shell dmesg > dmesg.txt\`,"
+            echo "\`adb shell ps > ps.txt\` -- send all four back (exact commands in"
+            echo "VERIFICATION.md)."
+            echo "**Rescue:** reflash \`$BASE_TAG\` or the official baseline."
+          } > "$RUNNER_TEMP/NOTES.md"
+          python3 scripts/publish_release.py \
+            --tag "$FW_TAG" --name "$NAME" \
+            --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
+            --files "$RUNNER_TEMP/$PKG.zip" "$P/VERIFICATION.md"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-debugsys-report
+          path: |
+            ${{ runner.temp }}/probe/
+            ${{ runner.temp }}/probe_md5_raw.txt
+          if-no-files-found: warn
