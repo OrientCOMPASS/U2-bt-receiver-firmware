@@ -540,12 +540,38 @@ ADB_AUTHKEYS_FILE = "adb_keys"   # seeded at the ramdisk root as /adb_keys
 ADB_ROOTEXEC_MARKER = "### repo-debug-boot root executor ###"
 ADB_ROOTEXEC_RC = """
 # ### repo-debug-boot root executor ###
-# Runs /data/local/tmp/rootexec.sh as root at post-fs-data (see
-# ADB_ROOTEXEC_MARKER notes in scripts/mtk_bootimg.py).  Operator-controlled,
-# idempotent, no-op when the script is absent.
+# v6: service + start.  (v5 used the `exec` builtin at post-fs-data; on this
+# MTK init it silently never ran -- no rootexec.log, no execve error -- even
+# though a same-file same-trigger `copy` (keyseed) merged-action command DID
+# run, proven by /data/misc/adb/adb_keys mtime.  Do not use `exec` here.)
+# The service/start path is proven LIVE on the device: `setprop ctl.start
+# preinstall` from adb shell (uid 2000) made init run /system/bin/preinstall.sh
+# as uid 0 under Permissive (dmesg: "Starting service 'preinstall'" +
+# transition/entrypoint avc denials with permissive=1 + "exited with status 0").
+# Triggers, all no-op when /data/local/tmp/rootexec.sh is absent:
+#   post-fs-data            -- every boot, early
+#   sys.boot_completed=1    -- fallback if the early path ever fails
+#   repo.exec=1             -- operator on-demand: adb shell setprop repo.exec 1
+#                              (re-fire: setprop repo.exec 0; setprop repo.exec 1)
+#   on boot                 -- parse/fire marker only (diagnostic ladder)
+service repoexec /system/bin/sh /data/local/tmp/rootexec.sh
+    disabled
+    oneshot
+
+on boot
+    write /dev/kmsg repo-rootexec-v6-onboot
+
 on post-fs-data
-    exec /system/bin/sh /data/local/tmp/rootexec.sh
-    write /dev/kmsg repo-rootexec-trigger-done
+    write /dev/kmsg repo-rootexec-v6-pfd
+    start repoexec
+
+on property:sys.boot_completed=1
+    write /dev/kmsg repo-rootexec-v6-bc
+    start repoexec
+
+on property:repo.exec=1
+    write /dev/kmsg repo-rootexec-v6-propexec
+    start repoexec
 """
 ADB_KEYSEED_RC = """
 # ### repo-debug-boot adb key seeding ###
@@ -700,8 +726,13 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
         assert "functions mtp,adb" in rc2 and "start adbd" in rc2, "rc patch broken"
         if getattr(args, "rootexec", False):
             assert ADB_ROOTEXEC_MARKER in rc2, "rootexec marker vanished"
-            assert "exec /system/bin/sh /data/local/tmp/rootexec.sh" in rc2
-            log("self-check: root executor rc trigger verified")
+            assert ("service repoexec /system/bin/sh "
+                    "/data/local/tmp/rootexec.sh") in rc2, "repoexec service missing"
+            assert rc2.count("start repoexec") == 3, "expected 3 start repoexec triggers"
+            assert "on property:repo.exec=1" in rc2, "on-demand trigger missing"
+            assert "\n    exec /system/bin/sh" not in rc2, \
+                "v5 exec builtin must be gone (never ran on MTK init)"
+            log("self-check: root executor v6 (service repoexec + 4 triggers) verified")
         if key_line:
             assert ADB_KEYSEED_MARKER in rc2, "keyseed marker vanished"
             assert "copy /adbkey.pub /data/misc/adb/adb_keys" in rc2
@@ -778,9 +809,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "ramdisk root as /adb_keys -- read directly by the "
                         "MTK ramdisk adbd; the reliable pre-authorization path")
     a.add_argument("--rootexec", action="store_true",
-                   help="append the root-executor rc trigger: init runs "
-                        "/data/local/tmp/rootexec.sh AS ROOT at post-fs-data "
-                        "on every boot (no-op if the script is absent)")
+                   help="append the root-executor rc block (v6): service "
+                        "repoexec + start triggers (post-fs-data, "
+                        "sys.boot_completed=1, repo.exec=1) so init runs "
+                        "/data/local/tmp/rootexec.sh AS ROOT (no-op if the "
+                        "script is absent); on-demand: setprop repo.exec 1")
     a.set_defaults(fn=cmd_adb_enable)
 
     args = ap.parse_args(argv)
