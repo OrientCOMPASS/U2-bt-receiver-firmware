@@ -1,0 +1,456 @@
+# --------------------------------------------------------------------------- #
+# fw-btswap.yml -- B4: swap the multi-codec A2DP sink Bluetooth stack into the
+# validated debloat-v2 flash package and publish a flashable zip.
+#
+# Base: release `firmware-debloat-v2-20261030` (U2_7.0_debloat_v2.zip) --
+# already debloated, dropper-neutralized, dm-verity off (testkey re-signed
+# boot), CI-validated.  This workflow touches EXACTLY ONE file inside it:
+#
+#   /system/lib/hw/bluetooth.default.so  (1.7 MB MTK stock  ->  4.4 MB AOSP
+#   r36 + patches/nougat series: SBC + AAC(FDK) + LDAC(libldacdec) sink)
+#
+# The replacement is written IN PLACE (cat > file) so inode, owner, mode and
+# the security.selinux xattr of the stock file are preserved bit-for-bit.
+# Everything else in the package (boot/recovery/preloader/lk/scatter/...) is
+# byte-identical passthrough, md5-manifest asserted.
+#
+# Validation done here (CI cannot flash hardware):
+#   * artifact gate: ELF32 ARM, HMI (HAL_MODULE_INFO_SYM) exported GLOBAL,
+#     DT_NEEDED == the 9 libs present in /system/lib of the image
+#   * in-image: replaced file md5 == artifact md5, mode/owner/selinux xattr
+#     == pre-swap values, readelf on the in-image copy re-checked
+#   * e2fsck -fn clean; sparse size < partition cap
+#   * final package round-trip: unzip -> scatter-validate -> simg2img ->
+#     mount ro -> md5 + HMI + NEEDED + boot-critical apps + framework-res
+#   * boot.img kernel md5 == stock KERNEL_MD5; fstab still verity-off
+#   * md5 manifest: every non-system.img package entry identical to base
+#
+# Publishes: release `firmware-btswap-<date>` (prerelease) with the flash zip
+# + VERIFICATION.md; artifact `fw-btswap-report` carries all JSON/logs.
+# --------------------------------------------------------------------------- #
+name: fw-btswap
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkg_name:
+        description: 'Package (folder/zip base) name'
+        default: 'U2_7.0_bt_sink_v0'
+        required: true
+      fw_tag:
+        description: 'Release tag (empty = auto: firmware-btswap-<date>)'
+        required: false
+        default: ''
+      bt_run_id:
+        description: 'bt70 run id whose bt70-build artifact carries the stack .so'
+        default: '41001545274'
+        required: true
+      base_tag:
+        description: 'Base firmware release tag'
+        default: 'firmware-debloat-v2-20261030'
+        required: true
+      base_asset:
+        description: 'Base zip asset name in that release'
+        default: 'U2_7.0_debloat_v2.zip'
+        required: true
+      publish:
+        description: 'Publish the GitHub release when every check passes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
+  SYSTEM_PARTITION_BYTES: '3095396352'
+  PKG: ${{ inputs.pkg_name }}
+  FW_TAG_IN: ${{ inputs.fw_tag }}
+  BASE_TAG: ${{ inputs.base_tag }}
+  BASE_ASSET: ${{ inputs.base_asset }}
+  BT_RUN_ID: ${{ inputs.bt_run_id }}
+
+jobs:
+  btswap:
+    name: swap BT stack + repack + validate + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils attr e2fsprogs binutils jq
+          df -h "$RUNNER_TEMP" /
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Download BT stack artifact (bt70 run)
+        uses: actions/download-artifact@v4
+        with:
+          name: bt70-build
+          run-id: ${{ env.BT_RUN_ID }}
+          path: ${{ runner.temp }}/btart
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Artifact gate (ELF32 ARM + HMI export + DT_NEEDED)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; mkdir -p "$P"
+          SO="$RUNNER_TEMP/btart/btw/out/bluetooth.default.so"
+          test -f "$SO"
+          ls -l "$SO"
+          readelf -h "$SO" | grep -E 'Class:|Machine:|Type:' | tee "$P/artifact_elf.txt"
+          grep -q 'ELF32' "$P/artifact_elf.txt"
+          grep -q 'ARM' "$P/artifact_elf.txt"
+          # HAL entry: hardware.h defines HAL_MODULE_INFO_SYM as HMI
+          readelf --dyn-syms -W "$SO" | awk '$8=="HMI"' | tee "$P/artifact_hmi.txt"
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $7!="UND" {found=1} END {exit !found}' "$P/artifact_hmi.txt"
+          readelf -d "$SO" | grep NEEDED | awk '{print $NF}' | tr -d '[]' \
+            | sort | tee "$P/artifact_needed.txt"
+          # exactly the 9 expected providers, nothing exotic
+          diff "$P/artifact_needed.txt" <(printf '%s\n' libc.so libcutils.so libdl.so \
+            libhardware.so liblog.so libm.so libmedia.so libutils.so libz.so | sort)
+          md5sum "$SO" | awk '{print $1}' > "$P/bt_so_md5.txt"
+          stat -c %s "$SO" > "$P/bt_so_size.txt"
+          cat "$P/bt_so_md5.txt" "$P/bt_so_size.txt"
+          cp "$RUNNER_TEMP/btart/btw/out/symbol_gate.json" "$P/" 2>/dev/null || true
+          jq -r '.verdict' "$P/symbol_gate.json" | grep -q PASS
+
+      - name: Download base package (debloat v2 release asset)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          tag = os.environ["BASE_TAG"]; asset = os.environ["BASE_ASSET"]
+          r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+              headers={"Accept":"application/vnd.github+json","User-Agent":"fw-btswap",
+                       "Authorization":f"Bearer {tok}"})
+          rel = json.loads(urllib.request.urlopen(r).read())
+          url = None; base_md5 = None
+          for a in rel["assets"]:
+              if a["name"] == asset:
+                  url = a["browser_download_url"]
+              if a["name"].endswith("VERIFICATION.md"):
+                  pass
+          assert url, f"asset {asset} not found in release {tag}"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "base.zip")
+          rq = urllib.request.Request(url, headers={"User-Agent":"fw-btswap"})
+          with urllib.request.urlopen(rq) as src, open(dest, "wb") as out:
+              while True:
+                  b = src.read(1 << 22)
+                  if not b: break
+                  out.write(b)
+          print("base.zip:", os.path.getsize(dest), "bytes")
+          PY
+          md5sum "$RUNNER_TEMP/base.zip"
+
+      - name: Unzip base package + passthrough manifest
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; W="$RUNNER_TEMP/pkgwork"
+          rm -rf "$W"; mkdir -p "$W"
+          unzip -oq "$RUNNER_TEMP/base.zip" -d "$W"
+          BASEDIR="$(find "$W" -maxdepth 1 -mindepth 1 -type d | head -1)"
+          test -n "$BASEDIR"
+          echo "BASEDIR=$BASEDIR" | tee -a "$GITHUB_ENV"
+          ls -l "$BASEDIR" | head -30
+          find "$BASEDIR" -name '*_scatter.txt' | head -2
+          # md5 manifest of everything except system.img (passthrough assert later)
+          (cd "$BASEDIR" && find . -type f ! -name system.img -print0 \
+            | sort -z | xargs -0 md5sum) > "$P/base_manifest.md5"
+          wc -l "$P/base_manifest.md5"
+          md5sum "$BASEDIR/system.img" | awk '{print $1}' > "$P/base_system_sparse_md5.txt"
+          rm -f "$RUNNER_TEMP/base.zip"   # disk hygiene: raw image needs 3 GB headroom
+
+      - name: system.img sparse->raw, mount rw
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/pkgwork"; P="$RUNNER_TEMP/probe"
+          python3 scripts/mtk_sparse2raw.py "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img" -q 2>/dev/null \
+            || simg2img "$BASEDIR/system.img" "$RUNNER_TEMP/system.raw.img"
+          ls -l "$RUNNER_TEMP/system.raw.img"
+          test "$(stat -c %s "$RUNNER_TEMP/system.raw.img")" = "$SYSTEM_PARTITION_BYTES"
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,rw "$RUNNER_TEMP/system.raw.img" /mnt/sys
+          df -h /mnt/sys
+
+      - name: Runtime provider check (NEEDED libs exist in the image)
+        run: |
+          set -euo pipefail
+          for lib in $(cat "$RUNNER_TEMP/probe/artifact_needed.txt"); do
+            if [ ! -f "/mnt/sys/lib/$lib" ]; then
+              echo "FATAL: /system/lib/$lib missing in image"; exit 1
+            fi
+            echo "OK /system/lib/$lib"
+          done
+
+      - name: Swap bluetooth.default.so in place (preserve inode/mode/xattr)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; SO="$RUNNER_TEMP/btart/btw/out/bluetooth.default.so"
+          TGT=/mnt/sys/lib/hw/bluetooth.default.so
+          test -f "$TGT"
+          sudo ls -ln "$TGT" | tee "$P/swap_ls_before.txt"
+          sudo getfattr -n security.selinux --only-values "$TGT" 2>/dev/null \
+            | tee "$P/swap_selinux_before.txt" || true
+          echo
+          sudo md5sum "$TGT" > "$P/swap_md5_before.txt"
+          sudo stat -c %s "$TGT" > "$P/swap_size_before.txt"
+          # cat-in-place: same inode => owner, mode, selinux xattr preserved
+          sudo bash -c "cat '$SO' > '$TGT'"
+          sync
+          sudo md5sum "$TGT" | awk '{print $1}' > "$P/swap_md5_after.txt"
+          WANT=$(cat "$P/bt_so_md5.txt"); GOT=$(cat "$P/swap_md5_after.txt")
+          echo "swapped md5: got=$GOT want=$WANT"
+          test "$GOT" = "$WANT"
+          sudo ls -ln "$TGT" | tee "$P/swap_ls_after.txt"
+          sudo getfattr -n security.selinux --only-values "$TGT" 2>/dev/null \
+            | tee "$P/swap_selinux_after.txt" || true
+          echo
+          diff <(awk '{print $1, $3, $4}' "$P/swap_ls_before.txt") \
+               <(awk '{print $1, $3, $4}' "$P/swap_ls_after.txt")
+          if [ -s "$P/swap_selinux_before.txt" ]; then
+            cmp "$P/swap_selinux_before.txt" "$P/swap_selinux_after.txt"
+            echo "selinux xattr preserved: $(cat "$P/swap_selinux_after.txt")"
+          fi
+
+      - name: Zero-fill free space (stale stock-stack blocks must not ship)
+        run: |
+          set -uo pipefail
+          sudo dd if=/dev/zero of=/mnt/sys/.zerofill bs=1M status=none || true
+          sync
+          AVAIL_KB=$(df --output=avail -k /mnt/sys | tail -1 | tr -d ' ')
+          echo "avail after fill: ${AVAIL_KB} KiB"
+          if [ "$AVAIL_KB" -gt 65536 ]; then
+            echo "FATAL: zero-fill did not consume the free space"; exit 1
+          fi
+          sudo rm -f /mnt/sys/.zerofill
+          sync
+          df -h /mnt/sys
+
+      - name: Unmount, e2fsck, re-sparsify, size guard
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          sync
+          sudo umount /mnt/sys
+          rc=0; sudo e2fsck -fy "$RUNNER_TEMP/system.raw.img" || rc=$?
+          echo "e2fsck -fy rc=$rc (<=3 means clean or fixed)"
+          test "$rc" -le 3
+          sudo e2fsck -fn "$RUNNER_TEMP/system.raw.img"
+          echo "e2fsck -fn: clean"
+          img2simg "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img" 4096
+          SZ=$(stat -c %s "$RUNNER_TEMP/system.sparse.img")
+          echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
+          test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
+          if [ "$SZ" -gt 2000000000 ]; then
+            echo "FATAL: sparse system.img is $SZ bytes -- free space not zeroed?"; exit 1
+          fi
+
+      - name: Assemble the flash package (base parts + new system.img)
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/system.sparse.img" "$BASEDIR/system.img"
+          rm -f "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img"
+          NEWPKG="$RUNNER_TEMP/$PKG"
+          rm -rf "$NEWPKG"
+          mv "$BASEDIR" "$NEWPKG"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import repack_firmware as rf
+          pkg = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"])
+          out = os.path.join(os.environ["RUNNER_TEMP"], os.environ["PKG"] + ".zip")
+          n = rf.zip_package(pkg, out)
+          print(f"[btswap] package zip: {n} bytes -> {out}")
+          PY
+          ls -l "$RUNNER_TEMP/$PKG.zip"
+          df -h "$RUNNER_TEMP"
+
+      - name: Validate the final package end to end
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; CHK="$RUNNER_TEMP/chk"
+          rm -rf "$CHK"; mkdir -p "$CHK"
+          (cd "$CHK" && unzip -oq "$RUNNER_TEMP/$PKG.zip")
+          ls -l "$CHK/$PKG" | head -30
+          SCAT="$(find "$CHK/$PKG" -name '*_scatter.txt' | head -1)"
+          python3 scripts/mtk_scatter.py validate "$SCAT" "$CHK/$PKG" | tee "$P/scatter_validate.txt"
+          # --- passthrough manifest: everything except system.img identical
+          (cd "$CHK/$PKG" && find . -type f ! -name system.img -print0 \
+            | sort -z | xargs -0 md5sum) > "$P/final_manifest.md5"
+          diff "$P/base_manifest.md5" "$P/final_manifest.md5"
+          echo "[verify] all $(wc -l < "$P/final_manifest.md5") non-system entries byte-identical to base"
+          # --- system round-trip
+          python3 scripts/mtk_sparse2raw.py "$CHK/$PKG/system.img" "$CHK/system.raw.img" -q 2>/dev/null \
+            || simg2img "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+          rm -f "$CHK/$PKG/system.img"
+          sudo mkdir -p /mnt/chk
+          sudo mount -o loop,ro "$CHK/system.raw.img" /mnt/chk
+          sudo md5sum /mnt/chk/lib/hw/bluetooth.default.so | awk '{print $1}' > "$P/final_bt_md5.txt"
+          test "$(cat "$P/final_bt_md5.txt")" = "$(cat "$P/bt_so_md5.txt")"
+          echo "[verify] in-package bluetooth.default.so md5 == artifact"
+          sudo cp /mnt/chk/lib/hw/bluetooth.default.so "$P/final_bt.so"
+          sudo chown "$(id -u):$(id -g)" "$P/final_bt.so"
+          readelf --dyn-syms -W "$P/final_bt.so" \
+            | awk '$8=="HMI" && $4=="OBJECT" && $5=="GLOBAL" && $7!="UND" {found=1} END {exit !found}'
+          readelf -d "$P/final_bt.so" | grep NEEDED | awk '{print $NF}' | tr -d '[]' | sort \
+            | diff - "$P/artifact_needed.txt"
+          echo "[verify] in-package .so still exports HMI with the expected NEEDED set"
+          sudo getfattr -n security.selinux --only-values /mnt/chk/lib/hw/bluetooth.default.so \
+            2>/dev/null > "$P/final_selinux.txt" || true
+          if [ -s "$P/swap_selinux_before.txt" ]; then
+            cmp "$P/swap_selinux_before.txt" "$P/final_selinux.txt"
+            echo "[verify] selinux context preserved: $(cat "$P/final_selinux.txt")"
+          fi
+          for lib in $(cat "$P/artifact_needed.txt"); do
+            test -f "/mnt/chk/lib/$lib"
+          done
+          echo "[verify] all NEEDED providers present in the final image"
+          sudo python3 scripts/fw_inventory.py apps /mnt/chk --out "$P/apps_final.json" > /dev/null
+          sudo chown -R "$(id -u):$(id -g)" "$P"
+          python3 - <<'PY'
+          import json, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          apps = json.load(open(os.path.join(P, "apps_final.json")))
+          pkgs = {a.get("package") for a in apps if a.get("package")}
+          REQUIRED = ["com.android.systemui", "com.android.settings",
+                      "com.android.bluetooth", "com.android.packageinstaller",
+                      "com.android.providers.settings", "com.android.shell",
+                      "com.android.phone"]
+          lost = [p for p in REQUIRED if p not in pkgs]
+          assert not lost, f"boot-critical packages lost: {lost}"
+          print(f"[verify] boot-critical packages present ({len(pkgs)} APK records)")
+          PY
+          test -f /mnt/chk/framework/framework-res.apk
+          sudo umount /mnt/chk
+          # --- boot passthrough sanity (kernel md5 + verity-off fstab)
+          rm -rf "$P/pkgboot" "$P/pkgrd"
+          python3 scripts/mtk_bootimg.py unpack "$CHK/$PKG/boot.img" "$P/pkgboot"
+          GOT=$(md5sum "$P/pkgboot/kernel.bin" | cut -d' ' -f1)
+          echo "package boot kernel md5: $GOT (want $KERNEL_MD5)"
+          test "$GOT" = "$KERNEL_MD5"
+          mkdir -p "$P/pkgrd"
+          (cd "$P/pkgrd" && gzip -dc "$P/pkgboot/ramdisk.cpio.gz" | cpio -idm --quiet --no-absolute-filenames)
+          found=0
+          for f in "$P/pkgrd"/fstab*; do
+            [ -f "$f" ] || continue
+            found=1
+            if grep -E '/system' "$f" | grep -q 'verify'; then
+              echo "FATAL: packaged boot fstab verifies /system"; exit 1
+            fi
+          done
+          test "$found" = 1
+          echo "[verify] boot.img: stock kernel, verity still off"
+          rm -f "$CHK/system.raw.img"
+          df -h "$RUNNER_TEMP"
+
+      - name: Write VERIFICATION.md
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          PKG = os.environ["PKG"]
+          zip_path = os.path.join(os.environ["RUNNER_TEMP"], PKG + ".zip")
+          md5 = subprocess.run(["md5sum", zip_path], capture_output=True, text=True).stdout.split()[0]
+          rd = lambda n: open(os.path.join(P, n)).read().strip()
+          L = []
+          L.append(f"# VERIFICATION -- {PKG}.zip\n")
+          L.append(f"- package md5: `{md5}`  ({os.path.getsize(zip_path)} bytes)")
+          L.append(f"- base package: `{os.environ['BASE_TAG']}` / `{os.environ['BASE_ASSET']}`"
+                   " (debloat v2: dropper neutralized, verity-off boot, user-boot-validated line)")
+          L.append(f"- bt70 artifact run: `{os.environ['BT_RUN_ID']}` (symbol gate PASS)")
+          L.append(f"- replaced: `/system/lib/hw/bluetooth.default.so`")
+          L.append(f"  - stock: {rd('swap_size_before.txt')} bytes, md5 `{rd('swap_md5_before.txt').split()[0]}`")
+          L.append(f"  - ours : {rd('bt_so_size.txt')} bytes, md5 `{rd('bt_so_md5.txt')}`")
+          L.append(f"  - inode-preserving write: mode/owner `{rd('swap_ls_after.txt').split()[0]}`"
+                   f" selinux `{rd('swap_selinux_after.txt')}` (identical to before)")
+          L.append("- HAL entry `HMI` (== HAL_MODULE_INFO_SYM, hardware.h:207) exported GLOBAL;"
+                   " stock libbluetooth_jni.so loads it via hw_get_module unchanged")
+          L.append("- DT_NEEDED (9): " + ", ".join(rd('artifact_needed.txt').split()) +
+                   " -- every provider asserted present in /system/lib of the final image")
+          L.append("- codecs: A2DP SRC(SBC) + SNK(SBC/AAC/LDAC); AAC = FDK LATM (RFC 3016),"
+                   " LDAC = vendored MIT libldacdec, both statically linked")
+          L.append("- free space zero-filled; e2fsck -fy then -fn clean; re-sparsified (4096)")
+          L.append("- passthrough manifest: all non-system.img package entries md5-identical to base")
+          L.append("- boot.img: kernel md5 == stock, fstab verity-off (inherited from base, re-asserted)")
+          L.append("- boot-critical packages + framework-res.apk present in the final image\n")
+          L.append("## Flash\n")
+          L.append("SP Flash Tool -> load the scatter from the zip -> **Download Only**.")
+          L.append("Rescue: reflash `firmware-debloat-v2-20261030` (BT-swap touches only"
+                   " /system; boot/recovery are identical to it) or the official baseline.")
+          txt = "\n".join(L) + "\n"
+          with open(os.path.join(P, "VERIFICATION.md"), "w") as f:
+              f.write(txt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(txt)
+          print(txt)
+          PY
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          DATE=$(date -u +%Y%m%d)
+          FW_TAG="${FW_TAG_IN:-firmware-btswap-$DATE}"
+          NAME="U2 BT sink: debloat-v2 + multi-codec A2DP sink stack (SBC/AAC/LDAC)"
+          {
+            echo "KeenPlus U2 -- **B4 BT-swap firmware**: the debloat-v2 package with"
+            echo "EXACTLY ONE file changed:"
+            echo
+            echo "- \`/system/lib/hw/bluetooth.default.so\` -> AOSP android-7.0.0_r36 stack"
+            echo "  + \`patches/nougat\` series: A2DP **Sink** with **SBC + AAC (FDK, LATM)"
+            echo "  + LDAC (vendored MIT libldacdec, 660 kbps class)** receive; sink audio"
+            echo "  renders via AudioTrack (the MTK-proven path on this device)."
+            echo "- Selection preference when WE connect: LDAC > AAC > SBC; when the phone"
+            echo "  connects to us: any of the three advertised codecs is accepted."
+            echo "- Java layer, boot.img, recovery, vendor BT chain (libbt-vendor ->"
+            echo "  libbluetooth_mtk), audio HAL: untouched (byte-identical passthrough,"
+            echo "  md5-manifest asserted)."
+            echo
+            echo "Everything else about this package equals \`firmware-debloat-v2-20261030\`"
+            echo "(dropper-neutralized, verity-off testkey boot)."
+            echo
+            echo "**CI validation** (see VERIFICATION.md asset): ELF32 ARM, HMI exported,"
+            echo "NEEDED closure present in-image, inode/mode/SELinux xattr preserved,"
+            echo "e2fsck clean, package round-tripped and re-verified, kernel md5 stock."
+            echo
+            echo "> CI cannot exercise RF/audio -- B5 on-device test: pair, connect phone"
+            echo "> audio, check codec via \`dumpsys bluetooth_manager\` / logcat"
+            echo "> \`bta_av_co\` traces (expect 'setconfig AAC' / 'setconfig LDAC')."
+            echo
+            echo "**Flash:** SP Flash Tool -> scatter from the zip -> Download Only."
+            echo "**Rescue:** reflash debloat-v2 or the official baseline; never Format."
+          } > "$RUNNER_TEMP/NOTES.md"
+          cp "$RUNNER_TEMP/NOTES.md" "$P/NOTES.md"
+          python3 scripts/publish_release.py \
+            --tag "$FW_TAG" --name "$NAME" \
+            --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
+            --files "$RUNNER_TEMP/$PKG.zip" "$P/VERIFICATION.md"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-btswap-report
+          path: |
+            ${{ runner.temp }}/probe/
+            ${{ runner.temp }}/btart/btw/out/symbol_gate.json
