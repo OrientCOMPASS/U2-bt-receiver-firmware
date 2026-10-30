@@ -264,3 +264,15 @@ vendor 链 opcode/回调偏移全覆盖）与此判决一致。
 ~600 B 签名空壳）；取证工具：fw-debugboot.yml（adb 常开调试 boot.img，
 只刷 boot 分区即可在挂死现场抓 logcat/dmesg）。BT 换栈包将在 v3 基座
 上机验证启动正常后重发（fw-btswap 已参数化 expect_apks=80）。
+
+### 4.6 基座回退 v1：BT 换栈重建（v3 stub 判决后）
+
+v3-raw（载荷 stub 替换）上机仍卡初始化循环 → 载荷内容级校验假设成立，
+stub 路线冻结（详见 docs/DROPPER_FORENSICS.md 判决表）。BT 换栈改在
+**v1 基座**（上机验证可启动；6 个载荷原厂完好，首启会安装膨胀应用，
+用户手动卸载）上重建：`fw-btswap` 派发参数 base_tag=
+firmware-debloat-v1-20261030 / base_asset=U2_7.0_debloat_v1.zip /
+raw_system=true / expect_apks=80（v1 镜像含 6 个载荷 APK 记录）。
+发布 tag：firmware-btswap-v1-raw-*。这是换栈 .so 第一次运行在可启动
+基座上：正常开机 → 栈无罪可用；再挂 → 嫌疑回到栈本身（静态取证已全部
+通过，概率低）。

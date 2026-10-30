@@ -2,8 +2,10 @@
 # fw-btswap.yml -- B4: swap the multi-codec A2DP sink Bluetooth stack into the
 # validated debloat-v2 flash package and publish a flashable zip.
 #
-# Base: release `firmware-debloat-v2-20261030` (U2_7.0_debloat_v2.zip) --
-# already debloated, dropper-neutralized, dm-verity off (testkey re-signed
+# Base: any debloat release via the base_tag/base_asset inputs (default was
+# debloat-v2; since the on-device bisect it is debloat-v1 -- v2/v3 payload
+# edits both hung the first boot, see docs/DROPPER_FORENSICS.md) --
+# already debloated, dm-verity off (testkey re-signed
 # boot), CI-validated.  This workflow touches EXACTLY ONE file inside it:
 #
 #   /system/lib/hw/bluetooth.default.so  (1.7 MB MTK stock  ->  4.4 MB AOSP
@@ -67,8 +69,16 @@ on:
         type: boolean
         default: false
       expect_apks:
-        description: 'Expected APK inventory record count (debloat-v2 base=74; v3 stub base=80)'
+        description: 'Expected APK inventory record count (debloat-v2 base=74; v1/v3 base with the six operator payloads present=80)'
         default: '74'
+        required: false
+      base_label:
+        description: 'Short base label used in the release name/notes'
+        default: 'debloat-v2'
+        required: false
+      base_note:
+        description: 'One-line description of the base for the release notes/VERIF'
+        default: 'dropper-neutralized, verity-off testkey boot, user-boot-validated line'
         required: false
 
 permissions:
@@ -85,6 +95,8 @@ env:
   BT_RUN_ID: ${{ inputs.bt_run_id }}
   RAW_SYSTEM: ${{ inputs.raw_system }}
   EXPECT_APKS: ${{ inputs.expect_apks }}
+  BASE_LABEL: ${{ inputs.base_label }}
+  BASE_NOTE: ${{ inputs.base_note }}
 
 jobs:
   btswap:
@@ -141,7 +153,7 @@ jobs:
           cp "$RUNNER_TEMP/btart/btw/out/symbol_gate.json" "$P/" 2>/dev/null || true
           jq -r '.verdict' "$P/symbol_gate.json" | grep -q PASS
 
-      - name: Download base package (debloat v2 release asset)
+      - name: Download base package (base release asset)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -425,7 +437,7 @@ jobs:
           L.append(f"# VERIFICATION -- {PKG}.zip\n")
           L.append(f"- package md5: `{md5}`  ({os.path.getsize(zip_path)} bytes)")
           L.append(f"- base package: `{os.environ['BASE_TAG']}` / `{os.environ['BASE_ASSET']}`"
-                   " (debloat v2: dropper neutralized, verity-off boot, user-boot-validated line)")
+                   f" ({os.environ.get('BASE_LABEL','base')}: {os.environ.get('BASE_NOTE','')})")
           L.append(f"- bt70 artifact run: `{os.environ['BT_RUN_ID']}` (symbol gate PASS)")
           L.append(f"- replaced: `/system/lib/hw/bluetooth.default.so`")
           L.append(f"  - stock: {rd('swap_size_before.txt')} bytes, md5 `{rd('swap_md5_before.txt').split()[0]}`")
@@ -450,7 +462,7 @@ jobs:
           L.append("- boot-critical packages + framework-res.apk present in the final image\n")
           L.append("## Flash\n")
           L.append("SP Flash Tool -> load the scatter from the zip -> **Download Only**.")
-          L.append("Rescue: reflash `firmware-debloat-v2-20261030` (BT-swap touches only"
+          L.append(f"Rescue: reflash `{os.environ['BASE_TAG']}` (BT-swap touches only"
                    " /system; boot/recovery are identical to it) or the official baseline.")
           txt = "\n".join(L) + "\n"
           with open(os.path.join(P, "VERIFICATION.md"), "w") as f:
@@ -469,9 +481,9 @@ jobs:
           P="$RUNNER_TEMP/probe"
           DATE=$(date -u +%Y%m%d)
           FW_TAG="${FW_TAG_IN:-firmware-btswap-$DATE}"
-          NAME="U2 BT sink: debloat-v2 + multi-codec A2DP sink stack (SBC/AAC/LDAC)"
+          NAME="U2 BT sink: ${BASE_LABEL} + multi-codec A2DP sink stack (SBC/AAC/LDAC)"
           {
-            echo "KeenPlus U2 -- **B4 BT-swap firmware**: the debloat-v2 package with"
+            echo "KeenPlus U2 -- **BT-swap firmware**: the \`$BASE_TAG\` package with"
             echo "EXACTLY ONE file changed:"
             echo
             echo "- \`/system/lib/hw/bluetooth.default.so\` -> AOSP android-7.0.0_r36 stack"
@@ -484,8 +496,8 @@ jobs:
             echo "  libbluetooth_mtk), audio HAL: untouched (byte-identical passthrough,"
             echo "  md5-manifest asserted)."
             echo
-            echo "Everything else about this package equals \`firmware-debloat-v2-20261030\`"
-            echo "(dropper-neutralized, verity-off testkey boot)."
+            echo "Everything else about this package equals \`$BASE_TAG\`"
+            echo "($BASE_NOTE)."
             echo
             if [ "$RAW_SYSTEM" = "true" ]; then
               echo "**NOTE:** system.img in this package is **RAW** (non-sparse,"
@@ -506,7 +518,7 @@ jobs:
             echo "> \`bta_av_co\` traces (expect 'setconfig AAC' / 'setconfig LDAC')."
             echo
             echo "**Flash:** SP Flash Tool -> scatter from the zip -> Download Only."
-            echo "**Rescue:** reflash debloat-v2 or the official baseline; never Format."
+            echo "**Rescue:** reflash \`$BASE_TAG\` or the official baseline; never Format."
           } > "$RUNNER_TEMP/NOTES.md"
           cp "$RUNNER_TEMP/NOTES.md" "$P/NOTES.md"
           python3 scripts/publish_release.py \

@@ -115,3 +115,34 @@ manifest-only，`android:hasCode=false`，jarsigner v1 签名，SELinux xattr
 - 管线：`debloat/stub-list.txt` + `scripts/make_stub_apk.py` +
   fw-debloat.yml `operator_stubs` 输入；rawpack 增加 stub 记录级断言
   （expect_apks=80 / expect_stubs=6）。
+
+## v3 上机判决与回退决策（2026-10-30 深夜）
+
+**v3（stub 替换）同样卡初始化循环动画** —— 「USP 需要目录树存在」假设被
+上机结果否定：目录树、文件名、包名全部保留、仅内容换成有效签名 stub，
+首启依然挂死。
+
+综合判决表（全分区 Download Only 含 userdata 擦除）：
+
+| 基座 | 载荷状态 | 启动 |
+|---|---|---|
+| v0 / v1 | 原厂完整（203 MiB，6 APK） | ✓ |
+| v2 / v2-raw | 目录已删除 | ✗ 循环进度条 |
+| btswap-raw（v2 基座） | 目录已删除 | ✗ 同上（基座连带） |
+| v3-raw | 路径/文件名/包名保留，内容=2.5 KB stub | ✗ 同上 |
+
+唯一判别变量 = **载荷 APK 内容是否原厂完好**。首启流程对载荷做内容级
+校验（版本号/签名/内嵌清单之类；services.odex USP 字符串
+`Operator pack not valid:` 佐证校验存在），删除和掉包都过不了。确切
+机制需要 adb 日志定位 —— fw-debugboot.yml 的调试 boot（只刷 boot 分区，
+adb 常开）就是为此准备的取证工具，随时可用。
+
+**决策（用户拍板）**：回退 v1 基座（上机验证可启动），BT 换栈重建在 v1
+上（fw-btswap base_tag=firmware-debloat-v1-20261030, expect_apks=80,
+raw_system=true）；6 个载荷应用照常首启安装，由用户手动卸载。
+
+注意事项：
+- 若手动卸载后被 USP 重装（重启后复活），说明安装流程可重复触发，需拿
+  日志再战（debug boot + `pm uninstall` / 冻结路线）。
+- 讯飞输入法载荷也在 6 个之列：卸载前先确认当前输入法已切到原生
+  LatinIME（设置→语言和输入法），避免卸掉正在用的键盘。
