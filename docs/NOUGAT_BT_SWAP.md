@@ -276,3 +276,19 @@ raw_system=true / expect_apks=80（v1 镜像含 6 个载荷 APK 记录）。
 发布 tag：firmware-btswap-v1-raw-*。这是换栈 .so 第一次运行在可启动
 基座上：正常开机 → 栈无罪可用；再挂 → 嫌疑回到栈本身（静态取证已全部
 通过，概率低）。
+
+### 4.7 raw 编码上机判决：0/4 启动成功，回退 sparse（用户裁定）
+
+firmware-btswap-v1-raw-20261030（v1 基座 + BT 换栈 + RAW system.img）上机
+**依然卡初始化循环**。至此 raw 编码包战绩 0/4（v2-raw、btswap-v2-raw、
+v3-raw、btswap-v1-raw 全部挂死），而 sparse 包 2/2 启动成功（v0、v1——
+均为可刷写的 v1 系布局）。每个 raw 失败虽各有内容嫌疑（v2/v3=载荷被
+删/被 stub；btswap-v1=换栈），但用户合理裁定：不再走 raw。
+
+关键认识：**SPFT 92% FILL 崩溃是 v2 系 sparse 特有的**——致命 FILL 块
+（704,805–713,963）正是 v2 删除 203 MiB 载荷后腾出的区域；v1 系镜像该
+区域是载荷文件数据（RAW chunk），v1 sparse 在用户主机上刷写+启动双成功。
+因此 v1 基座的换栈包直接用 sparse（raw_system=false），与已验证可启动的
+v1 sparse 仅差 bluetooth.default.so 一个文件——最干净的单变量实验：
+开机 → 换栈无罪且 raw 方法存疑；再挂 → 嫌疑收敛到换栈 .so 本身
+（届时唯一出路是 debug boot 抓 logcat 定位）。
