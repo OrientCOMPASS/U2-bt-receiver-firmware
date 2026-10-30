@@ -328,13 +328,18 @@ jobs:
           P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
           apps = json.load(open(os.path.join(P, "apps_final.json")))
           pkgs = {a.get("package") for a in apps if a.get("package")}
+          # NOTE: com.android.phone is NOT in this product's baseline (BT-receiver
+          # device ships without Telephony; confirmed by fw-debloat v0/v1/v2 runs:
+          # "not present in baseline (skipped)").  btswap must not touch apps at
+          # all, so assert the packages the baseline actually has, plus an exact
+          # APK-record count match against the base image (74 in debloat v2).
           REQUIRED = ["com.android.systemui", "com.android.settings",
                       "com.android.bluetooth", "com.android.packageinstaller",
-                      "com.android.providers.settings", "com.android.shell",
-                      "com.android.phone"]
+                      "com.android.providers.settings", "com.android.shell"]
           lost = [p for p in REQUIRED if p not in pkgs]
           assert not lost, f"boot-critical packages lost: {lost}"
-          print(f"[verify] boot-critical packages present ({len(pkgs)} APK records)")
+          assert len(apps) == 74, f"APK record count changed: {len(apps)} != 74 (base debloat-v2)"
+          print(f"[verify] boot-critical packages present; {len(apps)} APK records (unchanged vs base)")
           PY
           test -f /mnt/chk/framework/framework-res.apk
           sudo umount /mnt/chk
