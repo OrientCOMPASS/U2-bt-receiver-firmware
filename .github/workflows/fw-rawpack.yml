@@ -44,6 +44,34 @@ on:
         description: 'Publish the GitHub release when every check passes'
         type: boolean
         default: true
+      expect_apks:
+        description: 'Expected APK inventory record count of the OUTPUT image (v2=74; v3 with stubbed operator payload=80)'
+        default: '74'
+        required: false
+      expect_stubs:
+        description: 'Expected number of stubbed vendor/operator/app payload records (0 = none)'
+        default: '0'
+        required: false
+      rel_name:
+        description: 'Release display name'
+        default: 'U2 debloat-v2 RAW re-encode (bisect/rescue; no BT swap)'
+        required: false
+      notes_use:
+        description: 'Release-notes "Use" paragraph'
+        default: >-
+          flash this to bisect the boot-hang report: if it boots fine, the
+          v2 base is OK and the BT-swap stack is implicated; if it hangs
+          identically, the v2 base is implicated. Also serves as a flashable
+          rescue image of v2.
+        required: false
+      verif_purpose:
+        description: 'VERIFICATION.md Purpose paragraph'
+        default: >-
+          Bisect + rescue: identical to the source package except the
+          encoding. If this boots normally, the v2 base is exonerated; if it
+          hangs the same way, the problem is in the v2 base itself (not the
+          BT swap).
+        required: false
 
 permissions:
   contents: write
@@ -57,6 +85,11 @@ env:
   FW_TAG: ${{ inputs.fw_tag }}
   BASE_TAG: ${{ inputs.base_tag }}
   BASE_ASSET: ${{ inputs.base_asset }}
+  EXPECT_APKS: ${{ inputs.expect_apks }}
+  EXPECT_STUBS: ${{ inputs.expect_stubs }}
+  REL_NAME: ${{ inputs.rel_name }}
+  NOTES_USE: ${{ inputs.notes_use }}
+  VERIF_PURPOSE: ${{ inputs.verif_purpose }}
 
 jobs:
   rawpack:
@@ -167,7 +200,25 @@ jobs:
                       "com.android.providers.settings", "com.android.shell"]
           lost = [p for p in REQUIRED if p not in pkgs]
           assert not lost, f"boot-critical packages lost: {lost}"
-          assert len(apps) == 74, f"APK record count changed: {len(apps)} != 74"
+          expect = int(os.environ.get("EXPECT_APKS") or 74)
+          assert len(apps) == expect, f"APK record count changed: {len(apps)} != {expect}"
+          n_stubs = int(os.environ.get("EXPECT_STUBS") or 0)
+          if n_stubs:
+              want = {}
+              for line in open("debloat/stub-list.txt", encoding="utf-8"):
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      rel, pkg = line.split()
+                      want[rel] = pkg
+              assert len(want) == n_stubs, f"stub-list has {len(want)} entries, expected {n_stubs}"
+              by_apk = {a["apk"]: a for a in apps}
+              for rel, pkg in sorted(want.items()):
+                  a = by_apk.get(rel)
+                  assert a is not None, f"stub record missing: {rel}"
+                  assert a.get("package") == pkg, f"{rel}: package {a.get('package')!r} != {pkg!r}"
+                  sz = a.get("apk_size", 1 << 40)
+                  assert sz < 65536, f"{rel}: not stub-sized ({sz} B)"
+              print(f"[rawpack] operator stubs OK: {n_stubs} records, correct packages, <64 KiB")
           print(f"[rawpack] apps OK: {len(apps)} records, boot-critical present")
           PY
 
@@ -265,7 +316,11 @@ jobs:
           L.append(f"  - fingerprint: {rd('fingerprint.txt')}")
           L.append("- every non-system.img entry md5-identical to the source package")
           L.append("- boot.img: kernel md5 == stock, fstab verity-off (inherited)")
-          L.append("- APK inventory: 74 records; boot-critical packages present")
+          L.append(f"- APK inventory: {os.environ.get('EXPECT_APKS', '74')} records; boot-critical packages present")
+          if int(os.environ.get("EXPECT_STUBS") or 0):
+              L.append(f"- operator payload: {os.environ['EXPECT_STUBS']} stub APKs under vendor/operator/app/"
+                       " (paths/file names/packages stock, contents ~600 B signed stubs;"
+                       " size+package asserted record-by-record against debloat/stub-list.txt)")
           L.append("- MD5SUMS.txt inside the zip lists every file (extraction-integrity check)\n")
           L.append("## Why RAW\n")
           L.append("The user's SP Flash Tool/DA deterministically crashes at 92% on our *sparse*")
@@ -273,9 +328,8 @@ jobs:
           L.append("the same blocks as RAW chunks fine -- see docs/NOUGAT_BT_SWAP.md §4.4).")
           L.append("A raw system.img only uses the plain write path.\n")
           L.append("## Purpose\n")
-          L.append("Bisect + rescue: identical to the source package except the encoding.")
-          L.append("If this boots normally, the v2 base is exonerated; if it hangs the same way,")
-          L.append("the problem is in the v2 base itself (not the BT swap).\n")
+          L.append(os.environ.get("VERIF_PURPOSE") or
+                   "Identical to the source package except the encoding.\n")
           L.append("## Flash\n")
           L.append("SP Flash Tool -> load the scatter from the zip -> **Download Only**.")
           L.append("Rescue: official baseline zip from release `base_firmware`.")
@@ -294,7 +348,7 @@ jobs:
         run: |
           set -euo pipefail
           P="$RUNNER_TEMP/probe"
-          NAME="U2 debloat-v2 RAW re-encode (bisect/rescue; no BT swap)"
+          NAME="${REL_NAME}"
           {
             echo "KeenPlus U2 -- **debloat-v2 re-encoded with a RAW (non-sparse) system.img**."
             echo
@@ -306,9 +360,7 @@ jobs:
             echo "our sparse images (DA FILL-write path; see docs/NOUGAT_BT_SWAP.md §4.4)."
             echo "RAW images only use the plain write path proven by v0/v1."
             echo
-            echo "**Use:** flash this to bisect the boot-hang report: if it boots fine, the"
-            echo "v2 base is OK and the BT-swap stack is implicated; if it hangs identically,"
-            echo "the v2 base is implicated. Also serves as a flashable rescue image of v2."
+            echo "**Use:** $NOTES_USE"
             echo
             echo "**Flash:** SP Flash Tool -> scatter from the zip -> Download Only."
             echo "After extracting, verify every file against MD5SUMS.txt inside the zip."

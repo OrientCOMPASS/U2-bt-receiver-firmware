@@ -49,6 +49,10 @@ on:
         description: 'Publish the GitHub release when every check passes'
         type: boolean
         default: true
+      operator_stubs:
+        description: 'v3: replace the six vendor/operator/app payload APKs IN PLACE with signed stub APKs (debloat/stub-list.txt) instead of deleting them'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -219,6 +223,71 @@ jobs:
             --json "$P/removed.json" | tail -30
           sudo chown -R "$(id -u):$(id -g)" "$P"
 
+      - name: Neutralize operator payload with stub APKs (v3)
+        if: ${{ inputs.operator_stubs }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          KS="$RUNNER_TEMP/stub.jks"
+          keytool -genkeypair -keystore "$KS" -storepass android -alias stubkey \
+            -keyalg RSA -keysize 2048 -validity 9125 \
+            -dname "CN=U2 operator stub, OU=debloat, O=U2-bt-receiver-firmware, C=CN"
+          : > "$P/stub_report.txt"
+          : > "$P/stub_selinux_state.txt"
+          n=0
+          while read -r rel pkg; do
+            target="/mnt/sys/$rel"
+            [ -f "$target" ] || { echo "FATAL: payload file missing: $rel"; exit 1; }
+            # Capture the stock SELinux label state BEFORE touching the file.
+            # On a non-SELinux host getfattr may be unable to read
+            # security.selinux at all (kernel/LSM-dependent) -- that is OK:
+            # `cp` below writes INTO the existing inode (O_TRUNC), so whatever
+            # xattr state the stock file had (label X, or no label) survives
+            # verbatim.  The definitive check runs after umount via debugfs
+            # (pure userspace) -- see "Verify stub SELinux labels" step.
+            ctx=$(sudo getfattr -n security.selinux --only-values "$target" 2>/dev/null || true)
+            if [ -n "$ctx" ]; then
+              echo "$rel $ctx" >> "$P/stub_selinux_state.txt"
+            else
+              echo "$rel NONE" >> "$P/stub_selinux_state.txt"
+            fi
+            orig=$(sudo stat -c %s "$target")
+            tmp="$RUNNER_TEMP/stub.apk"
+            rm -f "$tmp"
+            python3 scripts/make_stub_apk.py "$tmp" --package "$pkg" \
+              --keystore "$KS" --storepass android --alias stubkey
+            sudo cp "$tmp" "$target"          # in-place: inode + xattrs preserved
+            sudo chown root:root "$target"
+            sudo chmod 644 "$target"
+            new_sz=$(sudo stat -c %s "$target")
+            echo "$rel $pkg $orig -> $new_sz B" | tee -a "$P/stub_report.txt"
+            n=$((n+1))
+          done < <(grep -vE '^\s*(#|$)' debloat/stub-list.txt)
+          [ "$n" -eq 6 ] || { echo "FATAL: stubbed $n files, expected 6"; exit 1; }
+          # Re-parse every stub from the image with the CI inventory parser.
+          while read -r rel pkg; do
+            sudo cat "/mnt/sys/$rel" > "$RUNNER_TEMP/chk.apk"
+            got=$(python3 scripts/fw_inventory.py manifest "$RUNNER_TEMP/chk.apk" | jq -r .package)
+            [ "$got" = "$pkg" ] || { echo "FATAL: $rel parses as '$got' != '$pkg'"; exit 1; }
+          done < <(grep -vE '^\s*(#|$)' debloat/stub-list.txt)
+          echo "[stubs] all 6 verified in-image by fw_inventory.manifest"
+          # Second opinion from real Android tooling when the runner SDK has it
+          # (informational: aapt2 badging on a resources-less APK may warn).
+          AAPT2=$(ls /usr/local/lib/android/sdk/build-tools/*/aapt2 2>/dev/null | sort | tail -1 || true)
+          if [ -n "$AAPT2" ]; then
+            while read -r rel pkg; do
+              sudo cat "/mnt/sys/$rel" > "$RUNNER_TEMP/chk.apk"
+              BADGING=$("$AAPT2" dump badging "$RUNNER_TEMP/chk.apk" 2>&1 || true)
+              if echo "$BADGING" | grep -q "package: name='$pkg'"; then
+                echo "[aapt2] $rel -> package '$pkg' OK"
+              else
+                echo "[aapt2] WARN: $rel badging: $(echo "$BADGING" | head -2)"
+              fi
+            done < <(grep -vE '^\s*(#|$)' debloat/stub-list.txt)
+          else
+            echo "[aapt2] not found on runner -- fw_inventory parse is the gate"
+          fi
+
       - name: Block dropper domains in /system/etc/hosts (when list present)
         run: |
           set -euo pipefail
@@ -310,6 +379,26 @@ jobs:
           B="$RUNNER_TEMP/baseline"; OUT="$RUNNER_TEMP/build_out"; P="$RUNNER_TEMP/probe"
           sync
           sudo umount /mnt/sys
+          if [ "${{ inputs.operator_stubs }}" = "true" ]; then
+            # Definitive SELinux-label check on the UNMOUNTED image via debugfs
+            # (pure userspace -- no host SELinux/xattr support required).
+            # Expected state per file was captured before the stub overwrite.
+            fail=0
+            while read -r rel want; do
+              got=$(sudo debugfs -R "ea_list /$rel" "$B/system.raw.img" 2>/dev/null \
+                    | grep -o 'security\.selinux' || true)
+              if [ "$want" = "NONE" ]; then
+                [ -n "$got" ] && echo "WARN: $rel gained a label (stock had none)"
+                echo "[selinux] $rel: stock had no label, stub has none -- state preserved"
+              elif [ -z "$got" ]; then
+                echo "FATAL: $rel lost security.selinux (stock: $want)"
+                fail=1
+              else
+                echo "[selinux] $rel: security.selinux present (stock: $want)"
+              fi
+            done < "$P/stub_selinux_state.txt"
+            [ "$fail" -eq 0 ] || exit 1
+          fi
           sudo e2fsck -fy "$B/system.raw.img" || rc=$?
           echo "e2fsck -fy rc=${rc:-0} (<=3 means clean or fixed)"
           test "${rc:-0}" -le 3
@@ -415,6 +504,8 @@ jobs:
           df -h "$RUNNER_TEMP"
 
       - name: Write VERIFICATION.md
+        env:
+          OPERATOR_STUBS: ${{ inputs.operator_stubs }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -438,6 +529,17 @@ jobs:
                    " /system fstab line + CMS re-sign with the AOSP testkey (the stock"
                    " signing key); ramdisk entry list and all non-fstab bytes diff-asserted"
                    " identical to stock")
+          if os.environ.get("OPERATOR_STUBS") == "true":
+              stubs = open(os.path.join(P, "stub_report.txt")).read().strip().splitlines()
+              L.append(f"- operator payload (v3): {len(stubs)} APKs under vendor/operator/app/"
+                       " replaced IN PLACE with signed ~600 B stub APKs -- same paths, file"
+                       " names and package names, android:hasCode=false, SELinux xattr"
+                       " preserved.  Rationale: v2 deleted these dirs outright and the device"
+                       " hung at first boot (MTK USP customization); stubs keep the install"
+                       " flow intact while shipping zero third-party code.  Every stub"
+                       " re-parsed from the image by fw_inventory.manifest.")
+              for s in stubs:
+                  L.append(f"  - `{s}`")
           L.append("- recovery.img + all MTK-private partitions: byte-identical passthrough")
           L.append(f"- system.img verity area before edit: trailing_bytes={vb['trailing_bytes']},"
                    f" footer_present={vb['verity_present']} (stale tail zeroed after edit;"
@@ -504,6 +606,16 @@ jobs:
             echo
             jq -r '.planned[] | "- `\(.path)` (\(.package), \(.bytes/1048576*10|round/10) MiB)"' "$P/removed.json"
             echo
+            if [ "${{ inputs.operator_stubs }}" = "true" ]; then
+              echo "**Operator payload (v3 route)**: the six APKs under \`vendor/operator/app/\`"
+              echo "are replaced IN PLACE with ~600 B signed stubs (same paths, file names and"
+              echo "package names; \`android:hasCode=false\`; SELinux labels preserved) instead"
+              echo "of being deleted.  v2's outright deletion hung the device at first boot"
+              echo "(the MTK USP first-boot customization needs the payload tree); stubs keep"
+              echo "that flow intact while shipping zero third-party code.  Six tiny entries"
+              echo "with no launcher icons may appear under Settings -> Apps."
+              echo
+            fi
             echo "**CI boot-sanity validation (see VERIFICATION.md asset)**: kernel md5"
             echo "identical, ramdisk entry-identical, boot-critical packages present,"
             echo "e2fsck clean, scatter-validated, final image round-tripped and"

@@ -182,3 +182,129 @@ class TestParseGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEditDefaultProps(unittest.TestCase):
+    TEXT = ("#\n# ADDITIONAL_DEFAULT_PROPERTIES\n#\n"
+            "ro.adb.secure=1\nro.secure=1\nro.debuggable=0\n"
+            "persist.sys.usb.config=mtp\n# comment=notaprop\n"
+            "persist.sys.timezone=Asia/Shanghai\n")
+
+    def test_replace_in_place(self):
+        new, n = mb.edit_default_props(self.TEXT, {"ro.debuggable": "1",
+                                                   "ro.secure": "0"})
+        self.assertEqual(n, 2)
+        lines = new.splitlines()
+        self.assertEqual(lines, self.TEXT.splitlines()[:3]
+                         + ["ro.adb.secure=1", "ro.secure=0",
+                            "ro.debuggable=1", "persist.sys.usb.config=mtp",
+                            "# comment=notaprop",
+                            "persist.sys.timezone=Asia/Shanghai"])
+
+    def test_append_missing(self):
+        new, n = mb.edit_default_props("a=1\n", {"a": "2", "b": "3"})
+        self.assertEqual(n, 2)
+        self.assertEqual(new, "a=2\nb=3\n")
+
+    def test_adb_props_all_applied_on_stock(self):
+        new, n = mb.edit_default_props(self.TEXT, mb.ADB_PROPS)
+        self.assertEqual(n, 4)
+        for k, v in mb.ADB_PROPS.items():
+            self.assertIn(f"{k}={v}", new.splitlines())
+
+    def test_rc_patch_shape(self):
+        p = mb.ADB_RC_PATCH
+        self.assertIn(mb.ADB_RC_MARKER, p)
+        self.assertIn("on boot\n    setprop sys.usb.config mtp", p)
+        self.assertIn("on property:sys.usb.config=mtp\n", p)
+        self.assertIn("start adbd", p)
+        self.assertIn("functions mtp,adb", p)
+        self.assertIn("idProduct 201D", p)
+        # the keepalive must NOT rewrite sys.usb.state (no framework fight)
+        action_lines = [l.strip() for l in p.splitlines()
+                        if l.strip() and not l.strip().startswith("#")]
+        self.assertFalse(any("sys.usb.state" in l for l in action_lines),
+                         action_lines)
+
+
+@unittest.skipUnless(HAVE_CPIO, "needs cpio")
+class TestAdbEnable(unittest.TestCase):
+    STOCK_PROPS = ("#\nro.adb.secure=1\nro.secure=1\nro.debuggable=0\n"
+                   "persist.sys.usb.config=mtp\npersist.sys.timezone=X\n")
+    STOCK_RC = ("on boot\n    setprop sys.usb.vid 0E8D\n\n"
+                "#6.mtp\non property:sys.usb.config=mtp\n"
+                "    write /sys/class/android_usb/android0/enable 0\n"
+                "    setprop sys.usb.state ${sys.usb.config}\n")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.kernel = os.urandom(40000)
+        cls.boot = os.path.join(cls.tmp, "boot.img")
+        with open(cls.boot, "wb") as f:
+            f.write(build_synthetic_boot(cls.kernel, {
+                "default.prop": (0o644 | 0o100000,
+                                 cls.STOCK_PROPS.encode()),
+                mb.ADB_RC_FILE: (0o644 | 0o100000, cls.STOCK_RC.encode()),
+                "init": (0o755 | 0o100000, b"INIT" * 20),
+            }))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _run(self, *args, expect_ok=True):
+        r = subprocess.run([sys.executable,
+                            os.path.join(_SCRIPTS, "mtk_bootimg.py"), *args],
+                           capture_output=True, text=True)
+        if expect_ok:
+            self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        return r
+
+    def test_adb_enable_no_sign(self):
+        out = os.path.join(self.tmp, "boot_adb.img")
+        self._run("adb-enable", self.boot, out, "--no-sign")
+        h = mb.parse_boot(open(out, "rb").read())
+        self.assertEqual(h["kernel"], self.kernel)
+        self.assertEqual(h["tail"], b"")
+        names_before = {n for n, _ in
+                        mb.parse_cpio_index(_ramdisk_of(self.boot))}
+        names_after = {n for n, _ in
+                       mb.parse_cpio_index(bytes(h["ramdisk"]))}
+        self.assertEqual(names_before, names_after)
+        rd = os.path.join(self.tmp, "rd_adb")
+        mb.extract_ramdisk(bytes(h["ramdisk"]), rd)
+        props = open(os.path.join(rd, "default.prop")).read()
+        self.assertIn("ro.debuggable=1", props)
+        self.assertIn("ro.adb.secure=0", props)
+        self.assertIn("ro.secure=0", props)
+        self.assertIn("persist.sys.usb.config=mtp,adb", props)
+        self.assertIn("persist.sys.timezone=X", props)   # others untouched
+        rc = open(os.path.join(rd, mb.ADB_RC_FILE)).read()
+        self.assertIn(mb.ADB_RC_MARKER, rc)
+        self.assertIn("#6.mtp", rc)                      # stock kept
+        self.assertTrue(rc.index(mb.ADB_RC_MARKER) > rc.index("#6.mtp"),
+                        "keepalive must be appended AFTER the stock trigger")
+        shutil.rmtree(rd, ignore_errors=True)
+
+    def test_kernel_md5_gate(self):
+        import hashlib
+        good = hashlib.md5(self.kernel).hexdigest()
+        out = os.path.join(self.tmp, "boot_adb2.img")
+        self._run("adb-enable", self.boot, out, "--no-sign",
+                  "--assert-kernel-md5", good)
+        r = self._run("adb-enable", self.boot, out, "--no-sign",
+                      "--assert-kernel-md5", "0" * 32, expect_ok=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_idempotence_guard(self):
+        out1 = os.path.join(self.tmp, "boot_adb3.img")
+        self._run("adb-enable", self.boot, out1, "--no-sign")
+        r = self._run("adb-enable", out1, os.path.join(self.tmp, "x.img"),
+                      "--no-sign", expect_ok=False)
+        self.assertNotEqual(r.returncode, 0)   # already-patched rc is rejected
+
+
+def _ramdisk_of(path: str) -> bytes:
+    h = mb.parse_boot(open(path, "rb").read())
+    return bytes(h["ramdisk"])

@@ -81,3 +81,37 @@
   `apks_outside_roots.txt` + `apks_outside_manifests.txt`（全盘 APK 扫描）、
   `services_install_strings.txt`（USP CustomOperator）、
   `pkginstaller_hook_strings.txt`（魔改安装器）
+
+## 后续（v2 上机判决 → v3 stub 方案，2026-10-30 晚）
+
+**v2 判决：删除载荷目录导致首启挂死。** 用户实测（全分区 Download Only 含
+userdata 擦除）：
+
+| 包 | 载荷目录 | 刷写 | 启动 |
+|---|---|---|---|
+| v0 / v1 | 完整保留 | ✓ | ✓ 正常（首启安装 5+1 载荷） |
+| btswap-raw（v2 基座+BT 换栈） | 已删除 | ✓ 100% | ✗ 过厂商动画后循环进度条 |
+| **v2-raw（v2 原样，无换栈）** | 已删除 | ✓ 100% | ✗ **同样卡循环进度条** |
+
+v2-raw 与 btswap-raw 同症 → **BT 换栈无罪，v2 基座自身的改动即元凶**。
+v2 相对 v1 的唯一内容差异 = 删除 `vendor/operator/app/` 下 6 个载荷目录
+（sparse/raw 编码差异已被 v2-raw 排除）。结论：**MTK USP 首启定制流程
+（services.odex 内 CustomOperator + 魔改 PackageInstaller）需要载荷目录树
+存在**；目录被清空后该流程无法完成，启动卡在初始化循环。出厂
+`ro.debuggable=0`+`ro.adb.secure=1`+全新 /data（ADB_ENABLED=0）意味着挂死
+现场没有 adb —— 取证需 fw-debugboot.yml 产出的调试 boot.img（只刷 boot
+分区，秒级，system 不动，挂死复现且 adb 常开）。
+
+**v3 修复：stub 替换（保结构、换内容）。** 保持 6 个载荷的路径、文件名、
+包名与出厂完全一致，仅把 APK 内容换成 ~600 B 的有效 stub（二进制
+manifest-only，`android:hasCode=false`，jarsigner v1 签名，SELinux xattr
+从原文件克隆）：
+
+- USP/安装器首启流程照旧走通（有物可装），但装入的是零第三方代码的空壳；
+- 编码器逐字节镜像本固件真实 aapt 输出的 AXML 布局（probe v8 实物对照），
+  CI 用 fw_inventory 解析器 + runner aapt2 双重回读校验；
+- 副作用（可接受）：设置→应用里会出现 6 个无图标的小条目；日后想侧载同
+  包名真应用需先卸载 stub（签名不同）。
+- 管线：`debloat/stub-list.txt` + `scripts/make_stub_apk.py` +
+  fw-debloat.yml `operator_stubs` 输入；rawpack 增加 stub 记录级断言
+  （expect_apks=80 / expect_stubs=6）。

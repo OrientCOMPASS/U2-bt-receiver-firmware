@@ -34,6 +34,14 @@ Subcommands
       full pipeline: unpack -> edit every fstab* file in the ramdisk (drop
       the verify flag from /system lines) -> repack -> re-sign -> self-check.
 
+  adb-enable IN OUT --pk8 K.pk8 --x509 C.pem [--no-sign] [--rc-file F]
+                 [--assert-kernel-md5 MD5]
+      debug/forensics boot: flip the four adb gate props in default.prop
+      (ro.debuggable=1, ro.adb.secure=0, ro.secure=0,
+      persist.sys.usb.config=mtp,adb) and append an adbd keepalive trigger
+      to the MTK usb rc -> repack -> re-sign -> self-check.  Used by
+      fw-debugboot.yml to make a hung first boot diagnosable over USB.
+
 Requires: gzip, cpio (GNU), openssl (for signing).  Uses sudo transparently
 when not running as root (ramdisk files are root-owned).
 """
@@ -450,6 +458,150 @@ def cmd_sign(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# adb-enable -- debug/forensics boot image (used by fw-debugboot.yml)
+# --------------------------------------------------------------------------- #
+# Fresh-/data user builds ship Settings.Global.ADB_ENABLED=0 and
+# ro.debuggable=0 + ro.adb.secure=1, so adb is unreachable exactly when we
+# need it most: a hung first boot.  This patch flips the four gate props and
+# appends a keepalive trigger to the MTK usb rc, so adbd comes up from init
+# even if system_server never reaches UsbDeviceManager.
+ADB_PROPS = {
+    "ro.debuggable": "1",
+    "ro.adb.secure": "0",
+    "ro.secure": "0",
+    "persist.sys.usb.config": "mtp,adb",
+}
+ADB_RC_FILE = "init.mt6735.usb.rc"
+ADB_RC_MARKER = "### repo-debug-boot adb keepalive ###"
+ADB_RC_PATCH = """
+# ### repo-debug-boot adb keepalive ###
+# Debug/forensics boot patch (scripts/mtk_bootimg.py adb-enable).
+# 1) Force the initial usb config at `on boot`, so the keepalive trigger
+#    below fires even when system_server never reaches UsbDeviceManager --
+#    exactly the hung-first-boot case this image exists to debug.
+#    (init.mt6735.usb.rc's own `on boot` sets sys.usb.vid first: this block
+#    is appended at the end of the same file, so parse order guarantees it.)
+# 2) Whenever the framework asks for plain "mtp" (a user build with a fresh
+#    /data has Settings.Global.ADB_ENABLED=0), force the composite mtp,adb
+#    gadget and (re)start adbd.  sys.usb.state is deliberately NOT touched:
+#    the stock #6.mtp trigger already set it to "mtp", which keeps
+#    system_server's UsbDeviceManager satisfied -- no property ping-pong.
+on boot
+    setprop sys.usb.config mtp
+
+on property:sys.usb.config=mtp
+    start adbd
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/idVendor ${sys.usb.vid}
+    write /sys/class/android_usb/android0/idProduct 201D
+    write /sys/class/android_usb/android0/functions mtp,adb
+    write /sys/class/android_usb/android0/enable 1
+"""
+
+
+def edit_default_props(text: str, props: Dict[str, str]) -> Tuple[str, int]:
+    """Set/replace `key=value` lines in default.prop text.
+
+    Returns (new_text, n_props_applied).  Existing keys are replaced
+    in-place (line order and every other byte preserved); missing keys are
+    appended at the end.  Comment/blank lines are never touched.
+    """
+    lines = text.splitlines(keepends=True)
+    remaining = dict(props)
+    applied = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        key = s.split("=", 1)[0]
+        if key in remaining:
+            nl = "\n" if line.endswith("\n") else ""
+            lines[i] = f"{key}={remaining.pop(key)}{nl}"
+            applied += 1
+    for k, v in remaining.items():
+        lines.append(f"{k}={v}\n")
+        applied += 1
+    return "".join(lines), applied
+
+
+def cmd_adb_enable(args: argparse.Namespace) -> int:
+    import hashlib
+    data = open(args.image, "rb").read()
+    h = parse_boot(data)
+    kernel = bytes(h["kernel"])                                  # type: ignore
+    if args.assert_kernel_md5:
+        got = hashlib.md5(kernel).hexdigest()
+        want = args.assert_kernel_md5.strip().lower()
+        assert got == want, f"kernel md5 {got} != expected {want}"
+        log(f"kernel md5 OK ({got})")
+    ramdisk_gz = bytes(h["ramdisk"])                             # type: ignore
+    idx = parse_cpio_index(ramdisk_gz)
+    names = {n for n, _ in idx}
+    assert "default.prop" in names, "ramdisk has no default.prop"
+    assert args.rc_file in names, f"ramdisk has no {args.rc_file}"
+
+    with _workdir() as td:
+        rd = os.path.join(td, "rd")
+        extract_ramdisk(ramdisk_gz, rd)
+        # 1) the four gate props in default.prop
+        dp = os.path.join(rd, "default.prop")
+        old = _sudo_read(dp).decode("utf-8", "surrogateescape")
+        new, n = edit_default_props(old, ADB_PROPS)
+        assert n == len(ADB_PROPS), f"set {n}/{len(ADB_PROPS)} props"
+        _sudo_write(dp, new.encode("utf-8", "surrogateescape"))
+        log(f"default.prop: {n} props flipped "
+            f"({', '.join(sorted(ADB_PROPS))})")
+        # 2) the usb rc keepalive trigger
+        rcp = os.path.join(rd, args.rc_file)
+        rct = _sudo_read(rcp).decode("utf-8", "surrogateescape")
+        assert ADB_RC_MARKER not in rct, "rc file already patched"
+        _sudo_write(rcp, (rct.rstrip("\n") + "\n" + ADB_RC_PATCH)
+                    .encode("utf-8", "surrogateescape"))
+        log(f"{args.rc_file}: appended adb keepalive "
+            f"(on-boot config + mtp->mtp,adb gadget force)")
+        restore_mtimes(rd, idx)
+        new_ramdisk = repack_ramdisk(rd)
+
+    body = build_boot(h, kernel, new_ramdisk)
+    if args.no_sign:
+        tail = b""
+        log("--no-sign: signature tail omitted")
+    else:
+        tail = sign_body(body, args.pk8, args.x509)
+        log(f"signed with {os.path.basename(args.x509)} "
+            f"(CMS sha1WithRSA, tail={len(tail)}B)")
+    out = body + tail
+
+    # ---- self-check: re-parse what we are about to write ------------------ #
+    h2 = parse_boot(out)
+    assert bytes(h2["kernel"]) == kernel, "kernel changed in rebuild"
+    assert h2["page_size"] == h["page_size"], "page size changed"
+    idx2 = parse_cpio_index(bytes(h2["ramdisk"]))                # type: ignore
+    assert {n for n, _ in idx2} == names, "ramdisk file list changed"
+    with _workdir() as td:
+        rd = os.path.join(td, "rd2")
+        extract_ramdisk(bytes(h2["ramdisk"]), rd)                # type: ignore
+        dp2 = _sudo_read(os.path.join(rd, "default.prop")) \
+            .decode("utf-8", "surrogateescape")
+        got_props = {l.split("=", 1)[0]: l.split("=", 1)[1]
+                     for l in dp2.splitlines()
+                     if l.strip() and not l.startswith("#") and "=" in l}
+        for k, v in ADB_PROPS.items():
+            assert got_props.get(k) == v, f"prop {k}={got_props.get(k)!r} != {v!r}"
+        rc2 = _sudo_read(os.path.join(rd, args.rc_file)) \
+            .decode("utf-8", "surrogateescape")
+        assert ADB_RC_MARKER in rc2, "rc marker vanished"
+        assert "functions mtp,adb" in rc2 and "start adbd" in rc2, "rc patch broken"
+        if not args.no_sign:
+            assert check_tail_parses(tail), "signature tail not valid DER"
+    with open(args.out, "wb") as f:
+        f.write(out)
+    log(f"wrote {args.out}: {len(out)}B (kernel={len(kernel)}B, ramdisk "
+        f"{h['ramdisk_size']}B -> {len(new_ramdisk)}B, tail={len(tail)}B)")  # type: ignore
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -482,8 +634,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="signing cert (PEM, e.g. AOSP testkey.x509.pem)")
     s.set_defaults(fn=cmd_sign)
 
+    a = sub.add_parser("adb-enable",
+                       help="repack boot.img with adb always on (debug/forensics image)")
+    a.add_argument("image")
+    a.add_argument("out")
+    a.add_argument("--pk8", help="signing key (DER PKCS#8, e.g. AOSP testkey.pk8)")
+    a.add_argument("--x509", help="signing cert (PEM, e.g. AOSP testkey.x509.pem)")
+    a.add_argument("--no-sign", action="store_true",
+                   help="do not append a signature tail (tests only)")
+    a.add_argument("--rc-file", default=ADB_RC_FILE,
+                   help=f"ramdisk usb rc to patch (default: {ADB_RC_FILE})")
+    a.add_argument("--assert-kernel-md5", default="",
+                   help="abort unless the kernel md5 equals this hex string")
+    a.set_defaults(fn=cmd_adb_enable)
+
     args = ap.parse_args(argv)
-    if args.cmd == "disable-verity" and not args.no_sign:
+    if args.cmd in ("disable-verity", "adb-enable") and not args.no_sign:
         if not (args.pk8 and args.x509):
             ap.error("signing needs --pk8 and --x509 (or use --no-sign)")
     return args.fn(args)

@@ -1,0 +1,24 @@
+# debloat/stub-list.txt -- operator-pack payload stub replacement list (v3).
+#
+# v2 DELETED the six payload dirs under /system/vendor/operator/app/ and the
+# device then hung at first boot (looping progress bar; v0/v1 with the
+# payloads present boot fine) -- the MTK USP first-boot customization
+# (com.mediatek.usp.CustomOperator in services.odex + the vendor-modified
+# PackageInstaller) apparently never completes when the payload tree it
+# walks is gone.
+#
+# v3 therefore keeps the tree, the file NAMES and the PACKAGE NAMES exactly
+# as stock, and replaces only the APK CONTENTS with ~600 B valid stubs
+# (scripts/make_stub_apk.py: binary manifest only, android:hasCode=false,
+# v1-signed).  Same install flow, zero third-party code.  Side effect users
+# may notice: six tiny entries in Settings -> Apps with no launcher icons;
+# sideloading a real app with one of these package names later requires
+# uninstalling the stub first (signature mismatch).
+#
+# Format: <system-relative apk path> <package name>   ('#' comments allowed)
+vendor/operator/app/HiBy/HiBy.apk com.hiby.music
+vendor/operator/app/WDJ/WDJ.apk com.wandoujia.phoenix2
+vendor/operator/app/kuake/kuake.apk com.quark.browser
+vendor/operator/app/mxsq/mxsq.apk uni.UNI557FDDF
+vendor/operator/app/wanneglianbo/wanneglianbo.apk com.iqiyi.wlanplay
+vendor/operator/app/xunfeishurufa/xunfeishurufa.apk com.iflytek.inputmethod

@@ -1,0 +1,336 @@
+# fw-debugboot.yml -- build an adb-enabled DEBUG boot.img for a hanging device.
+#
+# Why: the stock boot ramdisk ships ro.debuggable=0 + ro.adb.secure=1 and a
+# fresh /data has Settings.Global.ADB_ENABLED=0, so a hung first boot has NO
+# adb -- exactly when logs are needed most.  This workflow takes the boot.img
+# of any debloat/btswap release zip (already verity-off + testkey-signed by
+# our pipeline), flips the four gate props, appends an adbd keepalive trigger
+# to init.mt6735.usb.rc (so adbd comes up from init even when system_server
+# never reaches UsbDeviceManager), re-signs with the AOSP testkey and packs a
+# boot-partition-only SPFT mini package.
+#
+# Kernel bytes are asserted unchanged (md5 gate).  Flashing BOOT alone takes
+# seconds in SP Flash Tool and leaves the system partition untouched, so the
+# hang reproduces with adb available:
+#   adb logcat -b all -d -v threadtime > logcat.txt
+name: fw-debugboot
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'Release tag carrying the base package'
+        default: 'firmware-debloat-v2-raw-20261030'
+        required: true
+      base_asset:
+        description: 'Base zip asset name in that release'
+        default: 'U2_7.0_debloat_v2_raw.zip'
+        required: true
+      fw_tag:
+        description: 'Output release tag (empty = auto: firmware-debugboot-<date>)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish the GitHub release when every check passes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_MD5: 4128dc54373f68008afd1eb6ed25c105
+  BASE_TAG: ${{ inputs.base_tag }}
+  BASE_ASSET: ${{ inputs.base_asset }}
+  FW_TAG_IN: ${{ inputs.fw_tag }}
+
+jobs:
+  debugboot:
+    name: patch boot.img for always-on adb + validate + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install image tools (cpio)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio
+          mkdir -p "$RUNNER_TEMP/probe"
+
+      - name: Unit tests (toolchain gate)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      - name: Fetch AOSP testkey pair (stock boot is signed with it)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/keys"
+          for f in testkey.pk8 testkey.x509.pem; do
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://android.googlesource.com/platform/build/+/refs/tags/android-8.1.0_r80/target/product/security/${f}?format=TEXT" \
+              | base64 -d > "$RUNNER_TEMP/keys/$f"
+          done
+          openssl x509 -in "$RUNNER_TEMP/keys/testkey.x509.pem" -noout -subject
+
+      - name: Download base package asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tok = os.environ["GH_TOKEN"]
+          api = "https://api.github.com/repos/OrientCOMPASS/U2-bt-receiver-firmware"
+          tag = os.environ["BASE_TAG"]; asset = os.environ["BASE_ASSET"]
+          r = urllib.request.Request(f"{api}/releases/tags/{tag}",
+              headers={"Accept":"application/vnd.github+json","User-Agent":"fw-debugboot",
+                       "Authorization":f"Bearer {tok}"})
+          rel = json.loads(urllib.request.urlopen(r).read())
+          url = None
+          for a in rel["assets"]:
+              if a["name"] == asset:
+                  url = a["browser_download_url"]
+          assert url, f"asset {asset} not found in release {tag}"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "base.zip")
+          rq = urllib.request.Request(url, headers={"User-Agent":"fw-debugboot"})
+          with urllib.request.urlopen(rq) as src, open(dest, "wb") as out:
+              while True:
+                  b = src.read(1 << 22)
+                  if not b: break
+                  out.write(b)
+          print("base.zip:", os.path.getsize(dest), "bytes")
+          PY
+          md5sum "$RUNNER_TEMP/base.zip"
+
+      - name: Unzip base -> boot.img + scatter
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; W="$RUNNER_TEMP/pkgwork"
+          rm -rf "$W"; mkdir -p "$W"
+          unzip -oq "$RUNNER_TEMP/base.zip" -d "$W"
+          BASEDIR="$(find "$W" -maxdepth 1 -mindepth 1 -type d | head -1)"
+          test -n "$BASEDIR"
+          ls -l "$BASEDIR" | head
+          cp "$BASEDIR/boot.img" "$P/boot_stock.img"
+          SCATTER="$(find "$BASEDIR" -maxdepth 1 -name '*scatter*.txt' | head -1)"
+          test -n "$SCATTER"
+          cp "$SCATTER" "$P/scatter.txt"
+          md5sum "$P/boot_stock.img" | tee "$P/boot_stock_md5.txt"
+          rm -f "$RUNNER_TEMP/base.zip"
+
+      - name: Build the debug boot.img (adb always on)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          python3 scripts/mtk_bootimg.py adb-enable \
+            "$P/boot_stock.img" "$P/boot_debug.img" \
+            --pk8 "$RUNNER_TEMP/keys/testkey.pk8" \
+            --x509 "$RUNNER_TEMP/keys/testkey.x509.pem" \
+            --assert-kernel-md5 "$KERNEL_MD5"
+          ls -l "$P/boot_stock.img" "$P/boot_debug.img"
+
+      - name: Independent validation (kernel identical, diffs minimal, tail valid)
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          python3 - <<'PY'
+          import hashlib, os, sys
+          sys.path.insert(0, "scripts")
+          import mtk_bootimg as mb
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          stock = open(os.path.join(P, "boot_stock.img"), "rb").read()
+          debug = open(os.path.join(P, "boot_debug.img"), "rb").read()
+          hs, hd = mb.parse_boot(stock), mb.parse_boot(debug)
+          ks, kd = bytes(hs["kernel"]), bytes(hd["kernel"])
+          assert ks == kd, "kernel bytes changed"
+          kmd5 = hashlib.md5(kd).hexdigest()
+          assert kmd5 == os.environ["KERNEL_MD5"], f"kernel md5 {kmd5}"
+          print(f"[check] kernel md5 {kmd5} (stock, byte-identical)")
+          ns = {n for n, _ in mb.parse_cpio_index(bytes(hs["ramdisk"]))}
+          nd = {n for n, _ in mb.parse_cpio_index(bytes(hd["ramdisk"]))}
+          assert ns == nd, f"ramdisk file list changed: {ns ^ nd}"
+          print(f"[check] ramdisk file list identical ({len(nd)} entries)")
+          rs = os.path.join(P, "rd_stock"); rd_ = os.path.join(P, "rd_debug")
+          mb.extract_ramdisk(bytes(hs["ramdisk"]), rs)
+          mb.extract_ramdisk(bytes(hd["ramdisk"]), rd_)
+          def rd(base, name):
+              return open(os.path.join(base, name), encoding="utf-8",
+                          errors="surrogateescape").read()
+          ps, pd = rd(rs, "default.prop"), rd(rd_, "default.prop")
+          diff = [(a, b) for a, b in zip(ps.splitlines(), pd.splitlines()) if a != b]
+          assert len(pd.splitlines()) == len(ps.splitlines()), "prop line count changed"
+          expect = {("ro.adb.secure=1", "ro.adb.secure=0"),
+                    ("ro.secure=1", "ro.secure=0"),
+                    ("ro.debuggable=0", "ro.debuggable=1"),
+                    ("persist.sys.usb.config=mtp", "persist.sys.usb.config=mtp,adb")}
+          got = set(diff)
+          assert got == expect, f"prop diff != expected: extra {got - expect}, missing {expect - got}"
+          print(f"[check] default.prop diff == exactly the 4 adb gate props")
+          rcs, rcd = rd(rs, mb.ADB_RC_FILE), rd(rd_, mb.ADB_RC_FILE)
+          assert rcd.startswith(rcs.rstrip("\n")), "rc change is not append-only"
+          assert mb.ADB_RC_MARKER in rcd and "start adbd" in rcd and "functions mtp,adb" in rcd
+          print(f"[check] {mb.ADB_RC_FILE}: keepalive appended after stock content")
+          # every other ramdisk file byte-identical
+          others = 0
+          for name in sorted(nd):
+              if name in ("default.prop", mb.ADB_RC_FILE):
+                  continue
+              a = os.path.join(rs, name); b = os.path.join(rd_, name)
+              if os.path.isfile(a) and os.path.isfile(b):
+                  assert open(a, "rb").read() == open(b, "rb").read(), f"{name} changed"
+                  others += 1
+          print(f"[check] {others} other regular ramdisk files byte-identical")
+          assert mb.check_tail_parses(bytes(hd["tail"])), "debug tail not valid DER"
+          assert len(hd["tail"]) > 0
+          print(f"[check] CMS signature tail present and parseable ({len(hd['tail'])} B)")
+          PY
+          sudo rm -rf "$P/rd_stock" "$P/rd_debug"
+          md5sum "$P/boot_debug.img" | tee "$P/boot_debug_md5.txt"
+
+      - name: Assemble boot-only flash mini package
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"; W="$RUNNER_TEMP/mini/U2_debug_boot"
+          rm -rf "$RUNNER_TEMP/mini"; mkdir -p "$W"
+          cp "$P/scatter.txt" "$W/MT6735M_Android_scatter.txt"
+          cp "$P/boot_debug.img" "$W/boot.img"
+          cat > "$W/README_flash_boot_only.txt" <<'README'
+          U2 debug boot.img -- adb always on (forensics / BT bring-up logs)
+          ==================================================================
+
+          WHAT THIS IS
+          - The boot.img of the base package (dm-verity off, AOSP testkey
+            re-signed) with ONLY these ramdisk changes:
+              ro.debuggable=0 -> 1     ro.adb.secure=1 -> 0
+              ro.secure=1 -> 0         persist.sys.usb.config=mtp -> mtp,adb
+              init.mt6735.usb.rc: appended an adbd keepalive trigger, so adb
+              comes up from init even if system_server never finishes booting.
+          - Kernel bytes are md5-asserted identical to stock.
+          - /system is NOT touched: flash this ALONE and the current system
+            (and its hang) stays exactly as-is -- with adb available.
+
+          FLASH (SP Flash Tool, ~15 s)
+          1. SP Flash Tool -> Scatter-loading -> pick
+             MT6735M_Android_scatter.txt from THIS folder.
+          2. Check ONLY the "boot" row (uncheck everything else!).  Its
+             Location must point at the boot.img in THIS folder.
+          3. Mode: Download Only.  Power the device OFF.
+          4. Click Download, then plug in USB.  Wait for the green check.
+
+          GET LOGS (Windows)
+          1. adb tooling: download "SDK Platform Tools for Windows" from
+             https://developer.android.com/tools/releases/platform-tools
+             unzip it, open cmd in that folder.
+          2. Power on the device, wait for the hang, then:
+               adb kill-server
+               adb devices            <- must list a serial + "device"
+               adb shell getprop sys.boot_completed
+               adb logcat -b all -d -v threadtime > logcat.txt
+               adb shell getprop > props.txt
+               adb root               <- debug boot allows this
+               adb shell dmesg > dmesg.txt
+               adb shell ps > ps.txt
+          3. Send back logcat.txt + props.txt + dmesg.txt + ps.txt.
+             If logcat.txt is huge, the tail (last ~2000 lines) is enough:
+             it repeats on every crash-loop cycle.
+          - "unauthorized": shouldn't happen (ro.adb.secure=0); re-plug once.
+          - No serial at all: install the Google USB driver (or the MTK
+            driver pack) and retry; try another cable/port (data-capable!).
+
+          DAILY USE
+          This boot is a DEBUG configuration (root shell over USB).  Keep it
+          while we debug; for a production config reflash the boot.img from
+          the firmware package you actually run.
+          README
+          (cd "$RUNNER_TEMP/mini" && zip -r9q "$RUNNER_TEMP/U2_debug_boot_mini.zip" U2_debug_boot)
+          ls -l "$RUNNER_TEMP/U2_debug_boot_mini.zip"
+          (cd "$RUNNER_TEMP" && md5sum U2_debug_boot_mini.zip probe/boot_debug.img > "$P/MD5SUMS.txt")
+          cat "$P/MD5SUMS.txt"
+
+      - name: Write DEBUGBOOT_VERIFICATION.md
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          python3 - <<'PY'
+          import hashlib, os
+          P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
+          rd = lambda n: open(os.path.join(P, n)).read().strip()
+          sz = lambda n: os.path.getsize(os.path.join(P, n))
+          L = []
+          L.append("# VERIFICATION -- debug boot.img (adb always on)\n")
+          L.append(f"- base package: `{os.environ['BASE_TAG']}` / `{os.environ['BASE_ASSET']}`")
+          L.append(f"- base boot.img md5: `{rd('boot_stock_md5.txt').split()[0]}` ({sz('boot_stock.img')} B)")
+          L.append(f"- debug boot.img md5: `{rd('boot_debug_md5.txt').split()[0]}` ({sz('boot_debug.img')} B)")
+          L.append(f"- kernel md5 (stock == debug, byte-identical): `{os.environ['KERNEL_MD5']}`")
+          L.append("- ramdisk file list identical; default.prop diff == exactly the 4 adb gate")
+          L.append("  props (ro.debuggable=1, ro.adb.secure=0, ro.secure=0,")
+          L.append("  persist.sys.usb.config=mtp,adb); init.mt6735.usb.rc change append-only")
+          L.append("  (on-boot usb config + mtp->mtp,adb adbd keepalive); every other regular")
+          L.append("  ramdisk file byte-identical; CMS tail re-signed with the AOSP testkey")
+          L.append("  (the stock signing key) and DER-parseable")
+          L.append("- mini zip: scatter + boot.img + README (boot-partition-only flash)")
+          txt = "\n".join(L) + "\n"
+          with open(os.path.join(P, "DEBUGBOOT_VERIFICATION.md"), "w") as f:
+              f.write(txt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(txt)
+          print(txt)
+          PY
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/probe"
+          DATE=$(date -u +%Y%m%d)
+          FW_TAG="${FW_TAG_IN:-firmware-debugboot-$DATE}"
+          NAME="U2 debug boot.img -- adb always on (boot-partition-only flash)"
+          {
+            echo "KeenPlus U2 -- **debug boot image**: makes adb available even on a hung"
+            echo "first boot.  Built from the boot.img of \`$BASE_TAG\` (verity-off,"
+            echo "testkey-signed): the four adb gate props flipped + an adbd keepalive"
+            echo "trigger appended to \`init.mt6735.usb.rc\`.  Kernel md5-asserted"
+            echo "identical to stock; ramdisk diff-asserted minimal (see verification)."
+            echo
+            echo "**Use:** SP Flash Tool -> scatter from \`U2_debug_boot_mini.zip\` ->"
+            echo "check ONLY **boot** -> Download Only (~15 s).  /system is untouched,"
+            echo "so the current system (and its hang) reproduces -- with adb.  Then:"
+            echo "\`adb logcat -b all -d -v threadtime > logcat.txt\` and friends (the"
+            echo "mini zip carries a full README with the exact commands)."
+            echo
+            echo "> Debug configuration (root shell over USB) -- not for daily use."
+          } > "$RUNNER_TEMP/NOTES.md"
+          python3 scripts/publish_release.py \
+            --tag "$FW_TAG" --name "$NAME" \
+            --body-file "$RUNNER_TEMP/NOTES.md" --prerelease \
+            --files "$RUNNER_TEMP/U2_debug_boot_mini.zip" "$P/boot_debug.img" \
+                    "$P/DEBUGBOOT_VERIFICATION.md" "$P/MD5SUMS.txt"
+
+      - name: Make artifact readable by the upload action
+        if: always()
+        run: |
+          P="$RUNNER_TEMP/probe"
+          [ -d "$P" ] || exit 0
+          sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
+          sudo chmod -R a+rX "$P" 2>/dev/null || true
+          [ -f "$RUNNER_TEMP/NOTES.md" ] && chmod a+r "$RUNNER_TEMP/NOTES.md" || true
+          rm -f "$P/boot_stock.img" "$P/boot_debug.img"   # big binaries live in the release
+          echo "unreadable leftovers: $(find "$P" ! -readable | wc -l)"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-debugboot-report
+          path: |
+            ${{ runner.temp }}/probe/
+            ${{ runner.temp }}/NOTES.md
+          if-no-files-found: warn

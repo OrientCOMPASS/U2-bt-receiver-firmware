@@ -71,24 +71,36 @@ vendor/app/MiraVision
 # getBlockUninstallForUser/startPermsServiceForUninstall hooks).
 # ValidationTools' autoInstallapk/AutoUninstallApkService classes (removed
 # in v0) were the factory-line variant.  Nothing is downloaded: the APKs
-# ship in the image and are installed locally on first boot.  Removing the
-# payload kills the mechanism regardless of which installer runs it.
-# vendor/operator holds nothing but these six app dirs (probe v8: configs
-# file list empty, 203 MiB total).
+# ship in the image and are installed locally on first boot.
+#
+# *** v3 (2026-10-30): DO NOT DELETE THESE DIRS -- STUB them instead. ***
+# v2 removed the six payload dirs outright and the device then HUNG AT
+# FIRST BOOT (looping progress bar).  Bisected with the v2-raw re-encode
+# (firmware-debloat-v2-raw-20261030): same hang, so the v2 base itself is
+# the culprit and the BT-swap stack was exonerated.  Conclusion: the USP
+# first-boot customization requires the payload tree to exist; deleting it
+# wedges the boot flow.  v3 keeps paths, file names and package names and
+# replaces only the APK CONTENTS with ~600 B valid stubs -- see
+# debloat/stub-list.txt + scripts/make_stub_apk.py + the operator_stubs
+# input of fw-debloat.yml.  The six entries therefore stay commented out:
+# vendor/operator/app/kuake        (com.quark.browser)
+# vendor/operator/app/WDJ          (com.wandoujia.phoenix2)
+# vendor/operator/app/HiBy         (com.hiby.music)
+# vendor/operator/app/mxsq         (uni.UNI557FDDF)
+# vendor/operator/app/wanneglianbo (com.iqiyi.wlanplay)
+# vendor/operator/app/xunfeishurufa(com.iflytek.inputmethod)
+# (vendor/operator holds nothing but these six app dirs -- probe v8:
+# configs file list empty, 203 MiB total.)
 #
 # Keyboard note: removing the iFlytek IME payload is safe -- the stock AOSP
 # LatinIME (com.android.inputmethod.latin) is present in app/LatinIME and
 # is NOT touched by this list.
 #
-# 夸克 Quark (com.quark.browser):
-vendor/operator/app/kuake
-# 豌豆荚 Wandoujia (com.wandoujia.phoenix2):
-vendor/operator/app/WDJ
-# 海贝音乐 HiBy Music (com.hiby.music):
-vendor/operator/app/HiBy
-# 萌新社区 (uni.UNI557FDDF):
-vendor/operator/app/mxsq
-# 万能联播 (com.iqiyi.wlanplay):
-vendor/operator/app/wanneglianbo
-# 讯飞输入法 iFlytek IME (com.iflytek.inputmethod):
-vendor/operator/app/xunfeishurufa
+# (v2 payload removal entries -- superseded by debloat/stub-list.txt, see
+# the v3 note above.  Kept here, commented, as the historical record.)
+# vendor/operator/app/kuake
+# vendor/operator/app/WDJ
+# vendor/operator/app/HiBy
+# vendor/operator/app/mxsq
+# vendor/operator/app/wanneglianbo
+# vendor/operator/app/xunfeishurufa

@@ -66,6 +66,10 @@ on:
         description: 'Ship system.img RAW (non-sparse) -- workaround for the SPFT/DA sparse FILL-write crash at 92%'
         type: boolean
         default: false
+      expect_apks:
+        description: 'Expected APK inventory record count (debloat-v2 base=74; v3 stub base=80)'
+        default: '74'
+        required: false
 
 permissions:
   contents: write
@@ -80,6 +84,7 @@ env:
   BASE_ASSET: ${{ inputs.base_asset }}
   BT_RUN_ID: ${{ inputs.bt_run_id }}
   RAW_SYSTEM: ${{ inputs.raw_system }}
+  EXPECT_APKS: ${{ inputs.expect_apks }}
 
 jobs:
   btswap:
@@ -369,13 +374,15 @@ jobs:
           # device ships without Telephony; confirmed by fw-debloat v0/v1/v2 runs:
           # "not present in baseline (skipped)").  btswap must not touch apps at
           # all, so assert the packages the baseline actually has, plus an exact
-          # APK-record count match against the base image (74 in debloat v2).
+          # APK-record count match against the base image (expect_apks input;
+          # debloat v2 = 74, v3 with six stubbed operator payloads = 80).
           REQUIRED = ["com.android.systemui", "com.android.settings",
                       "com.android.bluetooth", "com.android.packageinstaller",
                       "com.android.providers.settings", "com.android.shell"]
           lost = [p for p in REQUIRED if p not in pkgs]
           assert not lost, f"boot-critical packages lost: {lost}"
-          assert len(apps) == 74, f"APK record count changed: {len(apps)} != 74 (base debloat-v2)"
+          expect = int(os.environ.get("EXPECT_APKS") or 74)
+          assert len(apps) == expect, f"APK record count changed: {len(apps)} != {expect} (base expectation)"
           print(f"[verify] boot-critical packages present; {len(apps)} APK records (unchanged vs base)")
           PY
           test -f /mnt/chk/framework/framework-res.apk

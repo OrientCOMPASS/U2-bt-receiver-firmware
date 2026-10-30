@@ -249,3 +249,18 @@ raw system.img md5 `5e994b3684b00194d6cfaa915a5443c7`），run 41052821368 全�
 - `scripts/repack_firmware.py` / `mtk_fw_zip.py` / `mtk_scatter.py`：B4 直接复用
   （scatter 已按官方文件逐字节保留）。
 - `build.yml`（完整 8.1）：保留，等算力到位后仍是"真 8.1 固件"的正路。
+
+### 4.5 上机判决：BT 换栈无罪（v2-raw 二分）
+
+btswap-raw 刷写 100% 成功但首启卡「循环进度条」后，用 fw-rawpack 把
+**v2 原样**（stock BT 栈，md5 断言在镜像内）重编码为 raw 上机：同样刷写
+成功、同样卡循环进度条。两包唯一差异（bluetooth.default.so）被排除 ——
+**挂死来自 v2 基座本身**：删除 `vendor/operator/app/` 载荷目录令 MTK USP
+首启定制流程无法完成（详见 docs/DROPPER_FORENSICS.md 后续章节）。换栈
+.so 的静态取证（无 TLS 重定位、EABI/FLAGS/哈希表/版本引用与 stock 兼容、
+vendor 链 opcode/回调偏移全覆盖）与此判决一致。
+
+修复路线：debloat v3 = 载荷 stub 替换（保目录树/文件名/包名，内容换
+~600 B 签名空壳）；取证工具：fw-debugboot.yml（adb 常开调试 boot.img，
+只刷 boot 分区即可在挂死现场抓 logcat/dmesg）。BT 换栈包将在 v3 基座
+上机验证启动正常后重发（fw-btswap 已参数化 expect_apks=80）。
