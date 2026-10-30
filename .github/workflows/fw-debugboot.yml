@@ -140,7 +140,7 @@ jobs:
           set -euo pipefail
           P="$RUNNER_TEMP/probe"
           python3 - <<'PY'
-          import hashlib, os, sys
+          import hashlib, os, subprocess, sys
           sys.path.insert(0, "scripts")
           import mtk_bootimg as mb
           P = os.path.join(os.environ["RUNNER_TEMP"], "probe")
@@ -159,38 +159,46 @@ jobs:
           rs = os.path.join(P, "rd_stock"); rd_ = os.path.join(P, "rd_debug")
           mb.extract_ramdisk(bytes(hs["ramdisk"]), rs)
           mb.extract_ramdisk(bytes(hd["ramdisk"]), rd_)
-          def rd(base, name):
-              return open(os.path.join(base, name), encoding="utf-8",
-                          errors="surrogateescape").read()
-          ps, pd = rd(rs, "default.prop"), rd(rd_, "default.prop")
-          diff = [(a, b) for a, b in zip(ps.splitlines(), pd.splitlines()) if a != b]
-          assert len(pd.splitlines()) == len(ps.splitlines()), "prop line count changed"
-          expect = {("ro.adb.secure=1", "ro.adb.secure=0"),
-                    ("ro.secure=1", "ro.secure=0"),
-                    ("ro.debuggable=0", "ro.debuggable=1"),
-                    ("persist.sys.usb.config=mtp", "persist.sys.usb.config=mtp,adb")}
-          got = set(diff)
-          assert got == expect, f"prop diff != expected: extra {got - expect}, missing {expect - got}"
-          print(f"[check] default.prop diff == exactly the 4 adb gate props")
-          rcs, rcd = rd(rs, mb.ADB_RC_FILE), rd(rd_, mb.ADB_RC_FILE)
-          assert rcd.startswith(rcs.rstrip("\n")), "rc change is not append-only"
-          assert mb.ADB_RC_MARKER in rcd and "start adbd" in rcd and "functions mtp,adb" in rcd
-          print(f"[check] {mb.ADB_RC_FILE}: keepalive appended after stock content")
-          # every other ramdisk file byte-identical
-          others = 0
-          for name in sorted(nd):
-              if name in ("default.prop", mb.ADB_RC_FILE):
-                  continue
-              a = os.path.join(rs, name); b = os.path.join(rd_, name)
-              if os.path.isfile(a) and os.path.isfile(b):
-                  assert open(a, "rb").read() == open(b, "rb").read(), f"{name} changed"
-                  others += 1
-          print(f"[check] {others} other regular ramdisk files byte-identical")
-          assert mb.check_tail_parses(bytes(hd["tail"])), "debug tail not valid DER"
-          assert len(hd["tail"]) > 0
-          print(f"[check] CMS signature tail present and parseable ({len(hd['tail'])} B)")
+          # cpio -idm preserves the stock mode bits (rc files 0640 root, the
+          # 'd' dir even 000) -- open them up for the runner user, otherwise
+          # every read below dies with EACCES (run 41072400799 lesson).
+          subprocess.run(["sudo", "chmod", "-R", "a+rX", rs, rd_], check=True)
+          try:
+              def rd(base, name):
+                  return open(os.path.join(base, name), encoding="utf-8",
+                              errors="surrogateescape").read()
+              ps, pd = rd(rs, "default.prop"), rd(rd_, "default.prop")
+              diff = [(a, b) for a, b in zip(ps.splitlines(), pd.splitlines()) if a != b]
+              assert len(pd.splitlines()) == len(ps.splitlines()), "prop line count changed"
+              expect = {("ro.adb.secure=1", "ro.adb.secure=0"),
+                        ("ro.secure=1", "ro.secure=0"),
+                        ("ro.debuggable=0", "ro.debuggable=1"),
+                        ("persist.sys.usb.config=mtp", "persist.sys.usb.config=mtp,adb")}
+              got = set(diff)
+              assert got == expect, f"prop diff != expected: extra {got - expect}, missing {expect - got}"
+              print("[check] default.prop diff == exactly the 4 adb gate props")
+              rcs, rcd = rd(rs, mb.ADB_RC_FILE), rd(rd_, mb.ADB_RC_FILE)
+              assert rcd.startswith(rcs.rstrip("\n")), "rc change is not append-only"
+              assert mb.ADB_RC_MARKER in rcd and "start adbd" in rcd and "functions mtp,adb" in rcd
+              print(f"[check] {mb.ADB_RC_FILE}: keepalive appended after stock content")
+              # every other ramdisk file byte-identical
+              others = 0
+              for name in sorted(nd):
+                  if name in ("default.prop", mb.ADB_RC_FILE):
+                      continue
+                  a = os.path.join(rs, name); b = os.path.join(rd_, name)
+                  if os.path.isfile(a) and os.path.isfile(b):
+                      assert open(a, "rb").read() == open(b, "rb").read(), f"{name} changed"
+                      others += 1
+              print(f"[check] {others} other regular ramdisk files byte-identical")
+              assert mb.check_tail_parses(bytes(hd["tail"])), "debug tail not valid DER"
+              assert len(hd["tail"]) > 0
+              print(f"[check] CMS signature tail present and parseable ({len(hd['tail'])} B)")
+          finally:
+              # always clean the root-owned scratch trees (upload-artifact
+              # EACCES otherwise -- the fw-btswap step-19 lesson)
+              subprocess.run(["sudo", "rm", "-rf", rs, rd_], check=False)
           PY
-          sudo rm -rf "$P/rd_stock" "$P/rd_debug"
           md5sum "$P/boot_debug.img" | tee "$P/boot_debug_md5.txt"
 
       - name: Assemble boot-only flash mini package
@@ -319,6 +327,7 @@ jobs:
         run: |
           P="$RUNNER_TEMP/probe"
           [ -d "$P" ] || exit 0
+          sudo rm -rf "$P/rd_stock" "$P/rd_debug" 2>/dev/null || true
           sudo chown -R "$(id -u):$(id -g)" "$P" 2>/dev/null || true
           sudo chmod -R a+rX "$P" 2>/dev/null || true
           [ -f "$RUNNER_TEMP/NOTES.md" ] && chmod a+r "$RUNNER_TEMP/NOTES.md" || true
