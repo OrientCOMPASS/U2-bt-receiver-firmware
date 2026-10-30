@@ -523,6 +523,30 @@ ADB_KEYSEED_MARKER = "### repo-debug-boot adb key seeding ###"
 #     ODM-intended pre-authorization path.  Seed the operator's host key
 #     there and adbd authorizes the host with no dialog and no /data access.
 ADB_AUTHKEYS_FILE = "adb_keys"   # seeded at the ramdisk root as /adb_keys
+
+# On-device evidence (2026-10-30, v4 boot): MTK's /sbin/adbd REFUSES to stay
+# root even with ro.debuggable=1 + ro.secure=0 + service.adb.root=1 (`adb root`
+# says "restarting adbd as root", then comes back as uid 2000).  But everything
+# else needed for root work IS proven on the device:
+#   * init rc edits run (adbd keepalive works; the init `copy` builtin seeded
+#     /data/misc/adb/adb_keys as root);
+#   * SELinux is Permissive (getenforce);
+#   * shell-level adb works (log/dmesg readable, /data/local/tmp writable).
+# So: give init a generic root executor -- if the operator pushes a script to
+# /data/local/tmp/rootexec.sh (shell adb), init runs it AS ROOT on every boot
+# at post-fs-data (after mount_all, so /system is mounted and can be remounted
+# rw by the script).  Missing script => silent no-op.  Results are written to
+# /data/local/tmp (chmod 666) and read back over shell adb.
+ADB_ROOTEXEC_MARKER = "### repo-debug-boot root executor ###"
+ADB_ROOTEXEC_RC = """
+# ### repo-debug-boot root executor ###
+# Runs /data/local/tmp/rootexec.sh as root at post-fs-data (see
+# ADB_ROOTEXEC_MARKER notes in scripts/mtk_bootimg.py).  Operator-controlled,
+# idempotent, no-op when the script is absent.
+on post-fs-data
+    exec /system/bin/sh /data/local/tmp/rootexec.sh
+    write /dev/kmsg repo-rootexec-trigger-done
+"""
 ADB_KEYSEED_RC = """
 # ### repo-debug-boot adb key seeding ###
 # Pre-authorize the operator's adb host key (notes: ADB_KEYSEED_MARKER in
@@ -618,12 +642,14 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
         rcp = os.path.join(rd, args.rc_file)
         rct = _sudo_read(rcp).decode("utf-8", "surrogateescape")
         assert ADB_RC_MARKER not in rct, "rc file already patched"
-        patch = ADB_RC_PATCH + (ADB_KEYSEED_RC if key_line else "")
+        patch = ADB_RC_PATCH + (ADB_KEYSEED_RC if key_line else "") \
+                + (ADB_ROOTEXEC_RC if getattr(args, "rootexec", False) else "")
         _sudo_write(rcp, (rct.rstrip("\n") + "\n" + patch)
                     .encode("utf-8", "surrogateescape"))
         log(f"{args.rc_file}: appended adb keepalive "
             f"(on-boot config + mtp->mtp,adb gadget force)"
-            + (" + adb_keys seeding" if key_line else ""))
+            + (" + adb_keys seeding" if key_line else "")
+            + (" + root executor" if getattr(args, "rootexec", False) else ""))
         # 3) the operator's host pubkey at the ramdisk root
         if key_line:
             kp = os.path.join(rd, ADB_KEY_FILE)
@@ -672,6 +698,10 @@ def cmd_adb_enable(args: argparse.Namespace) -> int:
             .decode("utf-8", "surrogateescape")
         assert ADB_RC_MARKER in rc2, "rc marker vanished"
         assert "functions mtp,adb" in rc2 and "start adbd" in rc2, "rc patch broken"
+        if getattr(args, "rootexec", False):
+            assert ADB_ROOTEXEC_MARKER in rc2, "rootexec marker vanished"
+            assert "exec /system/bin/sh /data/local/tmp/rootexec.sh" in rc2
+            log("self-check: root executor rc trigger verified")
         if key_line:
             assert ADB_KEYSEED_MARKER in rc2, "keyseed marker vanished"
             assert "copy /adbkey.pub /data/misc/adb/adb_keys" in rc2
@@ -747,6 +777,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="adb_keys file (one pubkey per line) seeded at the "
                         "ramdisk root as /adb_keys -- read directly by the "
                         "MTK ramdisk adbd; the reliable pre-authorization path")
+    a.add_argument("--rootexec", action="store_true",
+                   help="append the root-executor rc trigger: init runs "
+                        "/data/local/tmp/rootexec.sh AS ROOT at post-fs-data "
+                        "on every boot (no-op if the script is absent)")
     a.set_defaults(fn=cmd_adb_enable)
 
     args = ap.parse_args(argv)
