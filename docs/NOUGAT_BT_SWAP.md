@@ -202,6 +202,32 @@ e2fsck 清洁；img2simg 回稀疏（1,189,549,592 B < 3,095,396,352 B 分区）
    ramdisk 归档权限位（部分目录 mode 000），runner 无法 scandir；验证后删除
    `pkgrd/`、`pkgboot/` 临时目录即愈。
 
+### 4.4 SPFT "92% 闪退"事件与 raw_system 模式（2026-10-30）
+
+用户实测：v0、v1 可 100% 刷入并开机；**v2 与 btswap（sparse system.img）均在
+92% 处 USB 断联 + SP Flash Tool 闪退**（同日同机、间隔约 1 小时，排除环境漂移；
+解压文件逐字节完整，排除截断）。
+
+对四个包的 system.img 做 sparse chunk 表取证（结构全部合法：v1.0、4096B 块、
+755,712 块、chunk ≤64MiB、零违规），发现唯一 4/4 完全相关的判别特征——
+整体进度 92% == 已写入第 708,723 块（镜像 93.8%）处的 chunk 类型：
+
+| 包 | 块 704,806–713,962 | 结果 |
+|---|---|---|
+| v0 | RAW（数据，idx 6615 span 9156） | ✅ 100% |
+| v1 | RAW（数据，idx 6624 span 9156） | ✅ 100% |
+| v2 | **FILL（零块，idx 6618 span 9158）** | ❌ 92% 崩 |
+| btswap | **FILL（零块，idx 5615 span 16384）** | ❌ 92% 崩 |
+
+即该 SPFT/DA 组合在镜像后段写这段 FILL（零块填充命令）时崩溃；更早、更大的
+FILL 段（52–74% 处、最长 128MiB）却能正常写完，机制不透明（疑 DA FILL 写入
+路径缺陷）。**对策：`fw-btswap.yml` 新增 `raw_system` 输入**——跳过 img2simg，
+直接发 3,095,396,352 B 的 raw ext4 镜像（== 分区大小），完全不经过 FILL 路径；
+包内附 MD5SUMS.txt 供解压完整性核对。产物：release
+`firmware-btswap-raw-20261030` / `U2_7.0_bt_sink_v0_raw.zip`
+（619,877,042 B，md5 `81f0e53434a553fc002df319ffe5d72c`；
+raw system.img md5 `5e994b3684b00194d6cfaa915a5443c7`），run 41052821368 全绿。
+
 **B5（用户侧）**：SP Flash Tool → zip 内 scatter → Download Only；开机后配对、
 连手机音频，`dumpsys bluetooth_manager` / logcat `bta_av_co` 应见
 `setconfig AAC` 或 `setconfig LDAC`（手机支持时）；救援 = 回刷 debloat-v2。
