@@ -1,24 +1,26 @@
 # Nougat BT Swap — 在官方 7.0 固件上落地自研蓝牙栈
 
-> **状态：已重启（2026-10-30，用户指令）——现为唯一活跃路线。**
+> **状态：B4 已交付（2026-10-30）——可刷包已发布，等待 B5 上机验证。**
 > 8.1 全量构建路线终止（构建机始终未到位，v0–v4 实验固件与 workflows 已删除，
 > 仓库回滚至 3c8b5b2）。基线直改（debloat）路线已产出可刷固件并在真机验证：
 > `firmware-debloat-20261029` 刷入后**正常开机**——这同时证明了本路线 B4 的
 > 两大前置：verity-off boot 重打包被 lk/init 接受；system.img 手术后 e2fsck/
 > 挂载/启动全链路无损。
 >
-> **重启后的功能范围（用户 2026-10-30 确认）**：A2DP **Sink** +
-> **AAC 解码** + **LDAC 660 kbps 接收**（按 DEVELOPMENT_PLAN.md §16.8：
-> `hegdi/libldacdec` MIT clean-room 解码器 + 自制 `libldacBT_bco.so` shim +
-> SINK_LDAC 挂接 + AVDTP MTU 1024）。Java 层维持不动（R3 首选路径）。
+> **功能范围（用户 2026-10-30 确认，已按此交付）**：A2DP **Sink** +
+> **AAC 解码** + **LDAC 660 kbps 接收**（DEVELOPMENT_PLAN.md §16.8）。
+> 实际实现比原计划更简：`hegdi/libldacdec`（MIT clean-room）**直接静态链入**
+> `bluetooth.default.so`（vendored 于 `third_party/libldacdec/`，无需
+> `libldacBT_bco.so` shim）；AAC = FDK LATM（RFC 3016）静态链入；
+> Java 层未动（R3 首选路径成立）。
 >
-> **执行载体已就位**：`bt_standalone_build.sh` 新增 nougat 树支持
-> （`--tag android-7.0.0_r36` 自动切换；无 libldac/无 bt_av HAL 补丁；
-> pristine 哨兵集；GKI 目录纳入 TU 清单），`scripts/bt_symbol_gate.py`
-> 实现 B3 链接零缺口闸门，`.github/workflows/bt70.yml` 串起
-> 编译 → 链接 → B1 基线符号门。补丁系列规划见 `patches/nougat/README.md`
-> （0001 aac-sink → 0002 sbc-xq → 0003 avdt-mtu → 0004 ldac-sink）。
-> B4 将基于 fw-debloat 已验证的手术流水线新增 swap 步骤；B5 上机。
+> **执行载体**：`bt_standalone_build.sh --tag android-7.0.0_r36`（nougat 树）
+> + `scripts/bt_symbol_gate.py`（B3 链接零缺口闸门）+ `.github/workflows/bt70.yml`
+> （编译→链接→符号门）。补丁系列最终收敛为 `patches/nougat/system_bt/` 两个
+> 补丁：**0001 控制面**（AVDTP/BTA 协商接受 AAC/LDAC sink）+ **0002 数据面**
+> （解码挂接与 AudioTrack 渲染）；LDAC/AAC 解码器均为静态链入。
+> B4 由 `.github/workflows/fw-btswap.yml` 完成（基于 fw-debloat v2 手术流水线，
+> 仅替换 `/system/lib/hw/bluetooth.default.so` 一个文件）；B5 待用户上机。
 
 ## 1. 为什么走这条路
 
@@ -73,16 +75,15 @@ r80 `system/bt` 全栈编译成了 ARM/bionic 目标码：
   `scripts/baseline_probe.py` + `baseline-probe.yml`（纯 stdlib 的
   zip/sparse/ext4/ELF32 解析器，无需 root/loop-mount）。实测结果见 §4.1，
   **AOSP tag 定为 `android-7.0.0_r36`**（基线为 7.0 NRD90M，R5 解除）。
-- **B2 补丁移植**：把 4+1 个补丁从 r80 移植到 7.0 树
+- **B2 补丁移植（✅ 已完成）**：把补丁从 r80 移植到 7.0 树
   （栈位置不同：`hardware/broadcom/bluetooth`；无 `a2dp_codecs` 框架，
   AAC sink 需要按 7.0 的 `btif_a2dp_sink`/`bta_av` 结构重写挂接点）。
   产出 `patches/nougat/` 系列 + harness 以 `--tag` 参数复验编译。
-- **B3 真链接验证**：从基线 `system.img` 提取全部 DT_NEEDED .so，
+- **B3 真链接验证（✅ 已完成，run 41001545274）**：从基线 `system.img` 提取全部 DT_NEEDED .so，
   用它们（而非 stub）链接我们的模块；`llvm-nm` 对比未定义符号 ⊆ 基线导出
   符号。**链接零缺口 = 上机前最强的可行性证明**。
-- **B4 镜像手术 + 重打包**：CI（root runner）loop-mount `system.img`，替换
-  §2 清单文件，恢复权限/SELinux xattr，容量校验（≤2952 MiB 分区），走既有
-  `repack_firmware.py` + 官方 scatter → SP_Flash_Tool 可刷 zip → GitHub Release。
+- **B4 镜像手术 + 重打包（✅ 已完成，run 41003456394 全绿，release
+  `firmware-btswap-20261030`）**：实测记录见 §4.3。
 - **B5 上机验证**（用户侧）：刷机、开关蓝牙、A2DP Sink SBC/AAC 连接出声、
   双设备（F6 受 7.0 单状态机限制，见 §5 R4）、延迟/稳定性按 R 指标抽测。
 
@@ -171,6 +172,39 @@ testkey 重签）；确定性由 `--renumber-inodes` + 归档 mtime 恢复保证
 结论：**full 换芯只能用 B2（7.0 源码移植 + 独立编译）的产物**；`swapfw.yml`
 的 full 模式保留符号门作为强制闸门，`bootonly` 模式（原厂 system +
 verity-off 重签 boot）先行上机验证 lk/init 是否接受重签 boot。
+
+### 4.3 B4 落地实录（2026-10-30）：栈产物 → swap 包 → 全绿发布
+
+**栈产物（bt70 run 41001545274，commit e9867bf）**：
+`bluetooth.default.so` 4,398,296 B，ELF32 ARM，443/443 TU；符号门 PASS
+（missing=[]，strong_und=175）；DT_NEEDED 恰为 9 个基线 `/system/lib` 已有库
+（liblog/libz/libdl/libcutils/libutils/libhardware/libmedia/libm/libc）；
+tinyxml2 静态链入（hidden visibility，dynsym 0 条目）；codec 优先级
+INT：LDAC > AAC > SBC。
+
+**关键发现（HMI）**：AOSP HAL 入口宏 `HAL_MODULE_INFO_SYM` 展开后导出符号名
+就是 `HMI`（`hardware.h:207`），stock `libbluetooth_jni.so` 以
+`HAL_MODULE_INFO_SYM_AS_STR="HMI"` dlsym 之——产物验证必须查 `HMI` 而非宏字面量。
+
+**swap 包（fw-btswap.yml，base=`firmware-debloat-v2-20261030`）**：
+仅改 `/system/lib/hw/bluetooth.default.so`（cat 原地写，inode/mode/SELinux
+xattr 保留：`u:object_r:system_file:s0`）；零填充空闲块（stock 栈残块不出货）；
+e2fsck 清洁；img2simg 回稀疏（1,189,549,592 B < 3,095,396,352 B 分区）；
+非 system 分区 10 项 md5 与 base 逐一相同；kernel md5 原厂、fstab verity-off。
+发布：`U2_7.0_bt_sink_v0.zip` 618,511,945 B，md5 `9f60c1e8360ea883302b778025ea241b`
++ `VERIFICATION.md`（完整审计链）。
+
+**首跑失败教训（已修）**：
+1. run 41002423353 —— 断言 `com.android.phone` 必在：官方基线**本就不带**
+   Telephony（BT 接收器产品；fw-debloat 日志早有 "not present in baseline
+   (skipped)" 注记）。改为只断言基线实有包 + APK 记录数恰为 74（与 base 相同）。
+2. run 41002971414 —— 1–18 步全绿仅 upload-artifact 失败：`cpio -idm` 保留
+   ramdisk 归档权限位（部分目录 mode 000），runner 无法 scandir；验证后删除
+   `pkgrd/`、`pkgboot/` 临时目录即愈。
+
+**B5（用户侧）**：SP Flash Tool → zip 内 scatter → Download Only；开机后配对、
+连手机音频，`dumpsys bluetooth_manager` / logcat `bta_av_co` 应见
+`setconfig AAC` 或 `setconfig LDAC`（手机支持时）；救援 = 回刷 debloat-v2。
 
 ## 5. 风险与对策
 
