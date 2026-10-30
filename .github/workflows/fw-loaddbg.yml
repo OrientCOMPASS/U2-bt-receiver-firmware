@@ -223,6 +223,7 @@ jobs:
       - name: Load matrix under qemu-arm (real linker, real libs)
         run: |
           set -uo pipefail
+          set +e   # runner shell adds -e; run_case must survive non-zero rc
           L="$RUNNER_TEMP/logs"; SYS="$SYSROOT"; W="$RUNNER_TEMP/work"
           STOCK_CONTROL="${STOCK_CONTROL:-0}"
           OURS="$SYS/system/lib/hw/bluetooth.default.so"
@@ -263,7 +264,7 @@ jobs:
           run_case ours_hal      "$OURS"  hal     60 gate
           run_case stock_hal     "$STOCK" hal     60 ${STOCK_CONTROL:+gate}
           run_case vendor_iface  "$VEND"  vendor  60 gate
-          run_case mtk_iface     "$MTK"   vendor  60 info
+          run_case mtk_iface     "$MTK"   plain   60 info
           run_case ours_halopen  "$OURS"  halopen 45 info
           run_case stock_halopen "$STOCK" halopen 45 info
           echo "" | tee -a "$L/matrix.txt"
@@ -302,6 +303,7 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          set +e   # runner shell adds -e; run_case must survive non-zero rc
           L="$RUNNER_TEMP/logs"
           {
             echo "# fw-loaddbg report (qemu-arm + real bionic linker)"

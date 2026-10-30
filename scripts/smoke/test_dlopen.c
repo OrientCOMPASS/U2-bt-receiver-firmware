@@ -9,7 +9,9 @@
  * dlopen(path, RTLD_NOW) -> dlsym("HMI")).
  *
  * Usage:
- *   test_dlopen <path-to.so> [hal|vendor|halopen]
+ *   test_dlopen <path-to.so> [plain|hal|vendor|halopen]
+ *     plain:            dlopen only; no entry-symbol requirement (for stack
+ *                       core libs like libbluetooth_mtk.so).
  *     hal    (default): expect HAL_MODULE_INFO_SYM == exported symbol "HMI";
  *                       print tag/module_api_version/hal_api_version/id/name.
  *     vendor:           expect BLUETOOTH_VENDOR_LIB_INTERFACE (16-byte
@@ -57,6 +59,14 @@ int main(int argc, char **argv) {
         return 2;
     }
     printf("[smoke] dlopen OK\n");
+    if (strcmp(mode, "plain") == 0) {
+        /* Pure dlopen check: library loads and its constructors ran, but we
+         * do NOT require any particular entry symbol (e.g. libbluetooth_mtk.so
+         * is the MTK stack core -- it exports neither HMI nor the vendor
+         * interface). */
+        printf("[smoke] PASS plain (dlopen + linker init only)\n");
+        return 0;
+    }
     if (strcmp(mode, "vendor") == 0) {
         void *s = dlsym(h, "BLUETOOTH_VENDOR_LIB_INTERFACE");
         if (!s) { printf("[smoke] FAIL: vendor interface symbol missing\n"); return 3; }
