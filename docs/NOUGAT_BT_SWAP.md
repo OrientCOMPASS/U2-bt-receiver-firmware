@@ -191,8 +191,8 @@ INT：LDAC > AAC > SBC。
 xattr 保留：`u:object_r:system_file:s0`）；零填充空闲块（stock 栈残块不出货）；
 e2fsck 清洁；img2simg 回稀疏（1,189,549,592 B < 3,095,396,352 B 分区）；
 非 system 分区 10 项 md5 与 base 逐一相同；kernel md5 原厂、fstab verity-off。
-发布：`U2_7.0_bt_sink_v0.zip` 618,511,945 B，md5 `9f60c1e8360ea883302b778025ea241b`
-+ `VERIFICATION.md`（完整审计链）。
+发布：`U2_7.0_bt_sink_v0.zip` 617,691,239 B，md5 `3c9d6273a19d0eab54399939d1f14c04`
+（以 release 内 `VERIFICATION.md` 为准；zip 打包非字节确定，每次重跑 md5 会变）。
 
 **首跑失败教训（已修）**：
 1. run 41002423353 —— 断言 `com.android.phone` 必在：官方基线**本就不带**
