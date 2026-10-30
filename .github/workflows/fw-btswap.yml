@@ -27,6 +27,11 @@
 #
 # Publishes: release `firmware-btswap-<date>` (prerelease) with the flash zip
 # + VERIFICATION.md; artifact `fw-btswap-report` carries all JSON/logs.
+#
+# raw_system input: ship system.img un-sparsified (RAW).  Workaround for the
+# SPFT/DA crash at 92% observed on the user host with sparse images: the DA
+# dies writing the FILL chunk over blocks 704805-713963, while v0/v1 wrote the
+# same blocks as RAW chunks fine.  Raw mode also embeds MD5SUMS.txt in the zip.
 # --------------------------------------------------------------------------- #
 name: fw-btswap
 
@@ -57,6 +62,10 @@ on:
         description: 'Publish the GitHub release when every check passes'
         type: boolean
         default: true
+      raw_system:
+        description: 'Ship system.img RAW (non-sparse) -- workaround for the SPFT/DA sparse FILL-write crash at 92%'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -70,6 +79,7 @@ env:
   BASE_TAG: ${{ inputs.base_tag }}
   BASE_ASSET: ${{ inputs.base_asset }}
   BT_RUN_ID: ${{ inputs.bt_run_id }}
+  RAW_SYSTEM: ${{ inputs.raw_system }}
 
 jobs:
   btswap:
@@ -253,22 +263,42 @@ jobs:
           test "$rc" -le 3
           sudo e2fsck -fn "$RUNNER_TEMP/system.raw.img"
           echo "e2fsck -fn: clean"
-          img2simg "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img" 4096
-          SZ=$(stat -c %s "$RUNNER_TEMP/system.sparse.img")
-          echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
-          test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
-          if [ "$SZ" -gt 2000000000 ]; then
-            echo "FATAL: sparse system.img is $SZ bytes -- free space not zeroed?"; exit 1
+          if [ "$RAW_SYSTEM" = "true" ]; then
+            # RAW mode: ship the ext4 image un-sparsified.  Workaround for the
+            # user's host: SP Flash Tool/DA deterministically dies at 92% on the
+            # sparse v2/btswap images -- the death point is the FILL chunk over
+            # blocks 704805-713963 (93.8% of the image); v0/v1 wrote the SAME
+            # blocks as RAW chunks without issue.  A fully-raw image never uses
+            # the FILL write path at all.
+            SZ=$(stat -c %s "$RUNNER_TEMP/system.raw.img")
+            echo "raw system.img: $SZ bytes (partition $SYSTEM_PARTITION_BYTES)"
+            test "$SZ" -eq "$SYSTEM_PARTITION_BYTES"
+          else
+            img2simg "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img" 4096
+            SZ=$(stat -c %s "$RUNNER_TEMP/system.sparse.img")
+            echo "sparse system.img: $SZ bytes (partition cap $SYSTEM_PARTITION_BYTES)"
+            test "$SZ" -lt "$SYSTEM_PARTITION_BYTES"
+            if [ "$SZ" -gt 2000000000 ]; then
+              echo "FATAL: sparse system.img is $SZ bytes -- free space not zeroed?"; exit 1
+            fi
           fi
 
       - name: Assemble the flash package (base parts + new system.img)
         run: |
           set -euo pipefail
-          cp "$RUNNER_TEMP/system.sparse.img" "$BASEDIR/system.img"
-          rm -f "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img"
+          if [ "$RAW_SYSTEM" = "true" ]; then
+            mv "$RUNNER_TEMP/system.raw.img" "$BASEDIR/system.img"
+          else
+            cp "$RUNNER_TEMP/system.sparse.img" "$BASEDIR/system.img"
+            rm -f "$RUNNER_TEMP/system.raw.img" "$RUNNER_TEMP/system.sparse.img"
+          fi
           NEWPKG="$RUNNER_TEMP/$PKG"
           rm -rf "$NEWPKG"
           mv "$BASEDIR" "$NEWPKG"
+          # per-file md5 table so the user can verify extraction integrity
+          (cd "$NEWPKG" && for f in *; do
+             [ "$f" = MD5SUMS.txt ] || md5sum "$f"; done > MD5SUMS.txt)
+          cat "$NEWPKG/MD5SUMS.txt"
           python3 - <<'PY'
           import os, sys
           sys.path.insert(0, "scripts")
@@ -291,14 +321,21 @@ jobs:
           SCAT="$(find "$CHK/$PKG" -name '*_scatter.txt' | head -1)"
           python3 scripts/mtk_scatter.py validate "$SCAT" "$CHK/$PKG" | tee "$P/scatter_validate.txt"
           # --- passthrough manifest: everything except system.img identical
-          (cd "$CHK/$PKG" && find . -type f ! -name system.img -print0 \
+          (cd "$CHK/$PKG" && find . -type f ! -name system.img ! -name MD5SUMS.txt -print0 \
             | sort -z | xargs -0 md5sum) > "$P/final_manifest.md5"
           diff "$P/base_manifest.md5" "$P/final_manifest.md5"
           echo "[verify] all $(wc -l < "$P/final_manifest.md5") non-system entries byte-identical to base"
           # --- system round-trip
-          python3 scripts/mtk_sparse2raw.py "$CHK/$PKG/system.img" "$CHK/system.raw.img" -q 2>/dev/null \
-            || simg2img "$CHK/$PKG/system.img" "$CHK/system.raw.img"
-          rm -f "$CHK/$PKG/system.img"
+          if [ "$RAW_SYSTEM" = "true" ]; then
+            MAGIC=$(head -c 4 "$CHK/$PKG/system.img" | od -An -tx1 | tr -d ' \n')
+            test "$MAGIC" != "3aff26ed"   # must NOT be sparse-encoded
+            mv "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+            test "$(stat -c %s "$CHK/system.raw.img")" -eq "$SYSTEM_PARTITION_BYTES"
+          else
+            python3 scripts/mtk_sparse2raw.py "$CHK/$PKG/system.img" "$CHK/system.raw.img" -q 2>/dev/null \
+              || simg2img "$CHK/$PKG/system.img" "$CHK/system.raw.img"
+            rm -f "$CHK/$PKG/system.img"
+          fi
           sudo mkdir -p /mnt/chk
           sudo mount -o loop,ro "$CHK/system.raw.img" /mnt/chk
           sudo md5sum /mnt/chk/lib/hw/bluetooth.default.so | awk '{print $1}' > "$P/final_bt_md5.txt"
@@ -394,7 +431,13 @@ jobs:
                    " -- every provider asserted present in /system/lib of the final image")
           L.append("- codecs: A2DP SRC(SBC) + SNK(SBC/AAC/LDAC); AAC = FDK LATM (RFC 3016),"
                    " LDAC = vendored MIT libldacdec, both statically linked")
-          L.append("- free space zero-filled; e2fsck -fy then -fn clean; re-sparsified (4096)")
+          if os.environ.get("RAW_SYSTEM") == "true":
+              L.append("- free space zero-filled; e2fsck -fy then -fn clean; system.img shipped"
+                       " **RAW / non-sparse** (3,095,396,352 B == partition size) -- workaround"
+                       " for the host SPFT/DA sparse FILL-write crash at 92%; MD5SUMS.txt inside"
+                       " the zip lists every file for extraction-integrity checks")
+          else:
+              L.append("- free space zero-filled; e2fsck -fy then -fn clean; re-sparsified (4096)")
           L.append("- passthrough manifest: all non-system.img package entries md5-identical to base")
           L.append("- boot.img: kernel md5 == stock, fstab verity-off (inherited from base, re-asserted)")
           L.append("- boot-critical packages + framework-res.apk present in the final image\n")
@@ -437,6 +480,16 @@ jobs:
             echo "Everything else about this package equals \`firmware-debloat-v2-20261030\`"
             echo "(dropper-neutralized, verity-off testkey boot)."
             echo
+            if [ "$RAW_SYSTEM" = "true" ]; then
+              echo "**NOTE:** system.img in this package is **RAW** (non-sparse,"
+              echo "3,095,396,352 bytes == partition size).  The sparse packages"
+              echo "deterministically killed SP Flash Tool at 92% on the user host"
+              echo "(DA FILL-write path over image blocks 704805-713963); v0/v1"
+              echo "sparse images wrote the same blocks as RAW chunks fine, so this"
+              echo "build ships plain data end to end.  After extracting, verify"
+              echo "system.img is exactly 3,095,396,352 bytes (MD5SUMS.txt inside)."
+              echo
+            fi
             echo "**CI validation** (see VERIFICATION.md asset): ELF32 ARM, HMI exported,"
             echo "NEEDED closure present in-image, inode/mode/SELinux xattr preserved,"
             echo "e2fsck clean, package round-tripped and re-verified, kernel md5 stock."
