@@ -361,6 +361,9 @@ jobs:
           done
           test "$found" = 1
           echo "[verify] boot.img: stock kernel, verity still off"
+          # cpio -idm preserves archive modes (some ramdisk dirs are 000) ->
+          # upload-artifact would hit EACCES scanning them; drop the scratch dirs.
+          rm -rf "$P/pkgrd" "$P/pkgboot"
           rm -f "$CHK/system.raw.img"
           df -h "$RUNNER_TEMP"
 
