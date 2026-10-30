@@ -160,9 +160,18 @@ setup_sources() {
   clone_full    bt        "$AOSP/system/bt"
   clone_sparse  libhardware "$AOSP/hardware/libhardware" include
   clone_full    tinyxml2  "$AOSP/external/tinyxml2"
-  # external/libldac exists only from 8.0 on; LDAC on the nougat tree goes
-  # through the (later) libldacdec+bco-shim route, see DEVELOPMENT_PLAN 16.8.
+  # external/libldac exists only from 8.0 on; LDAC RX on the nougat tree uses
+  # the vendored MIT libldacdec core (third_party/libldacdec, direct static
+  # link -- no shim, no dlopen), see DEVELOPMENT_PLAN 16.8.  Stage it next to
+  # the cloned sources so compile/link treat it like any other source root.
   [ "$TREE" = nougat ] || clone_full libldac "$AOSP/external/libldac"
+  if [ -d "$REPO_ROOT/third_party/libldacdec" ]; then
+    echo "[src] stage libldacdec (vendored, third_party)"
+    rm -rf "$SRC/libldacdec"
+    mkdir -p "$SRC/libldacdec"
+    cp "$REPO_ROOT"/third_party/libldacdec/*.c "$REPO_ROOT"/third_party/libldacdec/*.h \
+       "$SRC/libldacdec/"
+  fi
   clone_full    aac       "$AOSP/external/aac"
   if [ "$TREE" = nougat ]; then
     # N keeps the legacy TOP-LEVEL include/ tree (cutils, utils, log, system,
@@ -297,6 +306,7 @@ SENTINELS_NOUGAT=(
   "bionic/libc/kernel/uapi/linux/binder.h"
   "tinyxml2/tinyxml2.h"
   "aac/libAACdec/include/aacdecoder_lib.h"
+  "libldacdec/ldacdec.h"
 )
 
 SENTINELS=(
@@ -401,6 +411,9 @@ BT_INC=(
   -I"\$SRC/aac/libAACdec/include" -I"\$SRC/aac/libAACenc/include"
   -I"\$SRC/aac/libSYS/include"
   -I"\$SRC/libldac/inc" -I"\$SRC/libldac/abr/inc"
+  -I"\$SRC/libldacdec"
+  -I"\$SRC/aac/libFDK/include" -I"\$SRC/aac/libMpegTPDec/include"
+  -I"\$SRC/aac/libPCMutils/include" -I"\$SRC/aac/libSBRdec/include"
 )
 AAC_INC=(
   -I"\$SRC/aac/libAACdec/include" -I"\$SRC/aac/libAACenc/include"
@@ -413,6 +426,7 @@ AAC_INC=(
   -I"\$SRC/core/libcutils/include" -I"\$SRC/core/liblog/include" -I"\$SRC/core/libsystem/include"
 )
 LDAC_INC=( -I"\$SRC/libldac/inc" -I"\$SRC/libldac/abr/inc" )
+LDACDEC_INC=( -I"\$SRC/libldacdec" )
 DEFS=(
   -DEXPORT_SYMBOL=__attribute__\\(\\(visibility\\(\\"default\\"\\)\\)\\)
   -DLOG_NDEBUG=1 -DBUILDCFG -DHAS_NO_BDROID_BUILDCFG $bd_def -DNDEBUG
@@ -431,6 +445,8 @@ case "$ROOTKEY" in
   bt)   ABS="$BT/$REL";        INC=("${BT_INC[@]}") ;;
   aac)  ABS="$SRC/aac/$REL";   INC=("${AAC_INC[@]}") ;;
   ldac) ABS="$SRC/libldac/$REL"; INC=("${LDAC_INC[@]}") ;;
+  ldacdec) ABS="$SRC/libldacdec/$REL"; INC=("${LDACDEC_INC[@]}")
+           CFLAGS=( "${CFLAGS[@]/-std=c99/-std=gnu99}" ) ;;
   *)    echo "FAIL $ROOTKEY/$REL (unknown root)"; exit 0 ;;
 esac
 O="$OBJ/${ROOTKEY}_$(echo "$REL" | tr '/' '_').o"
@@ -496,6 +512,10 @@ SMOKEOF
   if [ -d "$SRC/libldac" ]; then
     (cd "$SRC/libldac" && ls src/ldaclib.c src/ldacBT.c abr/src/ldacBT_abr.c 2>/dev/null) \
       | sed 's#^#ldac #' >> "$LIST"
+  fi
+  # third_party/libldacdec -- vendored MIT LDAC decoder core (nougat sink RX)
+  if [ -d "$SRC/libldacdec" ]; then
+    (cd "$SRC/libldacdec" && ls *.c 2>/dev/null) | sed 's#^#libldacdec #' >> "$LIST"
   fi
   sort -o "$LIST" "$LIST"
 }
@@ -565,7 +585,7 @@ TRIAGEEOF
 link_artifacts() {
   # shellcheck source=/dev/null
   source "$WORKDIR/env.sh"
-  local -a aac_objs bt_objs a2dp_objs osi_objs
+  local -a aac_objs bt_objs a2dp_objs osi_objs ldacdec_objs
   echo "[link] libFraunhoferAAC.a"
   mapfile -t aac_objs < <(find "$OBJ" -name 'aac_*.o' | sort)
   "$AR" rcs "$OUTDIR/libFraunhoferAAC.a" "${aac_objs[@]}"
@@ -580,8 +600,10 @@ link_artifacts() {
   fi
   echo "[link] bluetooth.default.so (all stack objects; undefined platform symbols allowed)"
   mapfile -t bt_objs < <(find "$OBJ" -name 'bt_*.o' ! -name 'bt_audio_a2dp_hw_*' | sort)
+  mapfile -t ldacdec_objs < <(find "$OBJ" -name 'libldacdec_*.o' | sort)
   "$CCXX" "${TARGET[@]}" "${SYSROOT[@]}" -shared -static-libstdc++ \
     -o "$OUTDIR/bluetooth.default.so" "${bt_objs[@]}" "${aac_objs[@]}" \
+    ${ldacdec_objs[@]+"${ldacdec_objs[@]}"} \
     -Wl,-Bsymbolic -llog -lz -ldl || return 1
   echo "[link] audio.a2dp.default.so"
   mapfile -t a2dp_objs < <(find "$OBJ" -name 'bt_audio_a2dp_hw_src_*.o' | sort)

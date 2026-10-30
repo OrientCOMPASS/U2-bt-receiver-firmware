@@ -1,0 +1,506 @@
+From 5b9e97e06ed776f100974b2ec59875a946a40474 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:33:19 +0000
+Subject: [PATCH 2/2] btif_media: decode AAC (FDK/LATM) and LDAC (libldacdec)
+ sink streams (data plane)
+
+btif_media_task.c could only decode SBC A2DP sink streams.  Wire the two
+new codecs into the existing rx pipeline (RxSbcQ + 20 ms decode tick):
+
+* decoder reset dispatches on codec_info[2]: SBC keeps the OI path,
+  AAC opens an FDK aacDecoder in TT_MP4_LATM_MCP1 mode (RFC 3016
+  payloads), LDAC heap-allocates a libldacdec instance.  Both create the
+  AudioTrack from the parsed CIE sample rate / channel mode.
+* inc-media handler branches per active codec:
+  - AAC: aacDecoder_Fill over the whole RTP payload, then drain
+    aacDecoder_DecodeFrame until AAC_DEC_NOT_ENOUGH_BITS; PCM sized by
+    CStreamInfo frameSize*numChannels.
+  - LDAC: skip the 1-octet media payload header (low nibble = frame
+    count, same layout as SBC), then ldacDecode() per frame using the
+    returned bytesUsed; frameSamples*channels 16-bit PCM out.
+* the enque pump stamps num_frames=1 for AAC (LATM has no media payload
+  header, so its first octet must not be interpreted as a frame count)
+  and the decode tick drains whole packets for AAC/LDAC instead of using
+  the SBC per-frame budget.
+* clear_track releases the FDK handle / libldacdec instance and resets
+  the active-codec state to SBC.
+---
+ btif/src/btif_media_task.c | 402 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 401 insertions(+), 1 deletion(-)
+
+diff --git a/btif/src/btif_media_task.c b/btif/src/btif_media_task.c
+index 08af577..23969ae 100644
+--- a/btif/src/btif_media_task.c
++++ b/btif/src/btif_media_task.c
+@@ -82,10 +82,38 @@
+ #include "btif_avrcp_audio_track.h"
+ #endif
+ 
++#if (BTA_AV_SINK_INCLUDED == TRUE)
++#include "aacdecoder_lib.h"
++#include "a2d_aac.h"
++#include "a2d_ldac.h"
++#include "ldacdec.h"
++/* ldacdec.h/log.h leak generic helper macros into the global namespace */
++#undef min
++#undef max
++#undef container_of
++#undef LOG
++#undef LOG_ARRAY
++#undef LOG_ARRAY_LEN
++#undef LOG_FUNCTION
++#endif
++
+ #if (BTA_AV_SINK_INCLUDED == TRUE)
+ OI_CODEC_SBC_DECODER_CONTEXT context;
+ OI_UINT32 contextData[CODEC_DATA_WORDS(2, SBC_CODEC_FAST_FILTER_BUFFERS)];
+ OI_INT16 pcmData[15*SBC_MAX_SAMPLES_PER_FRAME*SBC_MAX_CHANNELS];
++
++/* Active sink codec, set at stream (re)configuration time */
++#define BTIF_SINK_CODEC_SBC   0
++#define BTIF_SINK_CODEC_AAC   1
++#define BTIF_SINK_CODEC_LDAC  2
++
++/* Decoded-PCM scratch buffers:
++ *   AAC : 1024 samples/frame * 2 ch (+ margin for 960/2048-length frames)
++ *   LDAC: MAX_FRAME_SAMPLES(256) * 2 ch */
++#define BTIF_AAC_PCM_BUF_SAMPLES  4096
++#define BTIF_LDAC_PCM_BUF_SAMPLES 512
++static INT_PCM btif_aac_pcm_buf[BTIF_AAC_PCM_BUF_SAMPLES];
++static int16_t btif_ldac_pcm_buf[BTIF_LDAC_PCM_BUF_SAMPLES];
+ #endif
+ 
+ /*****************************************************************************
+@@ -328,6 +356,11 @@ typedef struct
+ 
+     UINT32  sample_rate;
+     UINT8   channel_count;
++#if (BTA_AV_SINK_INCLUDED == TRUE)
++    UINT8   sink_codec_type;         /* BTIF_SINK_CODEC_*: active stream codec */
++    HANDLE_AACDECODER aac_decoder;   /* FDK AAC decoder (LATM input) */
++    ldacdec_t *ldac_decoder;         /* libldacdec instance (heap) */
++#endif
+ #ifdef USE_AUDIO_TRACK
+     btif_media_audio_focus_state rx_audio_focus_state;
+     void *audio_track;
+@@ -931,6 +964,11 @@ void btif_a2dp_on_init(void)
+     btif_media_cb.rx_audio_focus_state = BTIF_MEDIA_FOCUS_NOT_GRANTED;
+     btif_media_cb.audio_track = NULL;
+ #endif
++#if (BTA_AV_SINK_INCLUDED == TRUE)
++    btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++    btif_media_cb.aac_decoder = NULL;
++    btif_media_cb.ldac_decoder = NULL;
++#endif
+ }
+ 
+ 
+@@ -1331,6 +1369,23 @@ static void btif_media_task_avk_handle_timer(UNUSED_ATTR void *context)
+             return;
+         }
+ 
++        if (btif_media_cb.sink_codec_type != BTIF_SINK_CODEC_SBC)
++        {
++            /* AAC/LDAC: decode whole packets as they arrive.  The SBC-style
++             * per-frame budget and partial-packet accounting below does not
++             * apply to these codecs. */
++            int drain = fixed_queue_length(btif_media_cb.RxSbcQ);
++            while (drain-- > 0)
++            {
++                p_msg = (tBT_SBC_HDR *)fixed_queue_try_dequeue(btif_media_cb.RxSbcQ);
++                if (p_msg == NULL)
++                    break;
++                btif_media_task_handle_inc_media(p_msg);
++                osi_free(p_msg);
++            }
++            return;
++        }
++
+         num_frames_to_process = btif_media_cb.frames_to_process;
+         APPL_TRACE_DEBUG(" Process Frames + ");
+ 
+@@ -1537,6 +1592,139 @@ static void btif_media_thread_handle_cmd(fixed_queue_t *queue, UNUSED_ATTR void
+ }
+ 
+ #if (BTA_AV_SINK_INCLUDED == TRUE)
++/*******************************************************************************
++ **
++ ** Function         btif_sink_write_audio
++ **
++ ** Description      Route decoded PCM to the AudioTrack (or UIPC) output
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_sink_write_audio(void *p_buf, UINT32 len)
++{
++    if (len == 0)
++        return;
++#ifdef USE_AUDIO_TRACK
++    BtifAvrcpAudioTrackWriteData(btif_media_cb.audio_track, p_buf, (int)len);
++#else
++    UIPC_Send(UIPC_CH_ID_AV_AUDIO, 0, (UINT8 *)p_buf, len);
++#endif
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_handle_inc_aac
++ **
++ ** Description      Decode one RTP packet of AAC (LATM, RFC 3016) and write
++ **                  the PCM to the audio output
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_handle_inc_aac(tBT_SBC_HDR *p_msg)
++{
++    UCHAR *p_payload = (UCHAR *)(p_msg + 1) + p_msg->offset;
++    UINT buffer_size = p_msg->len;
++    UINT bytes_valid = p_msg->len;
++
++    if (btif_media_cb.aac_decoder == NULL || buffer_size == 0)
++        return;
++
++    while (bytes_valid > 0)
++    {
++        AAC_DECODER_ERROR err = aacDecoder_Fill(btif_media_cb.aac_decoder,
++                                                &p_payload, &buffer_size,
++                                                &bytes_valid);
++        if (err != AAC_DEC_OK)
++        {
++            APPL_TRACE_ERROR("%s aacDecoder_Fill failed: 0x%x", __func__, err);
++            return;
++        }
++
++        while (1)
++        {
++            CStreamInfo *info;
++            UINT32 frame_len;
++
++            err = aacDecoder_DecodeFrame(btif_media_cb.aac_decoder,
++                                         btif_aac_pcm_buf,
++                                         BTIF_AAC_PCM_BUF_SAMPLES,
++                                         0 /* flags */);
++            if (err == AAC_DEC_NOT_ENOUGH_BITS)
++                break;
++            if (err != AAC_DEC_OK)
++            {
++                APPL_TRACE_ERROR("%s aacDecoder_DecodeFrame failed: 0x%x",
++                                 __func__, err);
++                break;
++            }
++
++            info = aacDecoder_GetStreamInfo(btif_media_cb.aac_decoder);
++            if (info == NULL || info->frameSize <= 0 || info->numChannels <= 0)
++                break;
++
++            frame_len = (UINT32)info->frameSize * (UINT32)info->numChannels *
++                        (UINT32)sizeof(btif_aac_pcm_buf[0]);
++            if (frame_len > sizeof(btif_aac_pcm_buf))
++                frame_len = sizeof(btif_aac_pcm_buf);
++            btif_sink_write_audio(btif_aac_pcm_buf, frame_len);
++        }
++    }
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_handle_inc_ldac
++ **
++ ** Description      Decode one RTP packet of LDAC: skip the 1-octet media
++ **                  payload header, then decode num_frames LDAC frames
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_handle_inc_ldac(tBT_SBC_HDR *p_msg)
++{
++    UINT8 *p_payload = (UINT8 *)(p_msg + 1) + p_msg->offset;
++    int remaining = (int)p_msg->len;
++    int num_frames;
++
++    if (btif_media_cb.ldac_decoder == NULL ||
++        remaining < (A2D_LDAC_MPL_HDR_LEN + 1))
++        return;
++
++    num_frames = p_payload[0] & A2D_LDAC_HDR_NUM_MSK;
++    p_payload += A2D_LDAC_MPL_HDR_LEN;
++    remaining -= A2D_LDAC_MPL_HDR_LEN;
++
++    while (num_frames-- > 0 && remaining > 0)
++    {
++        int bytes_used = 0;
++        int ret = ldacDecode(btif_media_cb.ldac_decoder, p_payload,
++                             btif_ldac_pcm_buf, &bytes_used);
++        int ch, samples;
++
++        if (ret != 0 || bytes_used <= 0 || bytes_used > remaining)
++        {
++            APPL_TRACE_ERROR("%s ldacDecode failed: ret %d used %d rem %d",
++                             __func__, ret, bytes_used, remaining);
++            break;
++        }
++
++        ch = ldacdecGetChannelCount(btif_media_cb.ldac_decoder);
++        samples = btif_media_cb.ldac_decoder->frame.frameSamples;
++        if (ch > 0 && samples > 0 &&
++            samples * ch <= BTIF_LDAC_PCM_BUF_SAMPLES)
++        {
++            btif_sink_write_audio(btif_ldac_pcm_buf,
++                                  (UINT32)(samples * ch * (int)sizeof(int16_t)));
++        }
++
++        p_payload += bytes_used;
++        remaining -= bytes_used;
++    }
++}
++
+ /*******************************************************************************
+  **
+  ** Function         btif_media_task_handle_inc_media
+@@ -1570,6 +1758,18 @@ static void btif_media_task_handle_inc_media(tBT_SBC_HDR*p_msg)
+         return;
+     }
+ #endif
++
++    if (btif_media_cb.sink_codec_type == BTIF_SINK_CODEC_AAC)
++    {
++        btif_media_task_handle_inc_aac(p_msg);
++        return;
++    }
++    if (btif_media_cb.sink_codec_type == BTIF_SINK_CODEC_LDAC)
++    {
++        btif_media_task_handle_inc_ldac(p_msg);
++        return;
++    }
++
+     APPL_TRACE_DEBUG("%s Number of sbc frames %d, frame_len %d",
+                      __func__, num_sbc_frames, sbc_frame_len);
+ 
+@@ -2225,6 +2425,182 @@ static void btif_media_task_aa_handle_clear_track (void)
+     BtifAvrcpAudioTrackDelete(btif_media_cb.audio_track);
+     btif_media_cb.audio_track = NULL;
+ #endif
++    if (btif_media_cb.aac_decoder != NULL)
++    {
++        aacDecoder_Close(btif_media_cb.aac_decoder);
++        btif_media_cb.aac_decoder = NULL;
++    }
++    if (btif_media_cb.ldac_decoder != NULL)
++    {
++        osi_free(btif_media_cb.ldac_decoder);
++        btif_media_cb.ldac_decoder = NULL;
++    }
++    btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_a2dp_aac_get_track_frequency
++ **
++ ** Description      Map a (single-bit) AAC sampling frequency mask to Hz
++ **
++ *******************************************************************************/
++static UINT32 btif_a2dp_aac_get_track_frequency(UINT16 frequency)
++{
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_96000) return 96000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_88200) return 88200;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_64000) return 64000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_48000) return 48000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_44100) return 44100;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_32000) return 32000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_24000) return 24000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_22050) return 22050;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_16000) return 16000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_12000) return 12000;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_11025) return 11025;
++    if (frequency & A2D_AAC_IE_SAMP_FREQ_8000)  return 8000;
++    return 44100;
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_a2dp_ldac_get_track_frequency
++ **
++ ** Description      Map a (single-bit) LDAC sampling frequency mask to Hz
++ **
++ *******************************************************************************/
++static UINT32 btif_a2dp_ldac_get_track_frequency(UINT8 frequency)
++{
++    if (frequency & A2D_LDAC_IE_SAMP_FREQ_96000) return 96000;
++    if (frequency & A2D_LDAC_IE_SAMP_FREQ_88200) return 88200;
++    if (frequency & A2D_LDAC_IE_SAMP_FREQ_48000) return 48000;
++    if (frequency & A2D_LDAC_IE_SAMP_FREQ_44100) return 44100;
++    return 44100;
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_aa_handle_decoder_reset_aac
++ **
++ ** Description      Configure the sink decode path for AAC (FDK, LATM input)
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_aa_handle_decoder_reset_aac(tBTIF_MEDIA_SINK_CFG_UPDATE *p_buf)
++{
++    tA2D_AAC_CIE aac_cie;
++    UINT32 freq;
++    int ch_type;
++
++    if (A2D_ParsAacInfo(&aac_cie, p_buf->codec_info, FALSE) != A2D_SUCCESS)
++    {
++        APPL_TRACE_ERROR("%s A2D_ParsAacInfo failed", __func__);
++        return;
++    }
++
++    freq = btif_a2dp_aac_get_track_frequency(aac_cie.samp_freq);
++    ch_type = (aac_cie.ch_mode == A2D_AAC_IE_CH_MD_MONO) ?
++              AUDIO_CHANNEL_OUT_MONO : AUDIO_CHANNEL_OUT_STEREO;
++
++    btif_media_cb.sample_rate = freq;
++    btif_media_cb.channel_count = (aac_cie.ch_mode == A2D_AAC_IE_CH_MD_MONO) ? 1 : 2;
++    btif_media_cb.rx_flush = FALSE;
++    btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_AAC;
++
++    if (btif_media_cb.aac_decoder != NULL)
++    {
++        aacDecoder_Close(btif_media_cb.aac_decoder);
++        btif_media_cb.aac_decoder = NULL;
++    }
++    /* RFC 3016: AAC over RTP carries LATM (MCP1) payloads */
++    btif_media_cb.aac_decoder = aacDecoder_Open(TT_MP4_LATM_MCP1, 1 /* nrOfLayers */);
++    if (btif_media_cb.aac_decoder == NULL)
++    {
++        APPL_TRACE_ERROR("%s aacDecoder_Open failed", __func__);
++        btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++        return;
++    }
++    APPL_TRACE_DEBUG("%s A2dpSink: AAC freq %d ch_type %d", __func__, freq, ch_type);
++
++#ifdef USE_AUDIO_TRACK
++    btif_media_cb.audio_track = BtifAvrcpAudioTrackCreate((int)freq, ch_type);
++    if (btif_media_cb.audio_track == NULL)
++    {
++        APPL_TRACE_ERROR("%s A2dpSink: Track creation fails!!!", __func__);
++        return;
++    }
++#else
++    UIPC_Open(UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb);
++#endif
++
++    btif_media_cb.frames_to_process = 1;
++}
++
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_aa_handle_decoder_reset_ldac
++ **
++ ** Description      Configure the sink decode path for LDAC (libldacdec)
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_aa_handle_decoder_reset_ldac(tBTIF_MEDIA_SINK_CFG_UPDATE *p_buf)
++{
++    tA2D_LDAC_CIE ldac_cie;
++    UINT32 freq;
++    int ch_type;
++
++    if (A2D_ParsLdacInfo(&ldac_cie, p_buf->codec_info, FALSE) != A2D_SUCCESS)
++    {
++        APPL_TRACE_ERROR("%s A2D_ParsLdacInfo failed", __func__);
++        return;
++    }
++
++    freq = btif_a2dp_ldac_get_track_frequency(ldac_cie.samp_freq);
++    ch_type = (ldac_cie.ch_mode == A2D_LDAC_IE_CH_MD_MONO) ?
++              AUDIO_CHANNEL_OUT_MONO : AUDIO_CHANNEL_OUT_STEREO;
++
++    btif_media_cb.sample_rate = freq;
++    btif_media_cb.channel_count = (ldac_cie.ch_mode == A2D_LDAC_IE_CH_MD_MONO) ? 1 : 2;
++    btif_media_cb.rx_flush = FALSE;
++    btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_LDAC;
++
++    if (btif_media_cb.ldac_decoder != NULL)
++    {
++        osi_free(btif_media_cb.ldac_decoder);
++        btif_media_cb.ldac_decoder = NULL;
++    }
++    btif_media_cb.ldac_decoder = (ldacdec_t *)osi_malloc(sizeof(ldacdec_t));
++    if (btif_media_cb.ldac_decoder == NULL)
++    {
++        APPL_TRACE_ERROR("%s cannot allocate LDAC decoder", __func__);
++        btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++        return;
++    }
++    if (ldacdecInit(btif_media_cb.ldac_decoder) != 0)
++    {
++        APPL_TRACE_ERROR("%s ldacdecInit failed", __func__);
++        osi_free(btif_media_cb.ldac_decoder);
++        btif_media_cb.ldac_decoder = NULL;
++        btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++        return;
++    }
++    APPL_TRACE_DEBUG("%s A2dpSink: LDAC freq %d ch_type %d", __func__, freq, ch_type);
++
++#ifdef USE_AUDIO_TRACK
++    btif_media_cb.audio_track = BtifAvrcpAudioTrackCreate((int)freq, ch_type);
++    if (btif_media_cb.audio_track == NULL)
++    {
++        APPL_TRACE_ERROR("%s A2dpSink: Track creation fails!!!", __func__);
++        return;
++    }
++#else
++    UIPC_Open(UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb);
++#endif
++
++    btif_media_cb.frames_to_process = 1;
+ }
+ 
+ /*******************************************************************************
+@@ -2250,6 +2626,19 @@ static void btif_media_task_aa_handle_decoder_reset(BT_HDR *p_msg)
+             p_buf->codec_info[1], p_buf->codec_info[2], p_buf->codec_info[3],
+             p_buf->codec_info[4], p_buf->codec_info[5], p_buf->codec_info[6]);
+ 
++    /* Dispatch on the configured media codec type (octet 2 of codec info) */
++    if (p_buf->codec_info[2] == A2D_MEDIA_CT_M24)
++    {
++        btif_media_task_aa_handle_decoder_reset_aac(p_buf);
++        return;
++    }
++    if (p_buf->codec_info[2] == A2D_MEDIA_CT_VEND)
++    {
++        btif_media_task_aa_handle_decoder_reset_ldac(p_buf);
++        return;
++    }
++    btif_media_cb.sink_codec_type = BTIF_SINK_CODEC_SBC;
++
+     a2d_status = A2D_ParsSbcInfo(&sbc_cie, p_buf->codec_info, FALSE);
+     if (a2d_status != A2D_SUCCESS)
+     {
+@@ -2753,7 +3142,18 @@ UINT8 btif_media_sink_enque_buf(BT_HDR *p_pkt)
+                                   p_pkt->len);
+     memcpy((UINT8 *)(p_msg + 1), (UINT8 *)(p_pkt + 1) + p_pkt->offset,
+            p_pkt->len);
+-    p_msg->num_frames_to_be_processed = (*((UINT8 *)(p_pkt + 1) + p_pkt->offset))& 0x0f;
++    if (btif_media_cb.sink_codec_type == BTIF_SINK_CODEC_AAC)
++    {
++        /* LATM payload (RFC 3016) has no media payload header: treat the
++         * whole packet as one unit; decoding drains it completely. */
++        p_msg->num_frames_to_be_processed = 1;
++    }
++    else
++    {
++        /* SBC and LDAC media payload headers keep the frame count in the
++         * low nibble of the first payload octet */
++        p_msg->num_frames_to_be_processed = (*((UINT8 *)(p_pkt + 1) + p_pkt->offset))& 0x0f;
++    }
+     p_msg->len = p_pkt->len;
+     p_msg->offset = 0;
+     p_msg->layer_specific = p_pkt->layer_specific;
+-- 
+2.39.5
+

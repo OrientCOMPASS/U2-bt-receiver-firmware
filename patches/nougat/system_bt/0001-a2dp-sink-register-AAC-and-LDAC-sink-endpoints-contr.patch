@@ -1,0 +1,1164 @@
+From aaf150986f5e2cac9db7be2d75768f8a21942471 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:33:19 +0000
+Subject: [PATCH 1/2] a2dp-sink: register AAC and LDAC sink endpoints (control
+ plane)
+
+The Nougat A2DP sink registers a single SBC SNK SEP.  Phones default to
+their best codec, so with only SBC advertised they fall back to SBC even
+when they could send AAC or LDAC.  This adds the full control plane for
+a multi-codec sink:
+
+* stack/a2dp: new a2d_aac.c / a2d_ldac.c with A2D_Bld*/A2D_Pars* for the
+  MPEG-2/4 AAC CIE (A2DP spec 4.3.2) and the Sony LDAC vendor CIE
+  (vendor id 0x012D, codec id 0x00AA), mirroring a2d_sbc.c.  a2d_api.h
+  gains A2D_MEDIA_CT_VEND (0xFF), absent from the r36 tree.
+* SEP registration (bta_av_main.c): the SNK role now registers SEPs
+  idx 1..BTA_AV_MAX_SEPS-1 by calling the cos.init callout until it
+  declines, instead of a single hardcoded index 1.  SRC role unchanged
+  (single SEP at idx 0).  With BTA_AV_MAX_SEPS=4 (bdroid_buildcfg.h)
+  and AVDT_NUM_SEPS=8/AVDT_CODEC_SIZE=16 (bt_target.h overrides) the
+  set is SRC/SBC + SNK/SBC + SNK/AAC + SNK/LDAC.
+* bta_av_co.c: AAC and LDAC sink capability tables; init callout cases;
+  sink_supports_config accepts M24 and LDAC-VEND configs (cfg_in_cap
+  helpers); INT-side codec selection prefers LDAC > AAC > SBC
+  (peer_src_supports_codec priority scan + per-codec preferred-config
+  builders); setconfig on a SNK SEP now accepts any codec we advertise
+  instead of forcing SBC reconfiguration.
+* btif_av_api.h/btif_av_co.h: BTIF_AV_CODEC_AAC/LDAC ids and the two new
+  SEP indices.
+---
+ bta/av/bta_av_main.c       |  34 ++--
+ btif/co/bta_av_co.c        | 371 +++++++++++++++++++++++++++++++++----
+ btif/include/btif_av_api.h |   3 +
+ btif/include/btif_av_co.h  |   2 +
+ stack/Android.mk           |   2 +
+ stack/a2dp/a2d_aac.c       | 143 ++++++++++++++
+ stack/a2dp/a2d_ldac.c      | 147 +++++++++++++++
+ stack/include/a2d_aac.h    | 109 +++++++++++
+ stack/include/a2d_api.h    |   1 +
+ stack/include/a2d_ldac.h   | 105 +++++++++++
+ 10 files changed, 875 insertions(+), 42 deletions(-)
+ create mode 100644 stack/a2dp/a2d_aac.c
+ create mode 100644 stack/a2dp/a2d_ldac.c
+ create mode 100644 stack/include/a2d_aac.h
+ create mode 100644 stack/include/a2d_ldac.h
+
+diff --git a/bta/av/bta_av_main.c b/bta/av/bta_av_main.c
+index 735ee2c..80504d2 100644
+--- a/bta/av/bta_av_main.c
++++ b/bta/av/bta_av_main.c
+@@ -628,13 +628,11 @@ static void bta_av_api_register(tBTA_AV_DATA *p_data)
+             if (profile_initialized == UUID_SERVCLASS_AUDIO_SOURCE)
+             {
+                 cs.tsep = AVDT_TSEP_SRC;
+-                index = 0;
+             }
+             else if (profile_initialized == UUID_SERVCLASS_AUDIO_SINK)
+             {
+                 cs.tsep = AVDT_TSEP_SNK;
+                 cs.p_data_cback = bta_av_stream_data_cback;
+-                index = 1;
+             }
+ 
+             /* Initialize Handles to zero */
+@@ -645,18 +643,32 @@ static void bta_av_api_register(tBTA_AV_DATA *p_data)
+ 
+             /* keep the configuration in the stream control block */
+             memcpy(&p_scb->cfg, &cs.cfg, sizeof(tAVDT_CFG));
+-            if ((*bta_av_a2d_cos.init)(&codec_type, cs.cfg.codec_info,
+-                &cs.cfg.num_protect, cs.cfg.protect_info, index) == TRUE)
++
++            /* Register one stream endpoint per codec.  The SRC role keeps a
++             * single endpoint at index 0; the SNK role registers its codec
++             * set (SBC, AAC, LDAC) starting at index 1 and stops as soon as
++             * the callout declines an index (init returns FALSE). */
+             {
+-                if(AVDT_CreateStream(&p_scb->seps[index].av_handle, &cs) == AVDT_SUCCESS)
++                UINT8 index_last = (cs.tsep == AVDT_TSEP_SRC) ? 1 : BTA_AV_MAX_SEPS;
++                for (index = (cs.tsep == AVDT_TSEP_SRC) ? 0 : 1;
++                     index < index_last; index++)
+                 {
+-                    p_scb->seps[index].codec_type = codec_type;
+-                    p_scb->seps[index].tsep = cs.tsep;
+-                    if(cs.tsep == AVDT_TSEP_SNK)
+-                        p_scb->seps[index].p_app_data_cback = p_data->api_reg.p_app_data_cback;
+-                    else
+-                        p_scb->seps[index].p_app_data_cback = NULL; /* In case of A2DP SOURCE we don't need a callback to handle media packets */
++                    tAVDT_CS cs_sep = cs;   /* fresh copy per endpoint */
+ 
++                    if ((*bta_av_a2d_cos.init)(&codec_type, cs_sep.cfg.codec_info,
++                        &cs_sep.cfg.num_protect, cs_sep.cfg.protect_info, index) != TRUE)
++                    {
++                        break;
++                    }
++                    if(AVDT_CreateStream(&p_scb->seps[index].av_handle, &cs_sep) == AVDT_SUCCESS)
++                    {
++                        p_scb->seps[index].codec_type = codec_type;
++                        p_scb->seps[index].tsep = cs_sep.tsep;
++                        if(cs_sep.tsep == AVDT_TSEP_SNK)
++                            p_scb->seps[index].p_app_data_cback = p_data->api_reg.p_app_data_cback;
++                        else
++                            p_scb->seps[index].p_app_data_cback = NULL; /* In case of A2DP SOURCE we don't need a callback to handle media packets */
++                    }
+                 }
+             }
+ 
+diff --git a/btif/co/bta_av_co.c b/btif/co/bta_av_co.c
+index 76c8836..0f38fcd 100644
+--- a/btif/co/bta_av_co.c
++++ b/btif/co/bta_av_co.c
+@@ -26,6 +26,8 @@
+ #include "string.h"
+ #include "a2d_api.h"
+ #include "a2d_sbc.h"
++#include "a2d_aac.h"
++#include "a2d_ldac.h"
+ #include "bta_sys.h"
+ #include "bta_av_api.h"
+ #include "bta_av_co.h"
+@@ -92,6 +94,29 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps =
+     A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
+ };
+ 
++/* AAC (MPEG-2/4 LC) sink capabilities: what our FDK-based decoder accepts. */
++const tA2D_AAC_CIE bta_av_co_aac_sink_caps =
++{
++    (A2D_AAC_IE_OBJCT_MPEG2_LC | A2D_AAC_IE_OBJCT_MPEG4_LC),    /* obj_type */
++    (A2D_AAC_IE_SAMP_FREQ_44100 | A2D_AAC_IE_SAMP_FREQ_48000),  /* samp_freq */
++    (A2D_AAC_IE_CH_MD_MONO | A2D_AAC_IE_CH_MD_STEREO),          /* ch_mode */
++    A2D_AAC_IE_VBR_ON,                                          /* vbr */
++    320000                                                      /* bitrate */
++};
++
++/* Sony LDAC sink capabilities (vendor id 0x012D, codec id 0x00AA).
++ * Decode side is libldacdec; 660 kbps (EQMID SQ) is the design target but
++ * any EQMID the source picks within these caps decodes fine. */
++const tA2D_LDAC_CIE bta_av_co_ldac_sink_caps =
++{
++    A2D_LDAC_VENDOR_ID,
++    A2D_LDAC_CODEC_ID,
++    (A2D_LDAC_IE_SAMP_FREQ_44100 | A2D_LDAC_IE_SAMP_FREQ_48000 |
++     A2D_LDAC_IE_SAMP_FREQ_88200 | A2D_LDAC_IE_SAMP_FREQ_96000),    /* samp_freq */
++    (A2D_LDAC_IE_CH_MD_MONO | A2D_LDAC_IE_CH_MD_DUAL |
++     A2D_LDAC_IE_CH_MD_STEREO)                                      /* ch_mode */
++};
++
+ #if !defined(BTIF_AV_SBC_DEFAULT_SAMP_FREQ)
+ #define BTIF_AV_SBC_DEFAULT_SAMP_FREQ A2D_SBC_IE_SAMP_FREQ_44
+ #endif
+@@ -318,6 +343,24 @@ BOOLEAN bta_av_co_audio_init(UINT8 *p_codec_type, UINT8 *p_codec_info, UINT8 *p_
+         /* This should not fail because we are using constants for parameters */
+         A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &bta_av_co_sbc_sink_caps, p_codec_info);
+ 
++        /* Codec is valid */
++        return TRUE;
++
++    case BTIF_SV_AV_AA_AAC_SINK_INDEX:
++        *p_codec_type = A2D_MEDIA_CT_M24;
++
++        /* This should not fail because we are using constants for parameters */
++        A2D_BldAacInfo(AVDT_MEDIA_AUDIO, (tA2D_AAC_CIE *) &bta_av_co_aac_sink_caps, p_codec_info);
++
++        /* Codec is valid */
++        return TRUE;
++
++    case BTIF_SV_AV_AA_LDAC_SINK_INDEX:
++        *p_codec_type = A2D_MEDIA_CT_VEND;
++
++        /* This should not fail because we are using constants for parameters */
++        A2D_BldLdacInfo(AVDT_MEDIA_AUDIO, (tA2D_LDAC_CIE *) &bta_av_co_ldac_sink_caps, p_codec_info);
++
+         /* Codec is valid */
+         return TRUE;
+ #endif
+@@ -377,6 +420,192 @@ void bta_av_co_audio_disc_res(tBTA_AV_HNDL hndl, UINT8 num_seps, UINT8 num_snk,
+         p_peer->uuid_to_connect = UUID_SERVCLASS_AUDIO_SINK;
+ }
+ 
++/*******************************************************************************
++ **
++ ** Function         bta_av_ldac_caps_is_ldac
++ **
++ ** Description      TRUE if a vendor codec info element (pointing at the LOSC
++ **                  octet) is the Sony LDAC codec (vendor 0x012D / codec 0x00AA)
++ **
++ *******************************************************************************/
++static BOOLEAN bta_av_ldac_caps_is_ldac(const UINT8 *p_codec_info)
++{
++    return (BOOLEAN)(p_codec_info[3] == (UINT8)(A2D_LDAC_VENDOR_ID & 0xFF) &&
++                     p_codec_info[4] == (UINT8)(A2D_LDAC_VENDOR_ID >> 8) &&
++                     p_codec_info[5] == (UINT8)(A2D_LDAC_CODEC_ID & 0xFF) &&
++                     p_codec_info[6] == (UINT8)(A2D_LDAC_CODEC_ID >> 8));
++}
++
++/*******************************************************************************
++ **
++ ** Function         bta_av_aac_cfg_in_cap / bta_av_ldac_cfg_in_cap
++ **
++ ** Description      TRUE if a single (configuration) codec info element fits
++ **                  inside our sink capabilities.
++ **
++ *******************************************************************************/
++static BOOLEAN bta_av_aac_cfg_in_cap(UINT8 *p_cfg, const tA2D_AAC_CIE *p_cap)
++{
++    tA2D_AAC_CIE cfg;
++
++    if (A2D_ParsAacInfo(&cfg, p_cfg, FALSE) != A2D_SUCCESS)
++        return FALSE;
++    if (!(cfg.obj_type & p_cap->obj_type))
++        return FALSE;
++    if ((cfg.samp_freq & p_cap->samp_freq) != cfg.samp_freq)
++        return FALSE;
++    if ((cfg.ch_mode & p_cap->ch_mode) != cfg.ch_mode)
++        return FALSE;
++    if (cfg.vbr && !p_cap->vbr)
++        return FALSE;
++    if (cfg.bitrate > p_cap->bitrate)
++        return FALSE;
++    return TRUE;
++}
++
++static BOOLEAN bta_av_ldac_cfg_in_cap(UINT8 *p_cfg, const tA2D_LDAC_CIE *p_cap)
++{
++    tA2D_LDAC_CIE cfg;
++
++    /* A2D_ParsLdacInfo validates the vendor/codec identifiers as well */
++    if (A2D_ParsLdacInfo(&cfg, p_cfg, FALSE) != A2D_SUCCESS)
++        return FALSE;
++    if ((cfg.samp_freq & p_cap->samp_freq) != cfg.samp_freq)
++        return FALSE;
++    if ((cfg.ch_mode & p_cap->ch_mode) != cfg.ch_mode)
++        return FALSE;
++    return TRUE;
++}
++
++/*******************************************************************************
++ **
++ ** Function         bta_av_aac_caps_compatible / bta_av_ldac_caps_compatible
++ **
++ ** Description      TRUE if the peer SRC capabilities intersect our SINK
++ **                  capabilities (used for INT-side codec selection).
++ **
++ *******************************************************************************/
++static BOOLEAN bta_av_aac_caps_compatible(UINT8 *p_peer_caps, const tA2D_AAC_CIE *p_cap)
++{
++    tA2D_AAC_CIE peer;
++
++    if (A2D_ParsAacInfo(&peer, p_peer_caps, TRUE) != A2D_SUCCESS)
++        return FALSE;
++    return (BOOLEAN)((peer.obj_type & p_cap->obj_type) &&
++                     (peer.samp_freq & p_cap->samp_freq) &&
++                     (peer.ch_mode & p_cap->ch_mode));
++}
++
++static BOOLEAN bta_av_ldac_caps_compatible(UINT8 *p_peer_caps, const tA2D_LDAC_CIE *p_cap)
++{
++    tA2D_LDAC_CIE peer;
++
++    if (A2D_ParsLdacInfo(&peer, p_peer_caps, TRUE) != A2D_SUCCESS)
++        return FALSE;
++    return (BOOLEAN)((peer.samp_freq & p_cap->samp_freq) &&
++                     (peer.ch_mode & p_cap->ch_mode));
++}
++
++/*******************************************************************************
++ **
++ ** Function         bta_av_build_aac_src_cfg / bta_av_build_ldac_src_cfg
++ **
++ ** Description      Build the preferred (single-value) configuration from the
++ **                  peer SRC capabilities for the INT (sink) side.
++ **
++ *******************************************************************************/
++static void bta_av_build_aac_src_cfg(UINT8 *p_pref_cfg, UINT8 *p_src_cap)
++{
++    tA2D_AAC_CIE src_cap;
++    tA2D_AAC_CIE pref;
++    const tA2D_AAC_CIE *p_sink_cap = &bta_av_co_aac_sink_caps;
++
++    memset(&pref, 0, sizeof(pref));
++    if (A2D_ParsAacInfo(&src_cap, p_src_cap, TRUE) != A2D_SUCCESS)
++    {
++        APPL_TRACE_ERROR("bta_av_build_aac_src_cfg: cannot parse peer caps");
++        return;
++    }
++
++    if (src_cap.obj_type & A2D_AAC_IE_OBJCT_MPEG2_LC)
++        pref.obj_type = A2D_AAC_IE_OBJCT_MPEG2_LC;
++    else if (src_cap.obj_type & A2D_AAC_IE_OBJCT_MPEG4_LC)
++        pref.obj_type = A2D_AAC_IE_OBJCT_MPEG4_LC;
++    else
++        return;
++
++    if ((src_cap.samp_freq & A2D_AAC_IE_SAMP_FREQ_48000) &&
++        (p_sink_cap->samp_freq & A2D_AAC_IE_SAMP_FREQ_48000))
++        pref.samp_freq = A2D_AAC_IE_SAMP_FREQ_48000;
++    else if ((src_cap.samp_freq & A2D_AAC_IE_SAMP_FREQ_44100) &&
++             (p_sink_cap->samp_freq & A2D_AAC_IE_SAMP_FREQ_44100))
++        pref.samp_freq = A2D_AAC_IE_SAMP_FREQ_44100;
++    else
++        return;
++
++    if ((src_cap.ch_mode & A2D_AAC_IE_CH_MD_STEREO) &&
++        (p_sink_cap->ch_mode & A2D_AAC_IE_CH_MD_STEREO))
++        pref.ch_mode = A2D_AAC_IE_CH_MD_STEREO;
++    else if ((src_cap.ch_mode & A2D_AAC_IE_CH_MD_MONO) &&
++             (p_sink_cap->ch_mode & A2D_AAC_IE_CH_MD_MONO))
++        pref.ch_mode = A2D_AAC_IE_CH_MD_MONO;
++    else
++        return;
++
++    pref.vbr = (src_cap.vbr && p_sink_cap->vbr) ? A2D_AAC_IE_VBR_ON
++                                                : A2D_AAC_IE_VBR_OFF;
++    pref.bitrate = src_cap.bitrate;
++    if (pref.bitrate == 0 || pref.bitrate > p_sink_cap->bitrate)
++        pref.bitrate = p_sink_cap->bitrate;
++
++    A2D_BldAacInfo(AVDT_MEDIA_AUDIO, &pref, p_pref_cfg);
++}
++
++static void bta_av_build_ldac_src_cfg(UINT8 *p_pref_cfg, UINT8 *p_src_cap)
++{
++    tA2D_LDAC_CIE src_cap;
++    tA2D_LDAC_CIE pref;
++    const tA2D_LDAC_CIE *p_sink_cap = &bta_av_co_ldac_sink_caps;
++
++    memset(&pref, 0, sizeof(pref));
++    if (A2D_ParsLdacInfo(&src_cap, p_src_cap, TRUE) != A2D_SUCCESS)
++    {
++        APPL_TRACE_ERROR("bta_av_build_ldac_src_cfg: cannot parse peer caps");
++        return;
++    }
++
++    if ((src_cap.samp_freq & A2D_LDAC_IE_SAMP_FREQ_48000) &&
++        (p_sink_cap->samp_freq & A2D_LDAC_IE_SAMP_FREQ_48000))
++        pref.samp_freq = A2D_LDAC_IE_SAMP_FREQ_48000;
++    else if ((src_cap.samp_freq & A2D_LDAC_IE_SAMP_FREQ_44100) &&
++             (p_sink_cap->samp_freq & A2D_LDAC_IE_SAMP_FREQ_44100))
++        pref.samp_freq = A2D_LDAC_IE_SAMP_FREQ_44100;
++    else if ((src_cap.samp_freq & A2D_LDAC_IE_SAMP_FREQ_96000) &&
++             (p_sink_cap->samp_freq & A2D_LDAC_IE_SAMP_FREQ_96000))
++        pref.samp_freq = A2D_LDAC_IE_SAMP_FREQ_96000;
++    else if ((src_cap.samp_freq & A2D_LDAC_IE_SAMP_FREQ_88200) &&
++             (p_sink_cap->samp_freq & A2D_LDAC_IE_SAMP_FREQ_88200))
++        pref.samp_freq = A2D_LDAC_IE_SAMP_FREQ_88200;
++    else
++        return;
++
++    if ((src_cap.ch_mode & A2D_LDAC_IE_CH_MD_STEREO) &&
++        (p_sink_cap->ch_mode & A2D_LDAC_IE_CH_MD_STEREO))
++        pref.ch_mode = A2D_LDAC_IE_CH_MD_STEREO;
++    else if ((src_cap.ch_mode & A2D_LDAC_IE_CH_MD_DUAL) &&
++             (p_sink_cap->ch_mode & A2D_LDAC_IE_CH_MD_DUAL))
++        pref.ch_mode = A2D_LDAC_IE_CH_MD_DUAL;
++    else if ((src_cap.ch_mode & A2D_LDAC_IE_CH_MD_MONO) &&
++             (p_sink_cap->ch_mode & A2D_LDAC_IE_CH_MD_MONO))
++        pref.ch_mode = A2D_LDAC_IE_CH_MD_MONO;
++    else
++        return;
++
++    pref.vendor_id = A2D_LDAC_VENDOR_ID;
++    pref.codec_id = A2D_LDAC_CODEC_ID;
++    A2D_BldLdacInfo(AVDT_MEDIA_AUDIO, &pref, p_pref_cfg);
++}
++
+ /*******************************************************************************
+  **
+  ** Function         bta_av_build_src_cfg
+@@ -387,12 +616,23 @@ void bta_av_co_audio_disc_res(tBTA_AV_HNDL hndl, UINT8 num_seps, UINT8 num_snk,
+  ** Returns          Pass or Fail for current getconfig.
+  **
+  *******************************************************************************/
+-void bta_av_build_src_cfg (UINT8 *p_pref_cfg, UINT8 *p_src_cap)
++void bta_av_build_src_cfg (UINT8 *p_pref_cfg, UINT8 *p_src_cap, UINT8 codec_type)
+ {
+     tA2D_SBC_CIE    src_cap;
+     tA2D_SBC_CIE    pref_cap;
+     UINT8           status = 0;
+ 
++    if (codec_type == A2D_MEDIA_CT_M24)
++    {
++        bta_av_build_aac_src_cfg(p_pref_cfg, p_src_cap);
++        return;
++    }
++    if (codec_type == A2D_MEDIA_CT_VEND)
++    {
++        bta_av_build_ldac_src_cfg(p_pref_cfg, p_src_cap);
++        return;
++    }
++
+     /* initialize it to default SBC configuration */
+     A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &btif_av_sbc_default_config, p_pref_cfg);
+     /* now try to build a preferred one */
+@@ -491,9 +731,15 @@ UINT8 bta_av_audio_sink_getconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+     switch (codec_type)
+     {
+         case BTA_AV_CODEC_SBC:
++        case A2D_MEDIA_CT_M24:
+             supported = TRUE;
+             break;
+ 
++        case A2D_MEDIA_CT_VEND:
++            /* Only accept the Sony LDAC vendor codec */
++            supported = bta_av_ldac_caps_is_ldac(p_codec_info);
++            break;
++
+         default:
+             break;
+     }
+@@ -542,7 +788,7 @@ UINT8 bta_av_audio_sink_getconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+                 /* Save the new configuration */
+                 p_peer->p_src = p_src;
+                 /* get preferred config from src_caps */
+-                bta_av_build_src_cfg(pref_cfg, p_src->codec_caps);
++                bta_av_build_src_cfg(pref_cfg, p_src->codec_caps, p_src->codec_type);
+                 memcpy(p_peer->codec_cfg, pref_cfg, AVDT_CODEC_SIZE);
+ 
+                 APPL_TRACE_DEBUG("bta_av_audio_sink_getconfig  p_codec_info[%x:%x:%x:%x:%x:%x]",
+@@ -817,6 +1063,45 @@ void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+             mutex_global_lock();
+ 
+             /* Check if the configuration matches the current codec config */
++            if (AVDT_TSEP_SNK == t_local_sep)
++            {
++                /* Peer is SRC and proposes a config on one of our SINK SEPs.
++                 * bta_av_co_audio_sink_supports_config() above already
++                 * validated it against the caps we advertise: accept SBC,
++                 * AAC and LDAC as-is, no reconfiguration needed. */
++                switch (codec_type)
++                {
++                case BTA_AV_CODEC_SBC:
++                    APPL_TRACE_EVENT("remote peer setconfig bitpool range [%d:%d]",
++                       p_codec_info[BTA_AV_CO_SBC_MIN_BITPOOL_OFF], p_codec_info[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] );
++                    bta_av_co_cb.codec_cfg_setconfig.id = BTIF_AV_CODEC_SBC;
++                    bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_SBC;
++                    break;
++
++                case A2D_MEDIA_CT_M24:
++                    APPL_TRACE_EVENT("remote peer setconfig AAC");
++                    bta_av_co_cb.codec_cfg_setconfig.id = BTIF_AV_CODEC_AAC;
++                    bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_AAC;
++                    break;
++
++                case A2D_MEDIA_CT_VEND:
++                    APPL_TRACE_EVENT("remote peer setconfig LDAC");
++                    bta_av_co_cb.codec_cfg_setconfig.id = BTIF_AV_CODEC_LDAC;
++                    bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_LDAC;
++                    break;
++
++                default:
++                    APPL_TRACE_ERROR("bta_av_co_audio_setconfig unsupported codec type %d", codec_type);
++                    recfg_needed = TRUE;
++                    break;
++                }
++                if (!recfg_needed)
++                {
++                    memcpy(bta_av_co_cb.codec_cfg_setconfig.info, p_codec_info, AVDT_CODEC_SIZE);
++                    memcpy(bta_av_co_cb.codec_cfg.info, p_codec_info, AVDT_CODEC_SIZE);
++                }
++            }
++            else
+             switch (bta_av_co_cb.codec_cfg.id)
+             {
+             case BTIF_AV_CODEC_SBC:
+@@ -832,18 +1117,10 @@ void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+                 /* if remote side requests a restricted notify sinks preferred bitpool range as all other params are
+                    already checked for validify */
+                 APPL_TRACE_EVENT("remote peer setconfig bitpool range [%d:%d]",
+-                   p_codec_info[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+-                   p_codec_info[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] );
++                   p_codec_info[BTA_AV_CO_SBC_MIN_BITPOOL_OFF], p_codec_info[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] );
+ 
+                 bta_av_co_cb.codec_cfg_setconfig.id = BTIF_AV_CODEC_SBC;
+                 memcpy(bta_av_co_cb.codec_cfg_setconfig.info, p_codec_info, AVDT_CODEC_SIZE);
+-                if(AVDT_TSEP_SNK == t_local_sep)
+-                {
+-                    /* If Peer is SRC, and our cfg subset matches with what is requested by peer, then
+-                                         just accept what peer wants */
+-                    memcpy(bta_av_co_cb.codec_cfg.info, p_codec_info, AVDT_CODEC_SIZE);
+-                    recfg_needed = FALSE;
+-                }
+                 break;
+ 
+ 
+@@ -1352,35 +1629,53 @@ static BOOLEAN bta_av_co_audio_peer_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT
+  *******************************************************************************/
+ static BOOLEAN bta_av_co_audio_peer_src_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT8 *p_src_index)
+ {
++    /* INT (sink) side codec preference: LDAC > AAC > SBC */
++    static const UINT8 codec_prio[] =
++        { A2D_MEDIA_CT_VEND, A2D_MEDIA_CT_M24, A2D_MEDIA_CT_SBC };
++    int prio;
+     int index;
+-    UINT8 codec_type;
+-    FUNC_TRACE();
+-
+-    /* Configure the codec type to look for */
+-    codec_type = bta_av_co_cb.codec_cfg.id;
+ 
++    FUNC_TRACE();
+ 
+-    for (index = 0; index < p_peer->num_sup_srcs; index++)
++    for (prio = 0; prio < (int)BTA_AV_CO_NUM_ELEMENTS(codec_prio); prio++)
+     {
+-        if (p_peer->srcs[index].codec_type == codec_type)
++        for (index = 0; index < p_peer->num_sup_srcs; index++)
+         {
+-            switch (bta_av_co_cb.codec_cfg.id)
++            UINT8 *p_caps = (UINT8 *)p_peer->srcs[index].codec_caps;
++
++            if (p_peer->srcs[index].codec_type != codec_prio[prio])
++                continue;
++
++            switch (codec_prio[prio])
+             {
+-            case BTIF_AV_CODEC_SBC:
+-                if (p_src_index) *p_src_index = index;
+-                if (0 ==  bta_av_sbc_cfg_matches_cap((UINT8 *)p_peer->srcs[index].codec_caps,
+-                                                     (tA2D_SBC_CIE *)&bta_av_co_sbc_sink_caps))
+-                {
+-                    return TRUE;
+-                }
++            case A2D_MEDIA_CT_SBC:
++                if (0 != bta_av_sbc_cfg_matches_cap(p_caps,
++                        (tA2D_SBC_CIE *)&bta_av_co_sbc_sink_caps))
++                    continue;
++                bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_SBC;
+                 break;
+ 
+-            default:
+-                APPL_TRACE_ERROR("peer_src_supports_codec: unsupported codec id %d",
+-                                                            bta_av_co_cb.codec_cfg.id);
+-                return FALSE;
++            case A2D_MEDIA_CT_M24:
++                if (!bta_av_aac_caps_compatible(p_caps, &bta_av_co_aac_sink_caps))
++                    continue;
++                bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_AAC;
++                break;
++
++            case A2D_MEDIA_CT_VEND:
++                if (!bta_av_ldac_caps_is_ldac(p_caps) ||
++                    !bta_av_ldac_caps_compatible(p_caps, &bta_av_co_ldac_sink_caps))
++                    continue;
++                bta_av_co_cb.codec_cfg.id = BTIF_AV_CODEC_LDAC;
+                 break;
++
++            default:
++                continue;
+             }
++
++            APPL_TRACE_DEBUG("peer_src_supports_codec: selected codec 0x%x at src index %d",
++                             codec_prio[prio], index);
++            if (p_src_index) *p_src_index = (UINT8)index;
++            return TRUE;
+         }
+     }
+     return FALSE;
+@@ -1408,9 +1703,23 @@ static BOOLEAN bta_av_co_audio_sink_supports_config(UINT8 codec_type, const UINT
+         }
+         break;
+ 
++    case A2D_MEDIA_CT_M24:
++        if (!bta_av_aac_cfg_in_cap((UINT8 *)p_codec_cfg, &bta_av_co_aac_sink_caps))
++        {
++            return FALSE;
++        }
++        break;
++
++    case A2D_MEDIA_CT_VEND:
++        /* A2D_ParsLdacInfo (via cfg_in_cap) rejects non-LDAC vendor codecs */
++        if (!bta_av_ldac_cfg_in_cap((UINT8 *)p_codec_cfg, &bta_av_co_ldac_sink_caps))
++        {
++            return FALSE;
++        }
++        break;
+ 
+     default:
+-        APPL_TRACE_ERROR("bta_av_co_audio_media_supports_config unsupported codec type %d", codec_type);
++        APPL_TRACE_ERROR("bta_av_co_audio_sink_supports_config unsupported codec type %d", codec_type);
+         return FALSE;
+         break;
+     }
+diff --git a/btif/include/btif_av_api.h b/btif/include/btif_av_api.h
+index 86cd40b..ec1cc11 100644
+--- a/btif/include/btif_av_api.h
++++ b/btif/include/btif_av_api.h
+@@ -45,6 +45,9 @@
+ /* Codec type */
+ #define BTIF_AV_CODEC_NONE       0xFF
+ #define BTIF_AV_CODEC_SBC        A2D_MEDIA_CT_SBC        /* SBC media codec type */
++#define BTIF_AV_CODEC_AAC        A2D_MEDIA_CT_M24        /* MPEG-2/4 AAC media codec type */
++#define BTIF_AV_CODEC_LDAC       0xFE                    /* Sony LDAC vendor codec
++                                                            (0xFF collides with NONE) */
+ 
+ #define BTIF_AV_CODEC_PCM        0x5                     /* Raw PCM */
+ 
+diff --git a/btif/include/btif_av_co.h b/btif/include/btif_av_co.h
+index a6a5bfa..9f3b6ff 100644
+--- a/btif/include/btif_av_co.h
++++ b/btif/include/btif_av_co.h
+@@ -29,6 +29,8 @@ enum
+ {
+     BTIF_SV_AV_AA_SBC_INDEX = 0,
+     BTIF_SV_AV_AA_SBC_SINK_INDEX,
++    BTIF_SV_AV_AA_AAC_SINK_INDEX,
++    BTIF_SV_AV_AA_LDAC_SINK_INDEX,
+     BTIF_SV_AV_AA_SEP_INDEX  /* Last index */
+ };
+ 
+diff --git a/stack/Android.mk b/stack/Android.mk
+index 40ae5a6..1271e18 100644
+--- a/stack/Android.mk
++++ b/stack/Android.mk
+@@ -38,6 +38,8 @@ LOCAL_C_INCLUDES:= \
+ LOCAL_SRC_FILES:= \
+     ./a2dp/a2d_api.c \
+     ./a2dp/a2d_sbc.c \
++    ./a2dp/a2d_aac.c \
++    ./a2dp/a2d_ldac.c \
+     ./avrc/avrc_api.c \
+     ./avrc/avrc_sdp.c \
+     ./avrc/avrc_opt.c \
+diff --git a/stack/a2dp/a2d_aac.c b/stack/a2dp/a2d_aac.c
+new file mode 100644
+index 0000000..b55b20d
+--- /dev/null
++++ b/stack/a2dp/a2d_aac.c
+@@ -0,0 +1,143 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2026 The KeenPlus U2 Firmware Project Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  Functions for the MPEG-2/4 AAC A2DP media codec (capability/config
++ *  element build + parse).  Byte order follows A2DP spec section 4.3.2.
++ *
++ ******************************************************************************/
++
++#include "a2d_int.h"
++#include "a2d_aac.h"
++#include "bt_utils.h"
++
++/******************************************************************************
++**
++** Function         A2D_BldAacInfo
++**
++** Description      This function is called by an application to build
++**                  the AAC Media Codec Capabilities byte sequence
++**                  beginning from the LOSC octet.
++**                  Input Parameters:
++**                      media_type:  Indicates Audio, or Multimedia.
++**
++**                      p_ie:  The AAC Codec Information Element information.
++**
++**                  Output Parameters:
++**                      p_result:  the resulting codec info byte sequence.
++**
++** Returns          A2D_SUCCESS if function execution succeeded.
++**                  Error status code, otherwise.
++******************************************************************************/
++tA2D_STATUS A2D_BldAacInfo(UINT8 media_type, tA2D_AAC_CIE *p_ie, UINT8 *p_result)
++{
++    tA2D_STATUS status;
++
++    if (p_ie == NULL || p_result == NULL ||
++        (p_ie->obj_type & ~A2D_AAC_IE_OBJCT_MSK) ||
++        (p_ie->samp_freq & ~(A2D_AAC_IE_SAMP_FREQ_MSK0 | A2D_AAC_IE_SAMP_FREQ_MSK1)) ||
++        (p_ie->ch_mode & ~A2D_AAC_IE_CH_MD_MSK) ||
++        (p_ie->vbr & ~A2D_AAC_IE_VBR_MSK) ||
++        (p_ie->bitrate > A2D_AAC_IE_BITRATE_MSK))
++    {
++        /* if any unused bit is set */
++        status = A2D_INVALID_PARAMS;
++    }
++    else
++    {
++        status = A2D_SUCCESS;
++        *p_result++ = A2D_AAC_INFO_LEN;
++        *p_result++ = media_type;
++        *p_result++ = A2D_MEDIA_CT_M24;
++
++        /* Media Codec Specific Information Element */
++        *p_result++ = p_ie->obj_type;
++        *p_result++ = (UINT8)(p_ie->samp_freq & 0xFF);
++        *p_result++ = (UINT8)(((p_ie->samp_freq >> 8) & 0xF0) | p_ie->ch_mode);
++        *p_result++ = (UINT8)(p_ie->vbr | ((p_ie->bitrate >> 16) & A2D_AAC_IE_BITRATE_MSK0));
++        *p_result++ = (UINT8)((p_ie->bitrate >> 8) & 0xFF);
++        *p_result   = (UINT8)(p_ie->bitrate & 0xFF);
++    }
++    return status;
++}
++
++/******************************************************************************
++**
++** Function         A2D_ParsAacInfo
++**
++** Description      This function is called by an application to parse
++**                  the AAC Media Codec Capabilities byte sequence
++**                  beginning from the LOSC octet.
++**                  Input Parameters:
++**                      p_info:  the byte sequence to parse.
++**
++**                      for_caps:  TRUE, if the byte sequence is for get
++**                                 capabilities response.
++**
++**                  Output Parameters:
++**                      p_ie:  The AAC Codec Information Element information.
++**
++** Returns          A2D_SUCCESS if function execution succeeded.
++**                  Error status code, otherwise.
++******************************************************************************/
++tA2D_STATUS A2D_ParsAacInfo(tA2D_AAC_CIE *p_ie, const UINT8 *p_info,
++                            BOOLEAN for_caps)
++{
++    tA2D_STATUS status = A2D_SUCCESS;
++    UINT8 losc;
++
++    if (p_ie == NULL || p_info == NULL)
++        return A2D_INVALID_PARAMS;
++
++    losc = *p_info;
++    p_info += 2;
++
++    /* If the function is called for the wrong Media Type or Media Codec Type */
++    if (losc != A2D_AAC_INFO_LEN || *p_info != A2D_MEDIA_CT_M24)
++        return A2D_WRONG_CODEC;
++
++    p_info++;
++    p_ie->obj_type = *p_info++ & A2D_AAC_IE_OBJCT_MSK;
++
++    p_ie->samp_freq = *p_info++;                          /* octet 1: 8k..44.1k */
++    p_ie->samp_freq |= (UINT16)(*p_info & 0xF0) << 8;     /* octet 2 hi: 48k..96k */
++    p_ie->ch_mode = *p_info++ & A2D_AAC_IE_CH_MD_MSK;
++
++    p_ie->vbr = *p_info & A2D_AAC_IE_VBR_MSK;
++    p_ie->bitrate = (UINT32)(*p_info++ & A2D_AAC_IE_BITRATE_MSK0) << 16;
++    p_ie->bitrate |= (UINT32)(*p_info++) << 8;
++    p_ie->bitrate |= *p_info;
++
++    if (for_caps != FALSE)
++        return status;
++
++    /* Configuration: exactly one object type, one sampling frequency and one
++     * channel mode must be selected. */
++    if (A2D_BitsSet(p_ie->obj_type) != A2D_SET_ONE_BIT)
++        status = A2D_BAD_OBJ_TYPE;
++    if (!((A2D_BitsSet((UINT8)(p_ie->samp_freq & 0xFF)) == A2D_SET_ONE_BIT &&
++           A2D_BitsSet((UINT8)((p_ie->samp_freq >> 8) & 0xFF)) == 0) ||
++          (A2D_BitsSet((UINT8)(p_ie->samp_freq & 0xFF)) == 0 &&
++           A2D_BitsSet((UINT8)((p_ie->samp_freq >> 8) & 0xFF)) == A2D_SET_ONE_BIT)))
++        status = A2D_BAD_SAMP_FREQ;
++    if (A2D_BitsSet(p_ie->ch_mode) != A2D_SET_ONE_BIT)
++        status = A2D_BAD_CHANNEL;
++
++    return status;
++}
+diff --git a/stack/a2dp/a2d_ldac.c b/stack/a2dp/a2d_ldac.c
+new file mode 100644
+index 0000000..f8ef186
+--- /dev/null
++++ b/stack/a2dp/a2d_ldac.c
+@@ -0,0 +1,147 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2026 The KeenPlus U2 Firmware Project Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  Functions for the Sony LDAC A2DP vendor media codec (capability/config
++ *  element build + parse).
++ *
++ ******************************************************************************/
++
++#include "a2d_int.h"
++#include "a2d_ldac.h"
++#include "bt_utils.h"
++
++/******************************************************************************
++**
++** Function         A2D_BldLdacInfo
++**
++** Description      This function is called by an application to build
++**                  the LDAC Media Codec Capabilities byte sequence
++**                  beginning from the LOSC octet.
++**                  Input Parameters:
++**                      media_type:  Indicates Audio, or Multimedia.
++**
++**                      p_ie:  The LDAC Codec Information Element information.
++**
++**                  Output Parameters:
++**                      p_result:  the resulting codec info byte sequence.
++**
++** Returns          A2D_SUCCESS if function execution succeeded.
++**                  Error status code, otherwise.
++******************************************************************************/
++tA2D_STATUS A2D_BldLdacInfo(UINT8 media_type, tA2D_LDAC_CIE *p_ie, UINT8 *p_result)
++{
++    tA2D_STATUS status;
++    int i;
++
++    if (p_ie == NULL || p_result == NULL ||
++        (p_ie->vendor_id != A2D_LDAC_VENDOR_ID) ||
++        (p_ie->codec_id != A2D_LDAC_CODEC_ID) ||
++        (p_ie->samp_freq & ~A2D_LDAC_IE_SAMP_FREQ_MSK) ||
++        (p_ie->ch_mode & ~A2D_LDAC_IE_CH_MD_MSK))
++    {
++        /* if any unused bit is set */
++        status = A2D_INVALID_PARAMS;
++    }
++    else
++    {
++        status = A2D_SUCCESS;
++        *p_result++ = A2D_LDAC_INFO_LEN;
++        *p_result++ = media_type;
++        *p_result++ = A2D_MEDIA_CT_VEND;
++
++        /* Vendor ID (little endian) */
++        UINT8_TO_STREAM(p_result, (UINT8)(A2D_LDAC_VENDOR_ID & 0xFF));
++        UINT8_TO_STREAM(p_result, (UINT8)(A2D_LDAC_VENDOR_ID >> 8));
++        /* Codec ID (little endian) */
++        UINT8_TO_STREAM(p_result, (UINT8)(A2D_LDAC_CODEC_ID & 0xFF));
++        UINT8_TO_STREAM(p_result, (UINT8)(A2D_LDAC_CODEC_ID >> 8));
++
++        /* Media Codec Specific Information Element */
++        *p_result++ = p_ie->samp_freq;
++        *p_result++ = p_ie->ch_mode;
++
++        /* Reserved */
++        for (i = 0; i < 4; i++)
++            *p_result++ = 0;
++    }
++    return status;
++}
++
++/******************************************************************************
++**
++** Function         A2D_ParsLdacInfo
++**
++** Description      This function is called by an application to parse
++**                  the LDAC Media Codec Capabilities byte sequence
++**                  beginning from the LOSC octet.
++**                  Input Parameters:
++**                      p_info:  the byte sequence to parse.
++**
++**                      for_caps:  TRUE, if the byte sequence is for get
++**                                 capabilities response.
++**
++**                  Output Parameters:
++**                      p_ie:  The LDAC Codec Information Element information.
++**
++** Returns          A2D_SUCCESS if function execution succeeded.
++**                  Error status code, otherwise.
++******************************************************************************/
++tA2D_STATUS A2D_ParsLdacInfo(tA2D_LDAC_CIE *p_ie, const UINT8 *p_info,
++                             BOOLEAN for_caps)
++{
++    tA2D_STATUS status = A2D_SUCCESS;
++    UINT8 losc;
++
++    if (p_ie == NULL || p_info == NULL)
++        return A2D_INVALID_PARAMS;
++
++    losc = *p_info;
++    p_info += 2;
++
++    /* If the function is called for the wrong Media Type or Media Codec Type */
++    if (losc != A2D_LDAC_INFO_LEN || *p_info != A2D_MEDIA_CT_VEND)
++        return A2D_WRONG_CODEC;
++
++    p_info++;
++    /* Vendor ID (little endian) */
++    p_ie->vendor_id = (UINT16)(*p_info++);
++    p_ie->vendor_id |= (UINT16)(*p_info++) << 8;
++    /* Codec ID (little endian) */
++    p_ie->codec_id = (UINT16)(*p_info++);
++    p_ie->codec_id |= (UINT16)(*p_info++) << 8;
++
++    if (p_ie->vendor_id != A2D_LDAC_VENDOR_ID ||
++        p_ie->codec_id != A2D_LDAC_CODEC_ID)
++        return A2D_WRONG_CODEC;
++
++    p_ie->samp_freq = *p_info++ & A2D_LDAC_IE_SAMP_FREQ_MSK;
++    p_ie->ch_mode   = *p_info & A2D_LDAC_IE_CH_MD_MSK;
++
++    if (for_caps != FALSE)
++        return status;
++
++    /* Configuration: exactly one sampling frequency and channel mode */
++    if (A2D_BitsSet(p_ie->samp_freq) != A2D_SET_ONE_BIT)
++        status = A2D_BAD_SAMP_FREQ;
++    if (A2D_BitsSet(p_ie->ch_mode) != A2D_SET_ONE_BIT)
++        status = A2D_BAD_CH_MODE;
++
++    return status;
++}
+diff --git a/stack/include/a2d_aac.h b/stack/include/a2d_aac.h
+new file mode 100644
+index 0000000..a233abe
+--- /dev/null
++++ b/stack/include/a2d_aac.h
+@@ -0,0 +1,109 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2026 The KeenPlus U2 Firmware Project Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  Interface to the MPEG-2/4 AAC audio codec (A2DP media codec type 0x02).
++ *  Byte layout follows the A2DP specification, section 4.3.2
++ *  ("MPEG-2/4 AAC Codec Information Element").
++ *
++ ******************************************************************************/
++#ifndef A2D_AAC_H
++#define A2D_AAC_H
++
++#include "a2d_api.h"
++
++/*****************************************************************************
++**  Constants
++*****************************************************************************/
++/* Length of the AAC Media Codec Information Element (octets after LOSC). */
++#define A2D_AAC_INFO_LEN        8
++
++/* [Octet 0] Object type */
++#define A2D_AAC_IE_OBJCT_MSK        0xF0
++#define A2D_AAC_IE_OBJCT_MPEG2_LC   0x80    /* MPEG-2 Low Complexity */
++#define A2D_AAC_IE_OBJCT_MPEG4_LC   0x40    /* MPEG-4 Low Complexity */
++#define A2D_AAC_IE_OBJCT_MPEG4_LTP  0x20    /* MPEG-4 Long Term Prediction */
++#define A2D_AAC_IE_OBJCT_MPEG4_SCA  0x10    /* MPEG-4 Scalable */
++
++/* [Octet 1] Sampling frequency, low byte (8000 .. 44100) */
++#define A2D_AAC_IE_SAMP_FREQ_MSK0   0xFF
++#define A2D_AAC_IE_SAMP_FREQ_8000   0x80
++#define A2D_AAC_IE_SAMP_FREQ_11025  0x40
++#define A2D_AAC_IE_SAMP_FREQ_12000  0x20
++#define A2D_AAC_IE_SAMP_FREQ_16000  0x10
++#define A2D_AAC_IE_SAMP_FREQ_22050  0x08
++#define A2D_AAC_IE_SAMP_FREQ_24000  0x04
++#define A2D_AAC_IE_SAMP_FREQ_32000  0x02
++#define A2D_AAC_IE_SAMP_FREQ_44100  0x01
++
++/* [Octet 2], bits 4-7: sampling frequency, high byte (48000 .. 96000).
++ * In tA2D_AAC_CIE.samp_freq these bits live at 8..11. */
++#define A2D_AAC_IE_SAMP_FREQ_MSK1   (0xF0 << 8)
++#define A2D_AAC_IE_SAMP_FREQ_48000  (0x80 << 8)
++#define A2D_AAC_IE_SAMP_FREQ_64000  (0x40 << 8)
++#define A2D_AAC_IE_SAMP_FREQ_88200  (0x20 << 8)
++#define A2D_AAC_IE_SAMP_FREQ_96000  (0x10 << 8)
++
++/* [Octet 2], bits 2-3: channel mode */
++#define A2D_AAC_IE_CH_MD_MSK        0x0C
++#define A2D_AAC_IE_CH_MD_MONO       0x08
++#define A2D_AAC_IE_CH_MD_STEREO     0x04
++
++/* [Octet 3], bit 7: variable bit rate; bits 0-6: bit rate bits 16-22 */
++#define A2D_AAC_IE_VBR_MSK          0x80
++#define A2D_AAC_IE_VBR_ON           0x80
++#define A2D_AAC_IE_VBR_OFF          0x00
++#define A2D_AAC_IE_BITRATE_MSK0     0x7F
++#define A2D_AAC_IE_BITRATE_MSK      0x7FFFFF
++
++/*****************************************************************************
++**  Type definitions
++*****************************************************************************/
++typedef struct
++{
++    UINT8   obj_type;   /* Object type bit mask */
++    UINT16  samp_freq;  /* Sampling frequency bit mask (octet1 | octet2 << 8) */
++    UINT8   ch_mode;    /* Channel mode bit mask */
++    UINT8   vbr;        /* Variable bit rate: 0 or A2D_AAC_IE_VBR_ON */
++    UINT32  bitrate;    /* Bit rate, 23 bits */
++} tA2D_AAC_CIE;
++
++/*****************************************************************************
++**  External Function Declarations
++*****************************************************************************/
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++/* Builds the AAC Media Codec Capability/Configuration byte sequence
++ * beginning from the LOSC octet. */
++extern tA2D_STATUS A2D_BldAacInfo(UINT8 media_type, tA2D_AAC_CIE *p_ie,
++                                  UINT8 *p_result);
++
++/* Parses the AAC Media Codec Capability byte sequence beginning from the
++ * LOSC octet. for_caps == TRUE relaxes the single-bit checks. */
++extern tA2D_STATUS A2D_ParsAacInfo(tA2D_AAC_CIE *p_ie, const UINT8 *p_info,
++                                   BOOLEAN for_caps);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* A2D_AAC_H */
+diff --git a/stack/include/a2d_api.h b/stack/include/a2d_api.h
+index 75d2755..1219cd9 100644
+--- a/stack/include/a2d_api.h
++++ b/stack/include/a2d_api.h
+@@ -50,6 +50,7 @@
+ #define A2D_MEDIA_CT_M12        0x01    /* MPEG-1, 2 Audio media codec type */
+ #define A2D_MEDIA_CT_M24        0x02    /* MPEG-2, 4 AAC media codec type */
+ #define A2D_MEDIA_CT_ATRAC      0x04    /* ATRAC family media codec type */
++#define A2D_MEDIA_CT_VEND       0xFF    /* Vendor-specific media codec type */
+ 
+ #define A2D_SUCCESS           0     /* Success */
+ #define A2D_FAIL              0x0A  /* Failed */
+diff --git a/stack/include/a2d_ldac.h b/stack/include/a2d_ldac.h
+new file mode 100644
+index 0000000..e60d35e
+--- /dev/null
++++ b/stack/include/a2d_ldac.h
+@@ -0,0 +1,105 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2026 The KeenPlus U2 Firmware Project Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  Interface to the Sony LDAC vendor audio codec (A2DP vendor codec type,
++ *  Vendor ID 0x012D, Codec ID 0x00AA).  Byte layout follows Sony's LDAC
++ *  A2DP vendor codec specification.
++ *
++ ******************************************************************************/
++#ifndef A2D_LDAC_H
++#define A2D_LDAC_H
++
++#include "a2d_api.h"
++
++/*****************************************************************************
++**  Constants
++*****************************************************************************/
++/* Vendor media codec type (non-A2DP standard).  r36 has no definition. */
++#ifndef A2D_MEDIA_CT_VEND
++#define A2D_MEDIA_CT_VEND       0xFF
++#endif
++
++/* Length of the LDAC Media Codec Information Element (octets after LOSC):
++ * vendor id (2) + codec id (2) + sampling freq (1) + channel mode (1)
++ * + reserved (4). */
++#define A2D_LDAC_INFO_LEN       10
++
++/* Length of the LDAC Media Payload header (1 octet: F|S|L|num_frames). */
++#define A2D_LDAC_MPL_HDR_LEN    1
++
++/* Vendor and codec identifiers (little endian on the wire) */
++#define A2D_LDAC_VENDOR_ID      0x012D
++#define A2D_LDAC_CODEC_ID       0x00AA
++
++/* [Octet 4] Sampling frequency */
++#define A2D_LDAC_IE_SAMP_FREQ_MSK   0x3F
++#define A2D_LDAC_IE_SAMP_FREQ_44100 0x20
++#define A2D_LDAC_IE_SAMP_FREQ_48000 0x10
++#define A2D_LDAC_IE_SAMP_FREQ_88200 0x08
++#define A2D_LDAC_IE_SAMP_FREQ_96000 0x04
++#define A2D_LDAC_IE_SAMP_FREQ_176400 0x02
++#define A2D_LDAC_IE_SAMP_FREQ_192000 0x01
++
++/* [Octet 5] Channel mode */
++#define A2D_LDAC_IE_CH_MD_MSK       0x07
++#define A2D_LDAC_IE_CH_MD_MONO      0x04
++#define A2D_LDAC_IE_CH_MD_DUAL      0x02
++#define A2D_LDAC_IE_CH_MD_STEREO    0x01
++
++/* Media payload header bits (octet 0 of the RTP media payload) */
++#define A2D_LDAC_HDR_F_MSK          0x80    /* fragment */
++#define A2D_LDAC_HDR_S_MSK          0x40    /* start frame */
++#define A2D_LDAC_HDR_L_MSK          0x20    /* last frame */
++#define A2D_LDAC_HDR_NUM_MSK        0x0F    /* number of LDAC frames */
++
++/*****************************************************************************
++**  Type definitions
++*****************************************************************************/
++typedef struct
++{
++    UINT16  vendor_id;  /* Must be A2D_LDAC_VENDOR_ID */
++    UINT16  codec_id;   /* Must be A2D_LDAC_CODEC_ID */
++    UINT8   samp_freq;  /* Sampling frequency bit mask */
++    UINT8   ch_mode;    /* Channel mode bit mask */
++} tA2D_LDAC_CIE;
++
++/*****************************************************************************
++**  External Function Declarations
++*****************************************************************************/
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++/* Builds the LDAC Media Codec Capability/Configuration byte sequence
++ * beginning from the LOSC octet. */
++extern tA2D_STATUS A2D_BldLdacInfo(UINT8 media_type, tA2D_LDAC_CIE *p_ie,
++                                   UINT8 *p_result);
++
++/* Parses the LDAC Media Codec Capability byte sequence beginning from the
++ * LOSC octet. for_caps == TRUE relaxes the single-bit checks. */
++extern tA2D_STATUS A2D_ParsLdacInfo(tA2D_LDAC_CIE *p_ie, const UINT8 *p_info,
++                                    BOOLEAN for_caps);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* A2D_LDAC_H */
+-- 
+2.39.5
+
