@@ -120,9 +120,15 @@ setup_ndk() {
   if [ -n "$ndkroot" ] && [ -x "$ndkroot/bin/clang++" ] && [ -f "$ndkroot/lib64/libc++.so.1" ]; then
     NDK="$ndkroot"; echo "[ndk] cached: $NDK"; return 0
   fi
-  echo "[ndk] downloading $NDK_URL (~530 MB)"
-  curl -sS -L --retry 3 -o "$zip" "$NDK_URL" || die "NDK download failed"
-  prefix="$(unzip -Z1 "$zip" | head -1 | cut -d/ -f1)"
+  if [ -s "$zip" ]; then
+    echo "[ndk] reusing cached $zip"
+  else
+    echo "[ndk] downloading $NDK_URL (~530 MB)"
+    curl -sS -L --retry 3 -o "$zip" "$NDK_URL" || die "NDK download failed"
+  fi
+  # `|| true`: unzip -Z1 on a huge archive gets SIGPIPE when head exits early;
+  # with `set -o pipefail` that would kill the whole script (exit 141).
+  prefix="$(unzip -Z1 "$zip" 2>/dev/null | head -1 | cut -d/ -f1 || true)"
   [ -n "$prefix" ] || die "cannot determine NDK top-level dir"
   local P="$prefix/toolchains/llvm/prebuilt/linux-x86_64"
   echo "[ndk] extracting toolchain (this keeps ~1 GB and drops the rest)"
