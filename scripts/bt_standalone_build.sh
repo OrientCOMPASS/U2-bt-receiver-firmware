@@ -445,7 +445,7 @@ case "$ROOTKEY" in
   bt)   ABS="$BT/$REL";        INC=("${BT_INC[@]}") ;;
   aac)  ABS="$SRC/aac/$REL";   INC=("${AAC_INC[@]}") ;;
   ldac) ABS="$SRC/libldac/$REL"; INC=("${LDAC_INC[@]}") ;;
-  ldacdec) ABS="$SRC/libldacdec/$REL"; INC=("${LDACDEC_INC[@]}")
+  libldacdec) ABS="$SRC/libldacdec/$REL"; INC=("${LDACDEC_INC[@]}")
            CFLAGS=( "${CFLAGS[@]/-std=c99/-std=gnu99}" ) ;;
   *)    echo "FAIL $ROOTKEY/$REL (unknown root)"; exit 0 ;;
 esac
