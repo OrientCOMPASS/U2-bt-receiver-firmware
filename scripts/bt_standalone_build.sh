@@ -447,6 +447,7 @@ case "$ROOTKEY" in
   ldac) ABS="$SRC/libldac/$REL"; INC=("${LDAC_INC[@]}") ;;
   libldacdec) ABS="$SRC/libldacdec/$REL"; INC=("${LDACDEC_INC[@]}")
            CFLAGS=( "${CFLAGS[@]/-std=c99/-std=gnu99}" ) ;;
+  tinyxml2) ABS="$SRC/tinyxml2/$REL"; INC=( -I"$SRC/tinyxml2" ) ;;
   *)    echo "FAIL $ROOTKEY/$REL (unknown root)"; exit 0 ;;
 esac
 O="$OBJ/${ROOTKEY}_$(echo "$REL" | tr '/' '_').o"
@@ -516,6 +517,14 @@ SMOKEOF
   # third_party/libldacdec -- vendored MIT LDAC decoder core (nougat sink RX)
   if [ -d "$SRC/libldacdec" ]; then
     (cd "$SRC/libldacdec" && ls *.c 2>/dev/null) | sed 's#^#libldacdec #' >> "$LIST"
+  fi
+  # external/tinyxml2 -- osi/config parses bt_stack.conf with it; the stock
+  # stack .so links tinyxml2 statically (its 804 exports include the whole
+  # tinyxml2 API) and no libtinyxml2.so exists on the device, so ours must
+  # carry it too or the symbols stay UND at runtime.
+  if [ -d "$SRC/tinyxml2" ]; then
+    (cd "$SRC/tinyxml2" && ls tinyxml2.cpp tinyxml2parser.cpp 2>/dev/null) \
+      | sed 's#^#tinyxml2 #' >> "$LIST"
   fi
   sort -o "$LIST" "$LIST"
 }
@@ -601,10 +610,30 @@ link_artifacts() {
   echo "[link] bluetooth.default.so (all stack objects; undefined platform symbols allowed)"
   mapfile -t bt_objs < <(find "$OBJ" -name 'bt_*.o' ! -name 'bt_audio_a2dp_hw_*' | sort)
   mapfile -t ldacdec_objs < <(find "$OBJ" -name 'libldacdec_*.o' | sort)
+  mapfile -t tinyxml2_objs < <(find "$OBJ" -name 'tinyxml2_*.o' | sort)
+  # Runtime DT_NEEDED completeness (B4): the N linker resolves every UND from
+  # the DT_NEEDED closure.  Provider analysis of the 179 strong UNDs against
+  # the baseline extraction showed 4 platform libs beyond the NDK five:
+  #   libcutils (property_get/set, set_sched_policy, __android_log_error_write)
+  #   libutils  (RefBase inc/decStrong)
+  #   libmedia  (AudioTrack ctor/write -- 32-bit size_t "j" manglings, proven
+  #              present via the stock stack's own UND set in the B3 gate)
+  #   libhardware (hw_get_module)
+  # The 32-bit versions are not in the baseline artifact, so record the
+  # DT_NEEDED entries with empty soname-carrying stubs (symbols stay UND,
+  # which -shared allows; the real libs satisfy them on-device).
+  mkdir -p "$OUTDIR/stubs"
+  local stub
+  for stub in libcutils libutils libhardware libmedia; do
+    "$CCXX" "${TARGET[@]}" "${SYSROOT[@]}" -shared -x c++ /dev/null \
+      -Wl,-soname,"$stub.so" -o "$OUTDIR/stubs/$stub.so" || return 1
+  done
   "$CCXX" "${TARGET[@]}" "${SYSROOT[@]}" -shared -static-libstdc++ \
     -o "$OUTDIR/bluetooth.default.so" "${bt_objs[@]}" "${aac_objs[@]}" \
     ${ldacdec_objs[@]+"${ldacdec_objs[@]}"} \
-    -Wl,-Bsymbolic -llog -lz -ldl || return 1
+    ${tinyxml2_objs[@]+"${tinyxml2_objs[@]}"} \
+    -Wl,-Bsymbolic -llog -lz -ldl \
+    -Wl,--no-as-needed -L"$OUTDIR/stubs" -lcutils -lutils -lhardware -lmedia || return 1
   echo "[link] audio.a2dp.default.so"
   mapfile -t a2dp_objs < <(find "$OBJ" -name 'bt_audio_a2dp_hw_src_*.o' | sort)
   mapfile -t osi_objs < <(find "$OBJ" -name 'bt_osi_*.o' | sort)
