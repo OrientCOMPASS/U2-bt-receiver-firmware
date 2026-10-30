@@ -523,7 +523,10 @@ SMOKEOF
   # tinyxml2 API) and no libtinyxml2.so exists on the device, so ours must
   # carry it too or the symbols stay UND at runtime.
   if [ -d "$SRC/tinyxml2" ]; then
-    (cd "$SRC/tinyxml2" && ls tinyxml2.cpp tinyxml2parser.cpp 2>/dev/null) \
+    # glob, not explicit names: r36 may or may not carry the split
+    # tinyxml2parser.cpp; `ls missing 2>/dev/null` still exits non-zero and
+    # pipefail would kill the script.
+    (cd "$SRC/tinyxml2" && ls tinyxml2*.cpp 2>/dev/null || true) \
       | sed 's#^#tinyxml2 #' >> "$LIST"
   fi
   sort -o "$LIST" "$LIST"
