@@ -128,11 +128,19 @@ jobs:
           python3 scripts/mtk_sparse2raw.py "$SPARSE" "$W/system.raw.img" -q
           rm -rf "$W/fw.zip" "$W/x" "$SPARSE"
           ls -l "$W/system.raw.img"
+          # loop-mount + cp -a: the proven extraction path in this repo's CI
+          # (run 41092527738: debugfs silently wrote nothing on this image --
+          # mount is kernel-verified by every other workflow, use it).
+          e2fsck -fn "$W/system.raw.img" | tail -2
           SYS="$W/sysroot"; mkdir -p "$SYS/system/bin" "$SYS/data"
-          debugfs -R "dump /system/bin/linker $SYS/system/bin/linker" "$W/system.raw.img" 2>/dev/null
-          debugfs -R "rdump /system/lib $SYS/system" "$W/system.raw.img" 2>/dev/null
-          debugfs -R "rdump /system/vendor/lib $SYS/system/vendor" "$W/system.raw.img" 2>/dev/null
-          chmod +x "$SYS/system/bin/linker"
+          sudo mkdir -p /mnt/loaddbg
+          sudo mount -o loop,ro "$W/system.raw.img" /mnt/loaddbg
+          cp -a /mnt/loaddbg/bin/linker "$SYS/system/bin/linker"
+          cp -a /mnt/loaddbg/lib "$SYS/system/lib"
+          mkdir -p "$SYS/system/vendor"
+          cp -a /mnt/loaddbg/vendor/lib "$SYS/system/vendor/lib"
+          sudo umount /mnt/loaddbg
+          test -x "$SYS/system/bin/linker"
           test -f "$SYS/system/lib/hw/bluetooth.default.so"
           md5sum "$SYS/system/lib/hw/bluetooth.default.so"
           GOT=$(md5sum "$SYS/system/lib/hw/bluetooth.default.so" | awk '{print $1}')
@@ -200,7 +208,10 @@ jobs:
             unzip -oq "$W/v1.zip" -d "$W/x1"
             S1="$(find "$W/x1" -name system.img | head -1)"
             python3 scripts/mtk_sparse2raw.py "$S1" "$W/s1.raw.img" -q
-            debugfs -R "dump /system/lib/hw/bluetooth.default.so $W/stock/bluetooth.default.so" "$W/s1.raw.img" 2>/dev/null
+            sudo mkdir -p /mnt/loaddbg
+            sudo mount -o loop,ro "$W/s1.raw.img" /mnt/loaddbg
+            cp -a /mnt/loaddbg/lib/hw/bluetooth.default.so "$W/stock/bluetooth.default.so"
+            sudo umount /mnt/loaddbg
             rm -rf "$W/v1.zip" "$W/x1" "$S1" "$W/s1.raw.img"
           fi
           md5sum "$W/stock/bluetooth.default.so"
