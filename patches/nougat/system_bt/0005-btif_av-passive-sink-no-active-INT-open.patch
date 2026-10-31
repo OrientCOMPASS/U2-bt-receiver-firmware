@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000005 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 31 Oct 2026 06:40:00 +0800
+Subject: [PATCH] btif_av: passive-sink - do not INT-open against peers
+
+Now that SEPs correctly advertise TSEP=SNK (patch 0004-avdt), phones and
+Windows act as INT and push SET_CONFIG to us.  Our simultaneous active
+BTA_AvOpen (stock N sink behavior) grabs the same SEP pair first; the
+peer then sees our SEID in-use and enters a DISCOVER->ABORT loop
+(btsnoop-proven with Z40: connect fails, Windows shows device unusable).
+
+Standard headphones are pure acceptors: skip the active open for SINK
+uuid on both CONNECT_REQ and PENDING paths.  The incoming ACP path
+(conn_created -> config_ind -> str_opened) builds the scb and still
+emits BTA_AV_OPEN_EVT so btif state machine and Java callbacks settle.
+---
+ btif/src/btif_av.c | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/btif/src/btif_av.c b/btif/src/btif_av.c
+index 03ba842..2b7adc0 100644
+--- a/btif/src/btif_av.c
++++ b/btif/src/btif_av.c
+@@ -330,8 +330,22 @@ static BOOLEAN btif_av_state_idle_handler(btif_sm_event_t event, void *p_data)
+              {
+                  memcpy(&btif_av_cb.peer_bda, ((btif_av_connect_req_t*)p_data)->target_bda,
+                                                                    sizeof(bt_bdaddr_t));
+-                 BTA_AvOpen(btif_av_cb.peer_bda.address, btif_av_cb.bta_handle,
+-                    TRUE, BTA_SEC_AUTHENTICATE, ((btif_av_connect_req_t*)p_data)->uuid);
++                 if (((btif_av_connect_req_t*)p_data)->uuid == UUID_SERVCLASS_AUDIO_SINK)
++                 {
++                     /* Passive-sink: phones/PCs act as INT and push SET_CONFIG
++                      * to our SNK SEPs.  Opening as INT simultaneously makes
++                      * both sides fight over the same SEP pair (btsnoop proof:
++                      * DISCOVER -> ABORT loop, Z40 connect fail).  Skip the
++                      * active open; the incoming ACP path (conn_created ->
++                      * config_ind -> str_opened) builds the scb and still
++                      * delivers BTA_AV_OPEN_EVT, so the state machine settles. */
++                     APPL_TRACE_DEBUG("btif_av: sink connect - passive ACP mode, waiting for incoming AVDTP");
++                 }
++                 else
++                 {
++                     BTA_AvOpen(btif_av_cb.peer_bda.address, btif_av_cb.bta_handle,
++                        TRUE, BTA_SEC_AUTHENTICATE, ((btif_av_connect_req_t*)p_data)->uuid);
++                 }
+              }
+              else if (event == BTA_AV_PENDING_EVT)
+              {
+@@ -343,8 +357,8 @@ static BOOLEAN btif_av_state_idle_handler(btif_sm_event_t event, void *p_data)
+                   }
+                   if (bt_av_sink_callbacks != NULL)
+                   {
+-                      BTA_AvOpen(btif_av_cb.peer_bda.address, btif_av_cb.bta_handle,
+-                                 TRUE, BTA_SEC_AUTHENTICATE, UUID_SERVCLASS_AUDIO_SINK);
++                      /* passive sink (see CONNECT_REQ_EVT): never INT-open */
++                      APPL_TRACE_DEBUG("btif_av: pending sink - passive ACP mode");
+                   }
+              }
+              btif_sm_change_state(btif_av_cb.sm_handle, BTIF_AV_STATE_OPENING);
+-- 
+2.39.0
