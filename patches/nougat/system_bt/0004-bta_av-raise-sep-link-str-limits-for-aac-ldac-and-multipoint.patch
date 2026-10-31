@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 31 Oct 2026 00:40:00 +0800
+Subject: [PATCH] nougat: raise AV SEP/link/str limits so AAC+LDAC endpoints
+ register and 2+ peers can stream
+
+Device-tested symptoms this fixes:
+1. LDAC/AAC never negotiated (phone only offered SBC): the SNK SEP
+   registration loop in bta_av_main.c runs index 1..BTA_AV_MAX_SEPS-1, and
+   BTA_AV_MAX_SEPS was 2 -> only BTIF_SV_AV_AA_SBC_SINK_INDEX(1) registered;
+   AAC_SINK(2) and LDAC_SINK(3) endpoints were never created. Raise to 4
+   (matches BTIF_SV_AV_AA_SEP_INDEX) and AVDT_NUM_SEPS 3 -> 8.
+2. Second peer rejected with "av scb not available for avdt connection":
+   scb pool BTA_AV_NUM_STRS=2 and AVDT_NUM_LINKS=2 left no headroom once a
+   stale/rc-leaked scb existed. Raise both to 4; AVDT_NUM_TC_TBL 6 -> 12
+   (= SEPS + LINKS).
+---
+diff --git a/bta/include/bta_av_api.h b/bta/include/bta_av_api.h
+--- a/bta/include/bta_av_api.h
++++ b/bta/include/bta_av_api.h
+@@ -93,11 +93,14 @@
+ 
+ /* maximum number of streams created: 1 for audio, 1 for video */
+ #ifndef BTA_AV_NUM_STRS
+-#define BTA_AV_NUM_STRS         2
++#define BTA_AV_NUM_STRS         4
+ #endif
+ 
++/* SEPs: index 0 = SRC SBC, 1..3 = SNK SBC/AAC/LDAC (btif_av_co.h enum).
++ * The stock value (2) truncated SNK registration after SBC, so AAC and LDAC
++ * endpoints were never created. */
+ #ifndef BTA_AV_MAX_SEPS
+-#define BTA_AV_MAX_SEPS         2
++#define BTA_AV_MAX_SEPS         4
+ #endif
+ 
+ #ifndef BTA_AV_MAX_A2DP_MTU
+diff --git a/include/bt_target.h b/include/bt_target.h
+--- a/include/bt_target.h
++++ b/include/bt_target.h
+@@ -1156,17 +1156,17 @@
+ 
+ /* Number of simultaneous links to different peer devices. */
+ #ifndef AVDT_NUM_LINKS
+-#define AVDT_NUM_LINKS              2
++#define AVDT_NUM_LINKS              4
+ #endif
+ 
+ /* Number of simultaneous stream endpoints. */
+ #ifndef AVDT_NUM_SEPS
+-#define AVDT_NUM_SEPS               3
++#define AVDT_NUM_SEPS               8
+ #endif
+ 
+ /* Number of transport channels setup by AVDT for all media streams */
+ #ifndef AVDT_NUM_TC_TBL
+-#define AVDT_NUM_TC_TBL             6
++#define AVDT_NUM_TC_TBL             12
+ #endif
+ 
+ /* Maximum size in bytes of the codec capabilities information element. */
+-- 
+2.39.0

@@ -1,15 +1,15 @@
 #!/system/bin/sh
-# rootexec.sh v4 -- system APK swap + BT .so swap + streaming boot logcat.
+# rootexec.sh v8 -- system APK swap + BT .so swap + streaming boot logcat.
 : > /data/local/tmp/rootexec.log 2>/dev/null
 exec >>/data/local/tmp/rootexec.log 2>&1
-echo "=== rootexec v4 $(date) boot_completed=$(getprop sys.boot_completed) ==="
+echo "=== rootexec v8 $(date) boot_completed=$(getprop sys.boot_completed) ==="
 id
 T=/data/local/tmp
 # --- 1) BT stack .so swap (idempotent) ---
 NEW=$T/bt_new.so
 TGT=/system/lib/hw/bluetooth.default.so
 BAK=$T/bt_stock_backup.so
-WANT=c561b6128e9293bde3280f7aca3d5b17
+WANT=7432a20a00215988f140f06e9350d1e8
 if [ -f "$NEW" ]; then
   GOT=$(md5sum $TGT | cut -d' ' -f1)
   if [ "$GOT" != "$WANT" ]; then
@@ -28,7 +28,7 @@ fi
 APK_NEW=$T/bt_new_apk.apk
 APK_TGT=/system/app/Bluetooth/Bluetooth.apk
 APK_BAK=$T/Bluetooth_stock_backup.apk
-APK_WANT=41d711dc6e2060ee517a54247ccf665f
+APK_WANT=54d2b2bb6d2a4822c7cdabd5473ab5ce
 if [ -f "$APK_NEW" ]; then
   GOT=$(md5sum $APK_TGT | cut -d' ' -f1)
   echo "apk target md5 before: $GOT"
@@ -72,4 +72,4 @@ fi
     chmod 666 $T/root_*.txt $T/root_*.xml $T/rootexec.log 2>/dev/null
     sleep 20
   done ) </dev/null >/dev/null 2>&1 &
-echo "rootexec v4 done"
+echo "rootexec v8 done"
