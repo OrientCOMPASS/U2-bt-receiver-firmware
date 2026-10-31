@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000004 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 31 Oct 2026 02:30:00 +0800
+Subject: [PATCH] avdt: fix TSEP bit position in DISCOVER encode/decode
+
+AOSP N (Broadcom 2012 code) builds the DISCOVER response SEP entry with
+TSEP at octet1 bit3, but the AVDTP spec (and every real peer, verified
+against a Z40 phone via btsnoop) puts TSEP at octet0 bit0:
+
+  octet0: SEID(6b) | InUse(1b) | TSEP(1b)
+  octet1: MediaType(4b) | RFA(4b)
+
+Peers therefore read all our SNK endpoints as SRC and refuse to offer
+LDAC/aptX.  Snoop proof: our rsp "02 01 04 08 0a 08 0c 08" carries the
+tsep bit in octet1 (0x08) while octet0 bit0 stays 0.  Later AOSP (O+)
+has the corrected macros; backport both directions.
+---
+ stack/avdt/avdt_defs.h | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+--- a/stack/avdt/avdt_defs.h
++++ b/stack/avdt/avdt_defs.h
+@@ -149,9 +149,9 @@
+ 
+ #define AVDT_MSG_PRS_DISC(p, seid, in_use, type, tsep) \
+     seid = *(p) >> 2; \
+-    in_use = (*(p)++ >> 1) & 0x01; \
+-    type = *(p) >> 4; \
+-    tsep = (*(p)++ >> 3) & 0x01;
++    in_use = (*(p) >> 1) & 0x01; \
++    tsep = *(p)++ & 0x01; \
++    type = *(p)++ >> 4;
+ 
+ #define AVDT_MSG_PRS_SIG(p, sig) \
+     sig = *(p)++ & 0x3F;
+@@ -181,8 +181,8 @@
+     *(p)++ = (UINT8) ((lbl) << 4) | ((pkt) << 2) | (msg);
+ 
+ #define AVDT_MSG_BLD_DISC(p, seid, in_use, type, tsep) \
+-    *(p)++ = (UINT8) (((seid) << 2) | ((in_use) << 1)); \
+-    *(p)++ = (UINT8) (((type) << 4) | ((tsep) << 3));
++    *(p)++ = (UINT8) (((seid) << 2) | ((in_use) << 1) | (tsep)); \
++    *(p)++ = (UINT8) ((type) << 4);
+ 
+ #define AVDT_MSG_BLD_SIG(p, sig) \
+     *(p)++ = (UINT8) (sig);
+-- 
+2.39.0
