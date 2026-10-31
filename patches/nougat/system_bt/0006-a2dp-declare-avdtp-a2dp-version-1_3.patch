@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000006 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Fri, 31 Oct 2026 07:30:00 +0800
+Subject: [PATCH] a2dp: declare AVDTP/A2DP version 1.3 in SDP records
+
+N stock declares AVDTP 0x0102 (v1.2) in the AudioSink record's protocol
+list and A2DP v1.2 in the ProfileDescriptorList.  Modern phones acting
+as INT refuse such legacy peers outright: btsnoop shows Z40 doing
+SDP(0x110B) -> AVDTP DISCOVER -> receiving 3 clean SNK SEPs ->
+L2CAP DISC 9 ms later, looping, never sending GET_CAPABILITIES.
+(When we were the INT the phone accepted passively, which masked this.)
+
+Real headphones declare v1.3 (0x0103, delay-reporting era); AOSP O+
+carries 0x0103.  Raise A2D_VERSION and both AVDT_VERSION definitions.
+Side effect: incoming skip-SDP path now assumes peer v1.3, matching
+every modern phone/PC; AVDT_VERSION_SYNC comparisons are untouched.
+---
+ include/bt_target.h        | 2 +-
+ stack/a2dp/a2d_int.h       | 2 +-
+ stack/include/avdt_api.h   | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/bt_target.h b/include/bt_target.h
+index 2aba530..5a5288a 100644
+--- a/include/bt_target.h
++++ b/include/bt_target.h
+@@ -99,7 +99,7 @@
+ #endif
+ 
+ #ifndef AVDT_VERSION
+-#define AVDT_VERSION  0x0102
++#define AVDT_VERSION  0x0103
+ #endif
+ 
+ #ifndef BTA_AG_AT_MAX_LEN
+diff --git a/stack/a2dp/a2d_int.h b/stack/a2dp/a2d_int.h
+index d4bb4c2..4e196f4 100644
+--- a/stack/a2dp/a2d_int.h
++++ b/stack/a2dp/a2d_int.h
+@@ -29,7 +29,7 @@
+ /*****************************************************************************
+ **  Constants
+ *****************************************************************************/
+-#define A2D_VERSION             0x0102
++#define A2D_VERSION             0x0103
+ 
+ /* Number of attributes in A2D SDP record. */
+ #define A2D_NUM_ATTR            6
+diff --git a/stack/include/avdt_api.h b/stack/include/avdt_api.h
+index e10faf0..9287c65 100644
+--- a/stack/include/avdt_api.h
++++ b/stack/include/avdt_api.h
+@@ -32,7 +32,7 @@
+ **  Constants
+ *****************************************************************************/
+ #ifndef AVDT_VERSION
+-#define AVDT_VERSION                0x0102
++#define AVDT_VERSION                0x0103
+ #endif
+ #define AVDT_VERSION_SYNC           0x0103
+ 
+-- 
+2.39.0
