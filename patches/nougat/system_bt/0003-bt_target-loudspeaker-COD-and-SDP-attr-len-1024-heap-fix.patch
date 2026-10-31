@@ -6,7 +6,7 @@ Subject: [PATCH] nougat: loudspeaker COD, SDP_MAX_ATTR_LEN 1024, partial-attr
 
 Three fixes so phones treat U2 as an audio sink and complete SDP discovery:
 
-1. BTA_DM_COD {0x5A,0x02,0x0C} (phone/smartphone) -> {0x24,0x04,0x14}
+1. BTA_DM_COD {0x5A,0x02,0x0C} (phone/smartphone) -> {0x24,0x04,0x04}
    (Audio/Video, Loudspeaker; service bits Audio|Rendering).  With the phone
    COD, sources classify U2 as a peer phone after pairing (icon downgrades to
    generic bluetooth, no media-audio offer).
@@ -42,7 +42,7 @@ diff --git a/include/bt_target.h b/include/bt_target.h
  */
  #ifndef BTA_DM_COD
 -#define BTA_DM_COD {0x5A, 0x02, 0x0C}
-+#define BTA_DM_COD {0x24, 0x04, 0x14}
++#define BTA_DM_COD {0x24, 0x04, 0x04}
  #endif
  
  /* The number of SCO links. */
