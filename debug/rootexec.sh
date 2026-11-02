@@ -1,8 +1,8 @@
 #!/system/bin/sh
-# rootexec.sh v17b -- system APK swap + BT .so swap + streaming boot logcat.
+# rootexec.sh v18 -- system APK swap + BT .so swap + streaming boot logcat.
 : > /data/local/tmp/rootexec.log 2>/dev/null
 exec >>/data/local/tmp/rootexec.log 2>&1
-echo "=== rootexec v17b $(date) boot_completed=$(getprop sys.boot_completed) ==="
+echo "=== rootexec v18 $(date) boot_completed=$(getprop sys.boot_completed) ==="
 id
 T=/data/local/tmp
 # --- 1) BT stack .so swap (idempotent) ---
@@ -16,7 +16,9 @@ if [ -f "$NEW" ]; then
   if [ "$GOT" != "$WANT" ]; then
     [ -f "$BAK" ] || cp $TGT $BAK
     mount -o rw,remount /system
-    cp $NEW $TGT && chmod 644 $TGT && chown 0:0 $TGT 2>/dev/null && restorecon $TGT 2>/dev/null && sync
+    # v18: ATOMIC install (cp tmp + rename). Direct cp over a mapped file
+    # invalidates pages under the running process -> SIGBUS (tombstone proof).
+    cp $NEW /system/lib/hw/.bt_swap.tmp && chmod 644 /system/lib/hw/.bt_swap.tmp && chown 0:0 /system/lib/hw/.bt_swap.tmp 2>/dev/null && restorecon /system/lib/hw/.bt_swap.tmp 2>/dev/null && mv /system/lib/hw/.bt_swap.tmp $TGT && sync
     echo "so swap done: $(md5sum $TGT)"
     mount -o ro,remount /system 2>/dev/null
     # v14: reload HAL - kill bt proc (zygote restarts it, snoop truncates fresh)
@@ -45,7 +47,7 @@ if [ -f "$APK_NEW" ]; then
     mount -o rw,remount /system
     rm -rf /system/app/Bluetooth/oat
     echo "oat removed: $(ls /system/app/Bluetooth/)"
-    cp $APK_NEW $APK_TGT && chmod 644 $APK_TGT && chown 0:0 $APK_TGT 2>/dev/null && restorecon $APK_TGT 2>/dev/null && sync
+    cp $APK_NEW /system/app/Bluetooth/.apk_swap.tmp && chmod 644 /system/app/Bluetooth/.apk_swap.tmp && chown 0:0 /system/app/Bluetooth/.apk_swap.tmp 2>/dev/null && restorecon /system/app/Bluetooth/.apk_swap.tmp 2>/dev/null && mv /system/app/Bluetooth/.apk_swap.tmp $APK_TGT && sync
     echo "apk swap done: $(md5sum $APK_TGT)"
     ls -laZ $APK_TGT
     mount -o ro,remount /system 2>/dev/null
@@ -101,6 +103,15 @@ if [ -f /data/misc/bluedroid/btsnoop_hci.log ]; then
   chmod 666 $T/snoop.log
   { echo "== snoop copy =="; ls -l $T/snoop.log; md5sum $T/snoop.log 2>/dev/null; } >> $T/snoop_v11.txt
 fi
+# --- 2e) v17/v18: crash forensics (pstore + tombstones) ---
+{
+  echo "== v18 forensics $(date) =="
+  cp /sys/fs/pstore/console-ramoops $T/pstore_console.txt 2>&1
+  cp /sys/fs/pstore/pmsg-ramoops-0 $T/pstore_pmsg.txt 2>&1
+  cp /data/tombstones/* $T/ 2>&1
+  chmod 666 $T/pstore_console.txt $T/pstore_pmsg.txt $T/tombstone_* 2>/dev/null
+  ls -l $T/pstore_*.txt $T/tombstone_* 2>/dev/null
+} >> $T/snoop_v11.txt 2>&1
 # --- 2f) v17b: raise AV/btif trace levels (conf ships TRC_*=2 = WARNING) ---
 setprop log.tag D
 if ! grep -q "^TRC_BTIF=4" "$CONF" 2>/dev/null; then
@@ -165,4 +176,4 @@ fi
     chmod 666 $T/root_*.txt $T/root_*.xml $T/rootexec.log 2>/dev/null
     sleep 20
   done ) </dev/null >/dev/null 2>&1 &
-echo "rootexec v17b done"
+echo "rootexec v18 done"

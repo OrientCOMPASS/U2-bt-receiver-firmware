@@ -1,0 +1,194 @@
+From 737074a320b90033300262b4b6b11a552c490a17 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:01:05 +0000
+Subject: [PATCH] nougat: multipoint 3 devices + preemptive suspend +
+ full-chain 48 kHz AAC
+
+Extends 0007 dual-slot multipoint to three simultaneous peers and fixes
+the switching semantics to match commercial multipoint headsets:
+
+* bta_av_aact.c (bta_av_start_ok): when a new sink stream starts while
+  another one is the active stream, claim p_active_scb for the new scb
+  FIRST, then inject BTA_AV_AP_STOP_EVT(suspend=TRUE) into the old scb
+  (same single-scb pattern as the stock reconfig suspend).  The old
+  peer receives AVDTP SUSPEND: its player pauses and the EDR medium
+  frees up, so the preempting stream no longer shares bandwidth with a
+  ghost stream (previous behaviour: old peer kept streaming and its
+  packets were silently dropped -> stutter on the new stream and the
+  old phone UI stayed 'playing').
+* btif_av.c: BTIF_AV_NUM_SLOTS 2 -> 3; third BTA_AvRegister (own SCB,
+  SEIDs 7-9); shadow-slot sm_init and dereg generalized to all slots.
+* bt_target.h: AVDT_NUM_SEPS 8 -> 12 (3 registrations x 3 SNK SEPs),
+  AVDT_NUM_TC_TBL 12 -> 16 (SEPS + LINKS).
+* bta_av_co.c: AAC sink caps advertise 48000 only (full-chain 48 kHz:
+  Windows picks 44.1 when both are offered; 48-only forces every
+  source to negotiate 48 kHz end to end).  SBC keeps both rates.
+---
+ bta/av/bta_av_aact.c | 21 ++++++++++++++++++++-
+ btif/co/bta_av_co.c  |  9 +++++++--
+ btif/src/btif_av.c   | 43 +++++++++++++++++++++++++++----------------
+ include/bt_target.h  | 11 +++++++----
+ 4 files changed, 61 insertions(+), 23 deletions(-)
+
+diff --git a/bta/av/bta_av_aact.c b/bta/av/bta_av_aact.c
+index 2c21af6..26ec142 100644
+--- a/bta/av/bta_av_aact.c
++++ b/bta/av/bta_av_aact.c
+@@ -2400,11 +2400,30 @@ void bta_av_start_ok (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
+     APPL_TRACE_DEBUG("bta_av_start_ok wait:x%x, role:x%x", p_scb->wait, p_scb->role);
+ 
+     p_scb->started = TRUE;
+-    /* Multipoint: this sink stream becomes the active (decoded) one */
++    /* Multipoint: this sink stream becomes the active (decoded) one.
++     * Preemption (抢断播放权): if a DIFFERENT sink stream was the active one
++     * and is still streaming, suspend it now via the standard single-scb
++     * AP_STOP(suspend=TRUE) path (same pattern as the reconfig suspend below).
++     * Effects: AVDTP SUSPEND goes to the old peer (its player pauses, the
++     * EDR medium frees up for us) and its scb transitions STARTED->OPENED.
++     * p_active_scb is claimed FIRST so the old scb's stop path does not
++     * fall back onto another started stream. */
+     if ((p_scb->chnl == BTA_AV_CHNL_AUDIO) &&
+         (p_scb->seps[p_scb->sep_idx].tsep == AVDT_TSEP_SNK))
+     {
++        tBTA_AV_SCB *p_old = bta_av_cb.p_active_scb;
+         bta_av_cb.p_active_scb = p_scb;
++        if ((p_old != NULL) && (p_old != p_scb) && p_old->started &&
++            (p_old->chnl == BTA_AV_CHNL_AUDIO) &&
++            (p_old->seps[p_old->sep_idx].tsep == AVDT_TSEP_SNK))
++        {
++            tBTA_AV_API_STOP stop;
++            APPL_TRACE_EVENT("MP preempt: suspend old active hdl %d, new hdl %d",
++                             p_old->hndl, p_scb->hndl);
++            stop.flush   = FALSE;
++            stop.suspend = TRUE;
++            bta_av_ssm_execute(p_old, BTA_AV_AP_STOP_EVT, (tBTA_AV_DATA *)&stop);
++        }
+         APPL_TRACE_EVENT("bta_av_start_ok: active sink scb -> hdl %d", p_scb->hndl);
+     }
+     if (p_scb->sco_suspend)
+diff --git a/btif/co/bta_av_co.c b/btif/co/bta_av_co.c
+index 0f38fcd..8ed4d98 100644
+--- a/btif/co/bta_av_co.c
++++ b/btif/co/bta_av_co.c
+@@ -94,11 +94,16 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps =
+     A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
+ };
+ 
+-/* AAC (MPEG-2/4 LC) sink capabilities: what our FDK-based decoder accepts. */
++/* AAC (MPEG-2/4 LC) sink capabilities: what our FDK-based decoder accepts.
++ * Full-chain 48 kHz: only 48000 is advertised.  Windows picks 44100 when
++ * both are offered (its sound-settings UI still shows a 48 kHz engine);
++ * advertising 48000 alone forces every source (Windows AAC, Android Z40,
++ * ...) to negotiate 48 kHz end to end.  SBC caps keep both rates as the
++ * compatibility fallback. */
+ const tA2D_AAC_CIE bta_av_co_aac_sink_caps =
+ {
+     (A2D_AAC_IE_OBJCT_MPEG2_LC | A2D_AAC_IE_OBJCT_MPEG4_LC),    /* obj_type */
+-    (A2D_AAC_IE_SAMP_FREQ_44100 | A2D_AAC_IE_SAMP_FREQ_48000),  /* samp_freq */
++    A2D_AAC_IE_SAMP_FREQ_48000,                                 /* samp_freq */
+     (A2D_AAC_IE_CH_MD_MONO | A2D_AAC_IE_CH_MD_STEREO),          /* ch_mode */
+     A2D_AAC_IE_VBR_ON,                                          /* vbr */
+     320000                                                      /* bitrate */
+diff --git a/btif/src/btif_av.c b/btif/src/btif_av.c
+index 3aa614a..d13255f 100644
+--- a/btif/src/btif_av.c
++++ b/btif/src/btif_av.c
+@@ -109,7 +109,7 @@ static btav_callbacks_t *bt_av_sink_callbacks = NULL;
+ **  audio currently feeds the single media task AudioTrack.  Mirrors
+ **  bta_av_cb.p_active_scb in the BTA layer (which gates the media packets).
+ *****************************************************************************/
+-#define BTIF_AV_NUM_SLOTS 2
++#define BTIF_AV_NUM_SLOTS 3
+ static btif_av_cb_t btif_av_cb_storage[BTIF_AV_NUM_SLOTS];
+ static btif_av_cb_t *g_ctx = &btif_av_cb_storage[0];   /* active context   */
+ static int g_ctx_index = 0;                            /* index of g_ctx   */
+@@ -1545,15 +1545,21 @@ bt_status_t btif_av_init(int service_id)
+         btif_av_cb.sm_handle =
+                 btif_sm_init((const btif_sm_handler_t*)btif_av_state_handlers, BTIF_AV_STATE_IDLE);
+ 
+-        /* Multipoint: initialize the secondary (native-only) slot */
+-        if (btif_av_cb_storage[1].sm_handle == NULL)
++        /* Multipoint: initialize the secondary (native-only) slots */
+         {
+-            g_ctx_index = 1;
+-            g_ctx = &btif_av_cb_storage[1];
+-            btif_av_cb.sm_handle =
+-                    btif_sm_init((const btif_sm_handler_t*)btif_av_state_handlers, BTIF_AV_STATE_IDLE);
+-            g_ctx_index = 0;
+-            g_ctx = &btif_av_cb_storage[0];
++            int slot_i;
++            for (slot_i = 1; slot_i < BTIF_AV_NUM_SLOTS; slot_i++)
++            {
++                if (btif_av_cb_storage[slot_i].sm_handle == NULL)
++                {
++                    g_ctx_index = slot_i;
++                    g_ctx = &btif_av_cb_storage[slot_i];
++                    btif_av_cb.sm_handle =
++                            btif_sm_init((const btif_sm_handler_t*)btif_av_state_handlers, BTIF_AV_STATE_IDLE);
++                    g_ctx_index = 0;
++                    g_ctx = &btif_av_cb_storage[0];
++                }
++            }
+         }
+ 
+         btif_a2dp_on_init();
+@@ -1954,18 +1960,23 @@ bt_status_t btif_av_sink_execute_service(BOOLEAN b_enable)
+                                                                         bte_av_callback);
+          BTA_AvRegister(BTA_AV_CHNL_AUDIO, BTIF_AVK_SERVICE_NAME, 0, bte_av_media_callback,
+                                                                 UUID_SERVCLASS_AUDIO_SINK);
+-         /* Multipoint (一拖二): register a second audio-sink stream control
+-          * block so a second peer gets its own SCB/LCB and its own set of
+-          * SEIDs (SBC/AAC/LDAC).  The second registration reuses the AVDTP
+-          * registration, SDP record and RC TG created by the first one. */
++         /* Multipoint (一拖二/一拖三): register a second and third audio-sink
++          * stream control block so peers 2..3 get their own SCB/LCB and their
++          * own sets of SEIDs (SBC/AAC/LDAC).  Extra registrations reuse the
++          * AVDTP registration, SDP record and RC TG created by the first. */
++         BTA_AvRegister(BTA_AV_CHNL_AUDIO, BTIF_AVK_SERVICE_NAME, 0, bte_av_media_callback,
++                                                                UUID_SERVCLASS_AUDIO_SINK);
+          BTA_AvRegister(BTA_AV_CHNL_AUDIO, BTIF_AVK_SERVICE_NAME, 0, bte_av_media_callback,
+                                                                 UUID_SERVCLASS_AUDIO_SINK);
+      }
+      else {
+          int i;
+-         /* deregister both multipoint slots */
+-         if (btif_av_cb_storage[1].bta_handle != 0)
+-             BTA_AvDeregister(btif_av_cb_storage[1].bta_handle);
++         /* deregister all multipoint slots */
++         for (i = BTIF_AV_NUM_SLOTS - 1; i >= 1; i--)
++         {
++             if (btif_av_cb_storage[i].bta_handle != 0)
++                 BTA_AvDeregister(btif_av_cb_storage[i].bta_handle);
++         }
+          BTA_AvDeregister(btif_av_cb.bta_handle);
+          BTA_AvDisable();
+          /* Multipoint: reset slot bookkeeping so the next enable starts clean */
+diff --git a/include/bt_target.h b/include/bt_target.h
+index 5a5288a..048089b 100644
+--- a/include/bt_target.h
++++ b/include/bt_target.h
+@@ -1159,14 +1159,17 @@
+ #define AVDT_NUM_LINKS              4
+ #endif
+ 
+-/* Number of simultaneous stream endpoints. */
++/* Number of simultaneous stream endpoints.
++ * 3-device multipoint: each BTA_AvRegister creates one SNK SCB with 3 SEPs
++ * (SBC/AAC/LDAC) -> 3 registrations need 9 SEIDs; keep headroom at 12. */
+ #ifndef AVDT_NUM_SEPS
+-#define AVDT_NUM_SEPS               8
++#define AVDT_NUM_SEPS               12
+ #endif
+ 
+-/* Number of transport channels setup by AVDT for all media streams */
++/* Number of transport channels setup by AVDT for all media streams
++ * (= AVDT_NUM_SEPS + AVDT_NUM_LINKS). */
+ #ifndef AVDT_NUM_TC_TBL
+-#define AVDT_NUM_TC_TBL             12
++#define AVDT_NUM_TC_TBL             16
+ #endif
+ 
+ /* Maximum size in bytes of the codec capabilities information element. */
+-- 
+2.39.5
+
