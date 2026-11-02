@@ -1,0 +1,208 @@
+From fcfcdf783665804a2093f086e7c38d2d0525dd09 Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:27:55 +0000
+Subject: [PATCH] nougat: fix multipoint slot routing - runtime hndl binding
+ (device-tested silence)
+
+Device-tested bug (2 peers connected -> total silence, never recovers):
+stream events (START/SUSPEND/STOP/CLOSE) were routed by matching their
+hndl against storage[i].bta_handle - the hndl returned by BTA_AvRegister.
+But N allocates the scb a peer actually streams on at CONNECTION time
+(bta_av_alloc_scb in conn_cback), so the stream hndl belongs to a
+different scb than the register hndl of 'our' slot.  Result: codec cfg
+and audio_active_slot were stored for slot 0 while the state machine ran
+in slot 2; the media-accept check saw owner slot 0 in IDLE state and
+dropped every media packet.  Disconnect/reconnect repeated the same
+misroute -> silence was permanent.
+
+Fix: one consistent runtime identity per slot:
+* g_slot_hndl[]: the conn-time scb hndl, bound on BTA_AV_OPEN_EVT
+  (status SUCCESS), cleared on CLOSE; slot_by_hndl now uses it.
+* peer_bda pre-binding at SINK_CONFIG (router) and at the in-line
+  MEDIA_SINK_CFG store (which can run before the queued CONFIG_REQ) -
+  whichever arrives first claims a free slot for that peer; OPEN then
+  resolves by bda to the SAME slot.  slot_by_bda no longer skips IDLE
+  slots (pre-bound slots are IDLE); first_free_slot skips slots with a
+  pre-bound bda so peers never collide.
+* CLOSE unbinds hndl+bda+cfg after dispatch so slots recycle cleanly.
+* media_switch_to_slot fails safe: no stored cfg -> abort the switch
+  without claiming ownership or tearing down the running track.
+---
+ btif/src/btif_av.c | 86 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 73 insertions(+), 13 deletions(-)
+
+diff --git a/btif/src/btif_av.c b/btif/src/btif_av.c
+index d13255f..3889b5d 100644
+--- a/btif/src/btif_av.c
++++ b/btif/src/btif_av.c
+@@ -119,16 +119,24 @@ static int      audio_active_slot = -1;                /* slot owning audio */
+ static BOOLEAN  g_slot_cfg_valid[BTIF_AV_NUM_SLOTS];   /* stored codec cfg  */
+ static UINT8    g_slot_cfg[BTIF_AV_NUM_SLOTS][AVDT_CODEC_SIZE];
+ static UINT8    g_slot_rc_handle[BTIF_AV_NUM_SLOTS];   /* for meta routing  */
++static UINT16   g_slot_hndl[BTIF_AV_NUM_SLOTS];        /* RUNTIME scb hndl  */
+ static int      g_register_next = 0;                   /* REGISTER routing  */
+ 
+ static int btif_av_self_slot(void) { return g_ctx_index; }
+ 
++/* Stream events (START/SUSPEND/STOP/CLOSE/RECONFIG) carry the hndl of the
++ * scb that was allocated WHEN THE PEER CONNECTED (bta_av_alloc_scb at
++ * conn_cback time) - NOT the hndl returned by BTA_AvRegister that lives in
++ * storage[i].bta_handle.  Routing stream events by the register hndl sent
++ * them to the wrong slot (device cfg/owner in slot 0, stream state machine
++ * in slot 2 -> media accept check failed -> total silence).  g_slot_hndl
++ * is the runtime binding: filled on BTA_AV_OPEN_EVT, cleared on CLOSE. */
+ static int btif_av_slot_by_hndl(UINT16 hndl)
+ {
+     int i;
+     if (hndl == 0) return -1;
+     for (i = 0; i < BTIF_AV_NUM_SLOTS; i++)
+-        if (btif_av_cb_storage[i].bta_handle == hndl)
++        if (g_slot_hndl[i] == hndl)
+             return i;
+     return -1;
+ }
+@@ -141,9 +149,10 @@ static int btif_av_slot_by_bda(const bt_bdaddr_t *bda)
+     {
+         if (btif_av_cb_storage[i].sm_handle == NULL)
+             continue;
+-        if (btif_sm_get_state(btif_av_cb_storage[i].sm_handle) == BTIF_AV_STATE_IDLE)
+-            continue;
+-        if (memcmp(&btif_av_cb_storage[i].peer_bda, bda, sizeof(bt_bdaddr_t)) == 0)
++        /* no IDLE-state filter: peer_bda is pre-bound at SINK_CONFIG time
++         * (before the state machine leaves IDLE) and cleared on CLOSE. */
++        if (memcmp(&btif_av_cb_storage[i].peer_bda, bda, sizeof(bt_bdaddr_t)) == 0 &&
++            memcmp(&btif_av_cb_storage[i].peer_bda, "\0\0\0\0\0\0", sizeof(bt_bdaddr_t)) != 0)
+             return i;
+     }
+     return -1;
+@@ -165,8 +174,13 @@ static int btif_av_first_free_slot(void)
+     {
+         if (btif_av_cb_storage[i].sm_handle == NULL)
+             continue;
+-        if (btif_sm_get_state(btif_av_cb_storage[i].sm_handle) == BTIF_AV_STATE_IDLE)
+-            return i;
++        if (btif_sm_get_state(btif_av_cb_storage[i].sm_handle) != BTIF_AV_STATE_IDLE)
++            continue;
++        /* skip slots whose bda was pre-bound by an in-flight SINK_CONFIG
++         * (peer connected but OPEN not processed yet) */
++        if (memcmp(&btif_av_cb_storage[i].peer_bda, "\0\0\0\0\0\0", sizeof(bt_bdaddr_t)) != 0)
++            continue;
++        return i;
+     }
+     return -1;
+ }
+@@ -178,14 +192,18 @@ static void btif_av_media_switch_to_slot(int slot)
+ {
+     if (slot < 0 || slot >= BTIF_AV_NUM_SLOTS)
+         return;
+-    BTIF_TRACE_EVENT("MP: media switch to slot %d (was %d)", slot, audio_active_slot);
+-    /* claim ownership first so it always matches bta_av_cb.p_active_scb */
+-    audio_active_slot = slot;
+     if (!g_slot_cfg_valid[slot])
+     {
+-        BTIF_TRACE_WARNING("%s: no stored cfg for slot %d", __func__, slot);
++        /* Fail safe: do NOT claim ownership and do NOT tear down the
++         * running track/decoder - a wrong or late switch must never kill
++         * audio that is currently playing. */
++        BTIF_TRACE_ERROR("MP: no stored cfg for slot %d - switch aborted (owner stays %d)",
++                         slot, audio_active_slot);
+         return;
+     }
++    BTIF_TRACE_EVENT("MP: media switch to slot %d (was %d)", slot, audio_active_slot);
++    /* claim ownership first so it always matches bta_av_cb.p_active_scb */
++    audio_active_slot = slot;
+     /* tear down the old decoder/AudioTrack first (reset_decoder would leak
+      * the previous track), then rebuild from the new peer's codec config */
+     btif_media_task_clear_track();
+@@ -1279,11 +1297,22 @@ static void btif_av_handle_event(UINT16 event, char* p_param)
+             break;
+ 
+         case BTA_AV_OPEN_EVT:
+-            slot = btif_av_slot_by_hndl(p_av->open.hndl);
++            /* bda first: SINK_CONFIG pre-binds the slot before OPEN arrives;
++             * hndl second: re-OPEN of an already runtime-bound scb. */
++            slot = btif_av_slot_by_bda((const bt_bdaddr_t*)p_av->open.bd_addr);
+             if (slot < 0)
+-                slot = btif_av_slot_by_bda((const bt_bdaddr_t*)p_av->open.bd_addr);
++                slot = btif_av_slot_by_hndl(p_av->open.hndl);
+             if (slot < 0)
+                 slot = btif_av_first_free_slot();
++            if (slot >= 0 && p_av->open.status == BTA_AV_SUCCESS)
++            {
++                /* runtime binding: later stream events for this peer carry
++                 * open.hndl (the conn-time scb hndl, not the register one) */
++                g_slot_hndl[slot] = p_av->open.hndl;
++                memcpy(&btif_av_cb_storage[slot].peer_bda, p_av->open.bd_addr,
++                       sizeof(bt_bdaddr_t));
++                BTIF_TRACE_EVENT("MP: OPEN bound slot %d <- hndl %d", slot, p_av->open.hndl);
++            }
+             break;
+ 
+         case BTA_AV_PENDING_EVT:
+@@ -1299,8 +1328,21 @@ static void btif_av_handle_event(UINT16 event, char* p_param)
+             break;
+ 
+         case BTIF_AV_SINK_CONFIG_REQ_EVT:
+-            slot = btif_av_slot_by_bda(&((btif_av_sink_config_req_t*)p_param)->peer_bd);
++        {
++            btif_av_sink_config_req_t *p_cfgreq = (btif_av_sink_config_req_t*)p_param;
++            slot = btif_av_slot_by_bda(&p_cfgreq->peer_bd);
++            if (slot < 0)
++                slot = btif_av_first_free_slot();
++            if (slot >= 0)
++            {
++                /* pre-bind the peer bda so the OPEN that follows (and the
++                 * in-line MEDIA_SINK_CFG store) resolve to this same slot */
++                memcpy(&btif_av_cb_storage[slot].peer_bda, &p_cfgreq->peer_bd,
++                       sizeof(bt_bdaddr_t));
++                BTIF_TRACE_EVENT("MP: SINK_CONFIG pre-bind slot %d", slot);
++            }
+             break;
++        }
+ 
+         case BTA_AV_RC_OPEN_EVT:
+             slot = btif_av_slot_by_bda((const bt_bdaddr_t*)p_av->rc_open.peer_addr);
+@@ -1368,6 +1410,15 @@ static void btif_av_handle_event(UINT16 event, char* p_param)
+     g_ctx_index = slot;
+     g_ctx = &btif_av_cb_storage[slot];
+     btif_sm_dispatch(g_ctx->sm_handle, event, (void*)p_param);
++    if (event == BTA_AV_CLOSE_EVT)
++    {
++        /* unbind the runtime identities so the slot can be reused cleanly
++         * by the next peer (stale bda/hndl would misroute later events) */
++        g_slot_hndl[slot] = 0;
++        memset(&btif_av_cb_storage[slot].peer_bda, 0, sizeof(bt_bdaddr_t));
++        g_slot_cfg_valid[slot] = FALSE;
++        BTIF_TRACE_EVENT("MP: CLOSE unbound slot %d", slot);
++    }
+     btif_av_event_free_data(event, p_param);
+     g_ctx_index = 0;
+     g_ctx = &btif_av_cb_storage[0];
+@@ -1492,8 +1543,15 @@ static void bte_av_media_callback(tBTA_AV_EVT event, tBTA_AV_MEDIA *p_data)
+          * audio (legacy single-device flow); otherwise defer the switch
+          * until this slot starts streaming (btif_av_media_switch_to_slot). */
+         int slot = btif_av_slot_by_bda((const bt_bdaddr_t*)p_data->avk_config.bd_addr);
++        if (slot < 0)
++            slot = btif_av_first_free_slot();
+         if (slot < 0)
+             slot = 0;
++        /* pre-bind (idempotent with the CONFIG_REQ router pre-bind): this
++         * callback can run BEFORE the queued BTIF_AV_SINK_CONFIG_REQ_EVT,
++         * so whichever arrives first claims the slot for this peer. */
++        memcpy(&btif_av_cb_storage[slot].peer_bda, p_data->avk_config.bd_addr,
++               sizeof(bt_bdaddr_t));
+         memcpy(g_slot_cfg[slot], p_data->avk_config.codec_info, AVDT_CODEC_SIZE);
+         g_slot_cfg_valid[slot] = TRUE;
+         BTIF_TRACE_EVENT("MP: sink cfg stored for slot %d, audio owner %d",
+@@ -1984,6 +2042,8 @@ bt_status_t btif_av_sink_execute_service(BOOLEAN b_enable)
+          {
+              g_slot_cfg_valid[i] = FALSE;
+              g_slot_rc_handle[i] = 0;
++             g_slot_hndl[i] = 0;
++             memset(&btif_av_cb_storage[i].peer_bda, 0, sizeof(bt_bdaddr_t));
+              if (btif_av_cb_storage[i].sm_handle != NULL &&
+                  btif_sm_get_state(btif_av_cb_storage[i].sm_handle) != BTIF_AV_STATE_IDLE)
+              {
+-- 
+2.39.5
+
