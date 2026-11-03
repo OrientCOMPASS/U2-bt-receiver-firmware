@@ -535,3 +535,83 @@ B: EV=3 (SYN|KEY)   KEY (0001): 0072 0073 00a4 0246
 与 `/data/local/tmp/bt_want.txt` 一致（P1c 仍在机上，未被回滚）。
 
 设计结论已写入 `docs/05` §3.8（P1c）/§3.9（AVRCP 双向）/§3.10（HFP 分层可行性 + F1′ 推荐路径）。
+
+### P1d 根因升级：命令死在 **btif 派发器**，比之前判断的更靠前一层（二进制取证）
+
+上一节说"`handle_avk_rc_metamsg_cmd` 转发给 NULL 的 `bt_rc_ctrl_callbacks`"—— 这只对了一半。
+把 r36 的整条 TG 链路读完并用产物二进制核对后，实际链路是：
+
+**(1) BTA 层：GetCapabilities 与通知注册都在 BTA 内部处理，配置是对的**
+
+`bta/av/bta_av_act.c: bta_av_proc_meta_cmd()` 对 `AVRC_PDU_GET_CAPABILITIES`
+**直接应答、不上报 btif**（`evt = 0`），内容取自 `p_bta_av_cfg->p_meta_evt_ids / num_evt_ids`；
+`AVRC_PDU_REGISTER_NOTIFICATION` 先用 `bta_av_chk_notif_evt_id()` 校验事件是否在册，
+不在册就地 `AVRC_STS_BAD_PARAM` 拒掉。
+
+配置选择发生在 `bta/av/bta_av_main.c: bta_av_api_register()`：
+```c
+if (profile_initialized == UUID_SERVCLASS_AUDIO_SINK) p_bta_av_cfg = &bta_avk_cfg;   /* Sink+CT+TG(abs vol) */
+else if (profile_initialized == UUID_SERVCLASS_AUDIO_SOURCE) p_bta_av_cfg = &bta_av_cfg;
+```
+我们 P1a 抢在 Java 之前 enable 的是 **SINK**，所以走 `bta_avk_cfg`。**产物二进制实测**
+（`llvm-nm` 取符号 + `.data.rel.ro`/`.rodata` 偏移换算）：
+
+```
+bta_av_meta_caps_evt_ids  (SRC/TG) @0x1a6bae : 01 02 05        PLAY_STATUS/TRACK/PLAY_POS，无 VOLUME
+bta_avk_meta_caps_evt_ids (SINK)   @0x1a6bb1 : 0d              AVRC_EVT_VOLUME_CHANGE ✓
+bta_avk_cfg @0x1ae17c : co_id=0x1958(AVRC_CO_METADATA) avrc_mtu=512 br_mtu=1008
+                        ct_cat=1 tg_cat=2 sig_mtu=672 transport_mtu=1008 flush_to=6
+                        vdp_mtu=1008 vdp_flush_to=600 group=FALSE
+                        num_co_ids=2  num_evt_ids=1  rc_pass_rsp=8(IMPLEMENTED_STABLE)
+                        p_meta_co_ids→0x1a6b9c  p_meta_evt_ids→0x1a6bb1
+bta_av_cfg  @0x1ae104 : co_id=0x1018(BROADCOM) … num_co_ids=2 num_evt_ids=3 → 0x1a6bae
+```
+→ **BTA 层完全就绪**：对端问 GetCapabilities(EVENTS_SUPPORTED) 会得到 `{0x0D}`，
+注册 VOLUME_CHANGED 也会通过校验并被上报到 btif。sink 侧 TG 记录还是 AVRC 1.4
+（`bta_av_main.c:557-566`）。
+
+**(2) btif 层：这里才是命令被丢掉的地方**
+
+`btif/src/btif_rc.c: btif_rc_handler()` 的 `BTA_AV_META_MSG_EVT` 分派（1069-1116）：
+```c
+if (bt_rc_callbacks != NULL)                  → handle_rc_metamsg_cmd()      /* Java AvrcpTarget 在 */
+else if (bt_rc_callbacks == NULL &&
+         bt_rc_ctrl_callbacks != NULL)        → handle_avk_rc_metamsg_cmd()  /* "Sink + CT + TG(abs vol)" */
+else                                          → BTIF_TRACE_ERROR("Neither CTRL, nor TG is up, drop meta commands");
+```
+我们两个回调**都是 NULL**（APK 只启用了 source 侧 profile，没有 AvrcpController；
+AvrcpTarget 是否注册待 (3) 确认）→ 命中第三支，**命令连解析都没做就被丢弃，
+一个字节都不回**。Windows 的 `RegisterNotification(VOLUME_CHANGED)` 拿不到 interim、
+`SetAbsoluteVolume` 拿不到 accept，于是滑块完全无效 —— 与实测吻合。
+
+好消息：`handle_rc_connect()` 里 `rc_connected/rc_handle/rc_vol_label/rc_volume` 的设置
+**不受回调 NULL 影响**（只有 uinput 初始化和 HAL_CBACK 被跳过），
+而 r36 **已经写好了**我们需要的两个 TG 应答函数，可以直接复用：
+```c
+static bt_status_t set_volume_rsp(bd_addr, abs_vol, label);                       /* ACCEPT */
+static bt_status_t volume_change_notification_rsp(bd_addr, rsp_type, abs_vol, label); /* INTERIM/CHANGED */
+```
+（二者带 `CHECK_RC_CONNECTED` 门禁，我们的 `rc_connected=TRUE` 能满足。）
+
+**P1d 落地方案（最小改动，纯 native）**
+1. 在 `BTA_AV_META_MSG_EVT` 的第三支（`Neither CTRL, nor TG is up`）里，
+   改为先交给 `u2_sink_policy_rc_metamsg_cmd(&p_data->meta_msg)`：
+   `AVRC_Ctrl_ParsCommand()` 解出 pdu；
+2. `AVRC_PDU_REGISTER_NOTIFICATION && event_id==AVRC_EVT_VOLUME_CHANGE`
+   → 记下 label、置 `btif_rc_cb.rc_notif[AVRC_EVT_VOLUME_CHANGE-1].bNotify=TRUE`
+   → 回 **INTERIM**（当前增益 → 0..127），事务**不释放**；
+3. `AVRC_PDU_SET_ABSOLUTE_VOLUME`
+   → `btif_a2dp_set_audio_track_gain(vol/127.0f)` + 记住 vol
+   → 回 **ACCEPT**（复用 `set_volume_rsp`）；
+4. 本地音量变化（P1e 音量键）→ 回 **CHANGED**（复用 `volume_change_notification_rsp`），
+   让手机/PC UI 跟着动；
+5. 其余 pdu → `send_reject_response(..., AVRC_STS_BAD_CMD)`，行为与原厂 TG 一致；
+6. 状态量放 `src/u2/u2_sink_policy.c` 的独立静态结构（不改任何与 vendor 共享的布局，
+   热路径零新增分配）。
+
+**待确认（`scripts/device/p1d_capture_avrcp.sh` 一次跑完即可判定）**：
+`bt_rc_callbacks` 到底是 NULL（走第三支）还是非 NULL（走 `handle_rc_metamsg_cmd` →
+`btif_rc_upstreams_evt` → Java AvrcpTarget，而 r36 的 `btif_rc_upstreams_evt` 里
+**没有** `AVRC_PDU_SET_ABSOLUTE_VOLUME` 分支 → 落到 `default: send_reject_response(BAD_CMD)`）。
+两种情形的修法不同：前者加第三支处理，后者要在 TG 路径里补分支。
+脚本按 logcat 里出现哪一条日志来区分（见脚本头 Q2 的 a/b/c/d 四种情形）。
