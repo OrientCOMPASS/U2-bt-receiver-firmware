@@ -1,0 +1,22 @@
+# 构建产物（不入库；目录名刻意避开工作区快照的排除规则 build/out/dist）
+bld/out/
+
+# 凭据：绝不入库（GitHub PAT / 桥接配对串 / 任何 token）
+CREDENTIALS.txt
+credentials.txt
+*.pat
+*.token
+secrets.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器 / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 说明：设备库快照 devlibs/ 位于**仓库外**的工作区根目录（../devlibs，16MB），
+# 不进本仓库；tools/build/build_bt.py 会自动回退到该路径。

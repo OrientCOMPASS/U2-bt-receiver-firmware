@@ -1,0 +1,27 @@
+{
+ "repo": "platform/system/bt",
+ "upstream": "https://android.googlesource.com/platform/system/bt",
+ "tag": "android-7.0.0_r36",
+ "commit": "cc4b5efe1ce96967948eb66889bcda6d174b61da",
+ "imported_at": "2026-11-04",
+ "import_note": "浅克隆 --depth 1 --branch android-7.0.0_r36 后原样复制到 src/（去掉 .git）。src/ 之后所有改动都属于本项目，按阶段独立 commit。",
+ "header_trees": {
+  "platform/external/tinyxml2": "android-7.0.0_r36 -> external/tinyxml2 (vendored)",
+  "platform/external/zlib": "android-7.0.0_r36 (headers only)",
+  "platform/external/libchrome": "android-7.0.0_r36 (headers only)",
+  "platform/external/protobuf": "android-7.0.0_r36 (2.6.1, headers + host protoc)",
+  "platform/external/libcxx": "android-7.0.0_r36 (std::__1 ABI, 与设备 libc++.so 一致)",
+  "platform/external/libcxxabi": "android-7.0.0_r36",
+  "platform/system/core": "android-7.0.0_r36 (cutils/log/utils headers)",
+  "platform/system/media": "android-7.0.0_r36 (system/audio.h)",
+  "platform/frameworks/av": "android-7.0.0_r36 (media/AudioTrack.h)",
+  "platform/frameworks/native": "android-7.0.0_r36 (binder/gui/ui)",
+  "platform/hardware/libhardware": "android-7.0.0_r36 (hardware/*.h)",
+  "platform/bionic": "android-7.0.0_r36 (参考；实际用 NDK r21e API24 sysroot)"
+ },
+ "toolchain": {
+  "ndk": "android-ndk-r21e",
+  "clang_target": "armv7a-none-linux-androideabi24",
+  "note": "MT6735 = Cortex-A53 (ARMv7-A 32bit userspace), 原厂 .so 为 EF_ARM_ABI_FLOAT_SOFT + Thumb-2"
+ }
+}
