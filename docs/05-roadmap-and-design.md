@@ -212,17 +212,39 @@ r36 在 sink 注册时已经把 TG 记录声明为 AVRC 1.4
 （`bta/av/bta_av_main.c:557-566`，注释原文 "Initialize AVRCP1.4 to provide Absolute Volume control"），
 所以对端会来发 `RegisterNotification(VOLUME_CHANGED)` / `SetAbsoluteVolume`。
 
-r36 的问题在 `btif/src/btif_rc.c: handle_avk_rc_metamsg_cmd()`：这两个 PDU **只打日志，
-然后转给 `bt_rc_ctrl_callbacks`**（那是 Java *AvrcpControllerService* 的回调，我们没有 →
-HAL_CBACK 判 NULL 静默丢弃）。既没有 interim response，也没有把音量应用到 AudioTrack。
+r36 的问题分两层，**真正的丢弃点在 btif 派发器**（详见 WORKLOG 同日"P1d 根因升级"）：
+
+- **BTA 层是通的**：`bta_av_proc_meta_cmd()` 就地应答 `GetCapabilities`，
+  内容取自 `p_bta_av_cfg`；因为 P1a 注册的是 SINK，`bta_av_main.c:506` 选中
+  `bta_avk_cfg`（注释原文 *"This configuration to be used when we are Sink + CT + TG(only for abs vol)"*），
+  其 `p_meta_evt_ids = {AVRC_EVT_VOLUME_CHANGE}`、`num_evt_ids = 1`、
+  `num_co_ids = 2`、`co_id = 0x1958(AVRC_CO_METADATA)`（已在**产物二进制**里 dump 核对）。
+  `RegisterNotification(VOLUME_CHANGED)` 也能通过 `bta_av_chk_notif_evt_id()` 校验并上报 btif。
+- **btif 层把它丢了**：`btif_rc.c:1069-1116` 的 `BTA_AV_META_MSG_EVT` 三分支派发
+  ```c
+  if (bt_rc_callbacks != NULL)                     → handle_rc_metamsg_cmd()     /* Java AvrcpTarget */
+  else if (bt_rc_ctrl_callbacks != NULL)           → handle_avk_rc_metamsg_cmd() /* Sink+CT+TG(absvol) */
+  else                                             → "Neither CTRL, nor TG is up, drop meta commands"
+  ```
+  我们两个回调**都是 NULL** → 命中第三支，命令**连 `AVRC_Ctrl_ParsCommand()` 都没执行就被丢弃**，
+  一个字节都不回。（早先记录的"`handle_avk_rc_metamsg_cmd` 转发给 NULL 的
+  `bt_rc_ctrl_callbacks`"只描述了第二支，而第二支我们根本进不去。）
+
+可直接复用的现成 TG 应答函数（r36 里就有，本来是给 Java 调的）：
+`set_volume_rsp(bd_addr, abs_vol, label)` → ACCEPT；
+`volume_change_notification_rsp(bd_addr, rsp_type, abs_vol, label)` → INTERIM/CHANGED。
+两者的 `CHECK_RC_CONNECTED` 门禁我们能满足：`handle_rc_connect()` 设置
+`rc_connected/rc_handle/rc_vol_label/rc_volume` **不受回调 NULL 影响**。
 
 实测表现完全对得上：
 - Android 拿不到 interim response → 认为绝对音量不可用 → **回退软件音量**（编码前缩放）→ 正常
 - Windows 不做软件缩放、只认绝对音量 → **滑块无效**，仅 0 值时静音
 
 P1d 修复（纯 native，不引入 Java 服务）：
+0. 在派发器第三支（`Neither CTRL, nor TG is up`）里改为先交给
+   `u2_sink_policy_rc_metamsg_cmd()`：`AVRC_Ctrl_ParsCommand()` 解出 pdu 后分派；
 1. `RegisterNotification(VOLUME_CHANGED)` → 立刻回 **interim**（当前增益映射到 0–127），
-   **不释放事务**（`p_meta_msg->pending` 语义），留作后续 changed 通知的通道；
+   记 label 并置 `rc_notif[AVRC_EVT_VOLUME_CHANGE-1].bNotify = TRUE`，**不释放事务**；
 2. `SetAbsoluteVolume(vol)` → `btif_a2dp_set_audio_track_gain((float)vol / 127.0f)` + 回 accept；
 3. 本地音量变化（P1e 的音量键）→ 主动对所有已注册 VOLUME_CHANGED 的对端发 **changed**，
    保持手机 UI 与实机音量同步（否则用户以为手机能控、实际不能）。

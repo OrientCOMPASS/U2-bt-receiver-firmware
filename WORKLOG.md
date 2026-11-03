@@ -615,3 +615,28 @@ static bt_status_t volume_change_notification_rsp(bd_addr, rsp_type, abs_vol, la
 **没有** `AVRC_PDU_SET_ABSOLUTE_VOLUME` 分支 → 落到 `default: send_reject_response(BAD_CMD)`）。
 两种情形的修法不同：前者加第三支处理，后者要在 TG 路径里补分支。
 脚本按 logcat 里出现哪一条日志来区分（见脚本头 Q2 的 a/b/c/d 四种情形）。
+
+### P1d 实施细节（写代码前必须知道的 4 个事实，均已核对源码）
+
+1. **`rc_notif[]` 的下标安全边界**：`btif_rc.c:60` `#define MAX_RC_NOTIFICATIONS AVRC_EVT_VOLUME_CHANGE`
+   （= 0x0D = 13）→ 数组只有 13 个元素，合法下标 0..12；而写入用的是 `rc_notif[event_id-1]`，
+   `VOLUME_CHANGE(13) → 下标 12`，**恰好是最后一个合法下标**。
+   BTA 层 `bta_av_chk_notif_evt_id()` 已保证只有在册事件（我们的 caps 只有 0x0D）能到 btif，
+   但我们自己的处理函数仍要加**显式边界检查**（`event_id >= 1 && event_id <= MAX_RC_NOTIFICATIONS`），
+   任何越界写都会踩到 `btif_rc_cb_t` 后面的成员 —— 按项目铁律：宁可多一行检查。
+2. **音量增益最终落在 `AudioTrack::setVolume()`**：
+   `btif_a2dp_set_audio_track_gain(float)` → `BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain)`
+   → `trackHolder->track->setVolume(gain)`（`btif_avrcp_audio_track.cpp:123-134`，handle 为 NULL 时只打日志安全返回）。
+   → 含义：**流还没开始（audio_track==NULL）时设的音量会静默丢失**。Windows 常常在连接时就下发音量，
+   所以必须在策略层记住 abs_vol，并在 track 创建成功后**重放一次**。
+3. **track 创建点（重放增益的钩子）**：`btif_media_task.c:2272`
+   `btif_media_task_aa_handle_decoder_reset()` 的 `#ifdef USE_AUDIO_TRACK` 分支：
+   `btif_media_cb.audio_track = BtifAvrcpAudioTrackCreate(track_frequency, channel_type)`。
+   同一函数里 `btif_media_cb.sample_rate = btif_a2dp_get_track_frequency(sbc_cie.samp_freq)`
+   —— 这就是 48k 硬约束在解码/输出侧的落点。
+4. **P1c 的 48k 验收有三个独立证据源**（互为印证，避免单点误判）：
+   ① `dumpsys media.audio_flinger` 的 Output thread `sampleRate`（**最权威**，HAL 实际值）；
+   ② logcat（需 `setprop log.tag.bt_appl V`）里 `btif_media_task_aa_handle_decoder_reset`
+      打印的 `\tsamp_freq:%d (48000)`；
+   ③ snoop 里 AVDTP SET_CONFIG 的 SBC 参数第 1 字节 = `0x10`。
+   取证脚本：`scripts/device/p1d_capture_avrcp.sh`（一次跑完同时回答 Q1 采样率 / Q2 AVRCP 落点）。
