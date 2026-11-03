@@ -55,6 +55,9 @@
 #include "btu.h"
 #include "device/include/controller.h"
 #include "bt_common.h"
+/* U2 A2DP SINK 接收器（本项目自有代码，见 src/u2/）：
+ * 必须在 BTA_EnableBluetooth() 之前抢下唯一的 AV 槽位，所以在这里引入。 */
+#include "u2/u2_sink_policy.h"
 #include "osi/include/fixed_queue.h"
 #include "osi/include/future.h"
 #include "osi/include/log.h"
@@ -257,6 +260,23 @@ void btif_init_ok(UNUSED_ATTR uint16_t event, UNUSED_ATTR char *p_param) {
 #if (BLE_INCLUDED == TRUE)
   btif_dm_load_ble_local_keys();
 #endif
+  /* -----------------------------------------------------------------------
+   * U2 A2DP SINK 接收器（P1a）
+   *
+   * 时机：btif task，BTA_EnableBluetooth() 之前，因此也早于 Java AdapterService
+   * 收到 STATE_ON 之后对各 profile 的 init（A2dpService → init_src）。
+   *
+   * 作用：抢下 r36 唯一的 AV 槽位（btif_av_init 以 sm_handle==NULL 为门槛），
+   * 并把 BTA_A2DP_SINK_SERVICE_ID 置入 btif_enabled_services —— 稍后
+   * btif_dm.c 的 BTA_DM_ENABLE_EVT 循环会**恰好一次**地调用
+   * btif_av_sink_execute_service(TRUE)（BTA_AvEnable + BTA_AvRegister(AUDIO_SINK)）。
+   * 副作用（有意为之）：Java 之后的 init_src 因 sm_handle 已存在而不再 enable source，
+   * 所以设备上只会广播 AudioSink 的 SDP 记录。
+   *
+   * 详见 docs/05-roadmap-and-design.md 与 src/u2/u2_sink_policy.c 顶部注释。
+   * --------------------------------------------------------------------- */
+  u2_sink_policy_install();
+
   BTA_EnableBluetooth(bte_dm_evt);
 }
 
@@ -530,6 +550,12 @@ void btif_enable_bluetooth_evt(tBTA_STATUS status)
 #ifdef BTIF_DM_OOB_TEST
         btif_dm_load_local_oob();
 #endif
+
+        /* U2 接收器策略（P1b）：适配器 ON 之后立即常驻可发现 + 可连接。
+         * 此时 bta_dm_enable() 已经用 bta_dm_cfg.dev_class（我们改成了
+         * COD 0x240414 = Audio/Video + Loudspeaker）下发过 HCI Write Class of Device，
+         * 也已完成 AV SINK service 的注册（见 btif_init_ok 里的 u2_sink_policy_install）。 */
+        u2_sink_policy_on_adapter_on();
 
         future_ready(stack_manager_get_hack_future(), FUTURE_SUCCESS);
     }
@@ -1094,6 +1120,12 @@ bt_status_t btif_set_adapter_property(const bt_property_t *property)
                 }
 
                 BTIF_TRACE_EVENT("set property scan mode : %x", mode);
+
+                /* U2 接收器策略：常驻"可发现 + 可连接"。
+                 * Android 只在蓝牙设置界面前台时才让适配器 discoverable，
+                 * 音箱必须随时可被扫到，所以在这里把上层的降级请求顶回去
+                 * （U2_ALWAYS_DISCOVERABLE=0 时该函数为空操作，行为回到原厂）。 */
+                u2_sink_policy_force_scan_mode(&disc_mode, &conn_mode);
 
                 BTA_DmSetVisibility(disc_mode, conn_mode, BTA_DM_IGNORE, BTA_DM_IGNORE);
 

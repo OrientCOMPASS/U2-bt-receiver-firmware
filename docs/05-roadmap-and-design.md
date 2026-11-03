@@ -141,6 +141,50 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
 | 改 caps 后 Windows/手机缓存旧偏好 | 已入册（docs/03 §7） | 删除重配对 + bthserv 重启 + PnP Disable/Enable，2–3 轮 |
 | `AudioTrack` 走 libmedia，MTK 版结构体布局 | 已确认 ABI 兼容（max 成员写偏移 656 / r36 sizeof 664） | 不再重复验证；热路径零新增分配 + canary |
 
+### 3.7 P1a / P1b 实施结果（已刷入实测，2026-11-04）
+
+上面 §3.1–§3.4 的方案已按"读码 → 实现 → 构建 → 原子刷入 → HCI 层取证"的顺序落地，
+实测确认了三条**硬约束**（写代码前必须先知道，否则会踩坑）：
+
+1. **r36 的 `btif_av` 只有一个 AV 槽位**：`btif_av_init(service_id)` 以 `sm_handle == NULL`
+   为门槛，只有第一次调用才 `btif_enable_service()`。→ 我们必须在 Java 的 `init_src`
+   之前跑，否则 SINK 永远不会被 enable。选定的钩子点是 **`btif_init_ok()`**
+   （`btif_core.c`，由 `stack/btu/btu_task.c:193` 投递，运行在 btif task，早于
+   `BTA_EnableBluetooth`，因而也早于 Java 收到 STATE_ON 后的 profile init）。
+2. **`BTA_AvEnable` 全生命周期只能调一次**：`bta_av_api_enable()` 第一件事就是
+   `memset(&bta_av_cb, 0, sizeof(tBTA_AV_CB))`。→ 我们**不直接**调
+   `btif_av_sink_execute_service()`，而是把 `BTA_A2DP_SINK_SERVICE_ID` 置入
+   `btif_enabled_services`，由 `btif_dm.c:1712` 的 `BTA_DM_ENABLE_EVT` service 循环
+   恰好一次地执行它。source 与 sink 天然不可并存（对纯接收器正好）。
+3. **Java 会主动把我们降级**：适配器 ON 后约 5s，上层下发
+   `BT_PROPERTY_ADAPTER_SCAN_MODE = CONNECTABLE`（实测 `disc=0x0 conn=0x1`）。
+   → 必须在 `btif_set_adapter_property()` 里拦截（`u2_sink_policy_force_scan_mode`），
+   否则音箱扫不到。
+
+实测取证（无需第二台蓝牙设备，靠 btsnoop 落盘 + `tools/dev/parse_snoop.py`）：
+
+```
+Write_Class_of_Device  bytes(LE)=14 04 24 → COD=0x240414 Audio/Video · Loudspeaker · Rendering+Audio
+Write_Scan_Enable      0x03               → inquiry + page scan（可发现 AND 可连接）
+```
+
+运行日志（tag `u2_sink_policy`，注意本机 `log.tag=E`，需先 `setprop log.tag.u2_sink_policy V`）：
+
+```
+I install: enter (installed=0, stack_running=0)
+I init_sink() -> 0
+I A2DP SINK service 已置位 (service_id=18)，等待 DM enable 循环执行
+I audio focus 预授予 GRANTED（native AudioTrack 通路）
+I adapter ON：设为 GENERAL_DISCOVERABLE + CONNECTABLE（接收器常驻可发现）
+W 覆盖上层 scan mode 请求 disc=0x0 conn=0x1 → GENERAL_DISC + CONN
+```
+
+STATE_ON、`/data/tombstones` total 0、`/proc/<pid>/maps` 里是我们的 .so（无 `(deleted)`）。
+符号审计仍是 229 UND / 0 未解析，DT_NEEDED 未变（没有引入新的运行时依赖）。
+
+**尚未验证的部分**（需要第二台设备，属 P1c 验收）：手机扫描到"U2"并显示为音频设备、
+配对、A2DP 连接、SBC 出声、协商采样率。
+
 ## 4. P2（AAC）与 P3（LDAC）：r36 缺什么
 
 实测 `src/stack/a2dp/` 只有 **`a2d_api.c` / `a2d_int.h` / `a2d_sbc.c`** —— **没有 AAC，也没有 LDAC / vendor codec**。
@@ -163,9 +207,12 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
 
 | 阶段 | 主题 | 单一变量 / 交付 | 验收 |
 |---|---|---|---|
-| **P0** ✅ | 干净 AOSP 基线可构建 + 可刷入 + BT 起得来 | `bluetooth.default.so`（源码等价） | STATE_ON、地址/名称正常、**零 tombstone**（已达成，md5 `df19dc6a…` 在机，重构建 `845164e3…`） |
-| **P1** | 基线 SINK（R1） | `-DUSE_AUDIO_TRACK` → sink service 启用 → COD/可发现 → 48k caps → AVRCP | 手机显示为"扬声器"；Android + Windows 各连一次 SBC 稳定播放；48k 协商成功；播放/暂停/音量可控 |
-| **P1b** | sink-only 收敛 | 移除/门控 source 注册 | 手机侧只看到 AudioSink；不影响 STATE_ON |
+| **P0** ✅ | 干净 AOSP 基线可构建 + 可原子刷入 + BT 起得来 | `bluetooth.default.so`（源码等价） | STATE_ON、地址/名称正常、**零 tombstone**（在机 `df19dc6a…`，重构建 `845164e3…`；已 Release `p0-baseline-build-flash-20261104`） |
+| **P1a** ✅ | `USE_AUDIO_TRACK` + native 启用 SINK service | `-DUSE_AUDIO_TRACK`、`src/u2/u2_sink_policy.c`、`btif_init_ok()` 一行钩子 | 已刷入 `d73dc8c9…`：`init_sink()->0`、`SINK service 已置位(18)`、focus GRANTED；STATE_ON、零 tombstone |
+| **P1b** ✅ | 扬声器身份 + 常驻可发现（顺带收敛掉 source 注册） | `BTA_DM_COD {0x24,0x04,0x14}`、`on_adapter_on()`、`force_scan_mode()` | 已刷入 `84f09a4c…`；**HCI 实证** `Write_Class_of_Device=14 04 24`(COD 0x240414 Loudspeaker)、`Write_Scan_Enable=0x03`(可发现+可连接) |
+| **P1c** | SBC 48k 收敛 + 真机出声 | `bta_av_co_sbc_sink_caps` 只广告 48k | 手机识别为扬声器并配对播放；`audio_config_cb` 报 48000；snoop 里 AVDTP SET_CONFIG 为 48k |
+| **P1d** | AVRCP 播放/暂停/音量（R1 后半） | `btif_rc.c` sink 视角核对 + CT/TG 路径 | 手机可控播放/暂停；Absolute Volume 生效 |
+| **P1** | 基线 SINK（R1）汇总 | P1a–P1d | Android 手机 + Windows 各连一次 SBC 稳定播放 |
 | **P2** | AAC（R2） | fdk-aac vendored + SEP/caps + 解码分派 | 手机选 AAC 时出声，48k，无重采样 |
 | **P3** | LDAC（R3） | libldac 2.0.72 全源码静态链入 + SEP/caps + 解码分派 | 48k@990kbps 出声；`nm` 无闭源 blob 痕迹；产物自洽 |
 | **P4** | 一拖二（R4） | 双 AVDTP/多 peer 管理 + 活跃流切换策略 | 2 台同时连接、单路活跃、切换 ≤1s、24h 双连不断 |

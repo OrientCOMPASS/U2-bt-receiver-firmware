@@ -35,6 +35,10 @@
 | C9 | 连续 killall BT 进程后适配器不回 STATE_ON | 任务书已警告 | 需要干净重启时用 `adb reboot` |
 | C10 | logcat 里几乎没有 bt_ 日志 | `/system/etc/bluetooth/bt_stack.conf` 里 `TraceConf=true` 且 `TRC_*=2`（只到 WARNING） | 调试时把 `TRC_*` 提到 6（`bt_stack.conf.debug` 就是全 6 的版本），并开 `BtSnoopLogOutput=true`（snoop 落 `/sdcard/mtklog/btlog/btsnoop_hci.log`） |
 | C11 | `ls /sbin`、`cat /init.rc` 权限拒绝 | 750 root:root，shell 非 root | 用 root executor 读（root 可读 /init.rc） |
+| C12 | **native 代码里 `LOG_INFO/LOG_WARN` 一条都看不到**，以为代码没跑 | **`getprop log.tag` = `E`** → liblog 全机最低优先级被压到 ERROR，只有 `LOG_ERROR` 能出来 | `setprop log.tag.<自己的TAG> V`（只影响单 tag）；调试脚本里先设 prop 再重启 BT。切勿改全机 `log.tag` |
+| C13 | 打开 `BtSnoopLogOutput=true` 后**一个字节都没写**，logcat 里 `E bt_snoop: update_logging unable to open '/sdcard/mtklog/btlog/btsnoop_hci.log': No such file or directory` | 本机 conf 的 `BtSnoopFileName` 指向 MTK 日志目录，而 `/sdcard/mtklog` **根本不存在**；`btsnoop.c` open 失败即 `is_logging=false` | 把 `BtSnoopFileName` 改成 AOSP 默认 `/data/misc/bluedroid/btsnoop_hci.log`（bluetooth uid 自己的目录，SELinux 放行）。见 `scripts/device/enable_snoop.sh` |
+| C14 | `adb pull /data/misc/bluedroid/btsnoop_hci.log` → Permission denied；本机又没 `su` | 该目录 `bluetooth:net_bt_stack 750`，shell(uid 2000) 读不到 | 用 root executor `cp` 到 `/data/local/tmp/` + `chmod 666`，再 `adb pull`（`scripts/device/dump_snoop.sh`） |
+| C15 | 刷入脚本结尾 `mount -o ro,remount /system` 返回 `Device or resource busy`(rc=1) | BT 进程正在使用 /system 下的文件 | 无害：`mv` + `sync` 已完成，刷入生效；但要知道 /system 会留在 rw 状态 |
 
 ## D. 沙箱 / 工程
 
@@ -45,6 +49,8 @@
 | D3 | `.git/config` 丢失、remote 没了 | 快照排除 `.git/config` | 每轮用 PAT 从 `CREDENTIALS.txt` 重新加 remote（见 docs/03） |
 | D4 | `git clone aosp-mirror/...` 报 `could not read Username` | 那些镜像仓库不存在（404 → git 转去要认证） | 一律用 `android.googlesource.com`；注意 `platform/external/fdk-aac` 在 googlesource 上也不存在，P2 需另找 fdk-aac 源 |
 | D5 | 内存 ~1GB，编译卡死/OOM | 沙箱内存限制 | `--jobs 2`（参数写法是 `--jobs N`，不是 `-jN`）；构建目录放 `/tmp` |
+| D6 | **改了头文件（如 `bld/bdroid_buildcfg/bdroid_buildcfg.h`）但改动没生效** | `build_bt.py` 的增量判断只比较**源文件** mtime 与 .o，不跟踪头文件依赖（没有 .d 机制） | 改任何头文件后必须 `--force` 全量重编（313 obj ≈ 30s，可接受） |
+| D7 | 产物大小与上一版**一模一样**，怀疑没编进去 | 新增代码很小，被段对齐/填充吸收 | 别用文件大小判断；用 `llvm-nm` 查新符号，或直接扫二进制字节（例如 COD：`24 04 14 00 0f 00 00 20 40 1f 01`） |
 
 ## E. 构建 / ABI
 

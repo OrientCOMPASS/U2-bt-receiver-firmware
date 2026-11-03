@@ -27,6 +27,29 @@
  * 以免一次改两个变量。 */
 #define BTA_AV_INCLUDED TRUE
 
+/* ---------------------------------------------------------------------------
+ * P1b：设备身份 —— Class of Device
+ *
+ * AOSP 默认（include/bt_target.h:397，#ifndef 保护，可被本文件覆盖）：
+ *     #define BTA_DM_COD {0x5A, 0x02, 0x0C}     // 0x5A020C = mobile phone
+ * 数组是 **MSB 在前**：stack/include/bt_types.h 的 DEVCLASS_TO_STREAM 会按
+ * a[2],a[1],a[0] 的顺序写进 HCI_Write_Class_of_Device。
+ *
+ * 目标是"扬声器"身份 COD 0x240414：
+ *     major service class = (0x240414>>13)&0x7FF = 0x120 → Rendering(bit18) + Audio(bit21)
+ *     major device class  = (0x240414>>8)&0x1F   = 0x04  → Audio/Video
+ *     minor device class  = (0x240414>>2)&0x3F   = 0x05  → Loudspeaker
+ * 于是手机/PC 在扫描列表里把本机显示为音频设备（而不是"手机"），并直接给出
+ * "媒体音频"选项。
+ *
+ * 生效路径：bta/dm/bta_dm_cfg.c 的 bta_dm_cfg.dev_class
+ *        → bta_dm_act.c:404 BTM_SetDeviceClass(dev_class)（在 bta_dm_enable 里）
+ *        → btsnd_hcic_write_dev_class → HCI Write Class of Device
+ * ------------------------------------------------------------------------- */
+#ifndef BTA_DM_COD
+#define BTA_DM_COD {0x24, 0x04, 0x14}
+#endif
+
 /* 48kHz 优先的全局约束在 codec 协商与 AudioTrack 侧落实（P2/P3），
  * 这里先记录 source 侧默认值以便对照（原厂 AOSP 默认 44100）。 */
 #define BTIF_A2DP_SRC_SAMPLING_RATE 48000

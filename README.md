@@ -12,8 +12,10 @@
 
 | 阶段 | 主题 | 状态 |
 |---|---|---|
-| **P0** | 干净 AOSP `bluetooth.default.so` 可构建 / 可原子刷入 / BT 起得来 | ✅ **达成**（STATE_ON，零 tombstone） |
-| P1 | 基线 SINK：扬声器身份(COD 0x240414) + SBC + AVRCP + 48k | ⏳ 方案已定，见 `docs/05` |
+| **P0** | 干净 AOSP `bluetooth.default.so` 可构建 / 可原子刷入 / BT 起得来 | ✅ **达成**（Release `p0-baseline-build-flash-20261104`） |
+| **P1a** | `-DUSE_AUDIO_TRACK` + native 主动启用 A2DP SINK service | ✅ **已刷入验证**（STATE_ON，零 tombstone） |
+| **P1b** | 扬声器身份 COD 0x240414 + 常驻可发现（HCI 层实证） | ✅ **已刷入验证** |
+| P1c/P1d | SBC 48k 收敛 + 真机出声 + AVRCP 播放/暂停/音量 | ⏳ 进行中 |
 | P2 | AAC（fdk-aac，LATM） | ⏳ |
 | P3 | LDAC（libldac 2.0.72 全源码静态链接） | ⏳ |
 | P4 | 一拖二（2 台手机、单路活跃流、切换 ≤1s、24h） | ⏳ |

@@ -238,3 +238,140 @@ switch 只有 `BTA_AV_CODEC_SBC`，default 直接 `return FALSE`。
 media task 按 codec_type 分派。fdk-aac 在 googlesource r36 上不存在，需另取源码 vendored。
 
 以上全部写入 `docs/05-roadmap-and-design.md`（含风险表与阶段验收标准）。
+
+---
+
+## 2026-11-04 · P1a + P1b：native 侧启用 A2DP SINK + 扬声器身份（已刷入验证）
+
+用户决策（本轮确认）：① push + Release P0 ✅ ② 走 **native-only**，APK 仅作后备
+③ P1 第一步 = `USE_AUDIO_TRACK` + 主动启用 sink service（合并做）④ root executor 按实测 v6 行为继续。
+
+### P0 归档
+- 已 push `main`（`15376bd`，841 文件）
+- Release **`p0-baseline-build-flash-20261104`** 已建，附件 `bluetooth.default.so`
+  (`845164e3…`) + `bluetooth.default.so.unstripped` (`2d51578b…`)
+
+### P1a：`-DUSE_AUDIO_TRACK` + `src/u2/u2_sink_policy.c`
+
+**读码得到的三个硬约束（决定了实现方式）**
+
+1. r36 的 `btif_av` 只有**一个** AV 槽位：`btif_av_init(service_id)` 以 `sm_handle == NULL`
+   为门槛，**只有第一次调用**才会 `btif_enable_service(service_id)`。→ 谁先 init 谁拿到
+   service enable 的机会；Java 的 `init_src` 若先跑，SINK 就永远不会被 enable。
+2. `bta_av_api_enable()` 第一件事是 `memset(&bta_av_cb, 0, sizeof(tBTA_AV_CB))`
+   → **`BTA_AvEnable` 全生命周期只能调用一次**，source 与 sink 不可并存。
+   所以我们**绝不能**自己直接调 `btif_av_sink_execute_service()`，否则与 DM 的
+   service 循环形成第二次 `BTA_AvEnable`，把已注册的控制块抹掉。
+3. 正确的触发点在 **`btif_init_ok()`**（`btif_core.c`，由 `stack/btu/btu_task.c:193`
+   经 `btif_transfer_context` 投递，运行在 btif task，**早于** `BTA_EnableBluetooth`，
+   也因此早于 Java 收到 STATE_ON 后的 profile init）。此刻 `stack_is_running == false`，
+   `btif_enable_service()` 只置位；随后 `btif_dm.c:1712` 的 `BTA_DM_ENABLE_EVT`
+   service 循环会**恰好一次**地执行 `btif_in_execute_service_request(18, TRUE)`
+   → `btif_av_sink_execute_service(TRUE)` → `BTA_AvEnable(...)` + `BTA_AvRegister(AUDIO_SINK)`。
+
+**改动（3 处，都很小）**
+
+| 文件 | 改动 |
+|---|---|
+| `tools/build/build_bt.py` | 新增 `EXTRA_PROJECT_SOURCES=["src/u2/u2_sink_policy.c"]`（借 libbtif 的 include/flags 上下文）与 `EXTRA_PROJECT_DEFINES=["-DUSE_AUDIO_TRACK"]` |
+| `src/u2/u2_sink_policy.{h,c}` | 本项目自有代码：自己的 `btav_callbacks_t`、`install()`、焦点授予、采样率观测 |
+| `src/btif/src/btif_core.c` | `btif_init_ok()` 里加一行 `u2_sink_policy_install();` |
+
+`USE_AUDIO_TRACK` 的必要性（源码依据）：未定义时 sink 的 PCM 走
+`UIPC_Send(UIPC_CH_ID_AV_AUDIO,…)`，而且 `btif_media_task_handle_inc_media()` 会因
+`data_channel_open == FALSE` **直接 return**（手机上没有 UIPC 消费者 = 死路）；
+定义后走 `BtifAvrcpAudioTrackWriteData()` → native `android::AudioTrack`
+（`AUDIO_STREAM_MUSIC` / `PCM_16` / `AUDIO_OUTPUT_FLAG_FAST` / `TRANSFER_SYNC`，
+采样率**直接取协商值** → 48k 无重采样）。
+实测 `grep -rn USE_AUDIO_TRACK --include=*.mk src/` → **0 命中**，即 AOSP r36 官方 make 不开它。
+
+焦点门禁：`btif_media_task.c:1319` `if (rx_audio_focus_state == NOT_GRANTED) return;`
+（初值 NOT_GRANTED，官方由 Java A2dpSinkService 授予）。我们在
+`install()` 里预授予 + `audio_state_cb(STARTED)` 再授予一次（专用接收器无焦点竞争）。
+
+**构建/刷入/实测**
+
+| 项 | 值 |
+|---|---|
+| 构建 | 313 obj（+1 我们的文件），链接 OK |
+| 符号审计 | 229 UND / **0 未解析**；DT_NEEDED 与原厂完全一致（未新增运行时依赖） |
+| P1a md5 | `d73dc8c9509347a1a95e1bc0d4c47e11`（1768488 B）→ 已原子刷入 |
+| `USE_AUDIO_TRACK` 生效证据 | 产物新增 `btif_a2dp_set_audio_focus_state` / `btif_a2dp_set_audio_track_gain` / `update_audio_focus_state` / `update_audio_track_gain` |
+| 运行证据 | `install: enter (installed=0, stack_running=0)` → `init_sink() -> 0` → `A2DP SINK service 已置位 (service_id=18)` → `audio focus 预授予 GRANTED` |
+| 稳定性 | **STATE_ON**，地址/名称正常，`/data/tombstones` **total 0** |
+| 映射核对 | `/proc/<pid>/maps` 里是 `/system/lib/hw/bluetooth.default.so`（**无 `(deleted)`**）→ 确认跑的是新 .so |
+
+副作用（有意为之，等于顺手完成了原计划的 P1b「收敛 source」）：Java 之后的
+`init_src` 因 `sm_handle != NULL` 而不再 enable source → 设备上只会有 AudioSink 的
+SDP 记录。`dumpsys` 里 Java 侧仍列出 A2dpService（无害，其 native 侧未注册）；
+另观察到 framework 侧本来就有 `E BluetoothA2dpSink: Could not bind to Bluetooth A2DP
+Service`（改前就存在，说明 Android 7 framework 有 sink API，只是 APK 没启用服务）。
+
+### P1b：COD 0x240414 + 常驻可发现
+
+| 文件 | 改动 |
+|---|---|
+| `bld/bdroid_buildcfg/bdroid_buildcfg.h` | `#define BTA_DM_COD {0x24, 0x04, 0x14}`（覆盖 `include/bt_target.h:397` 的默认 `{0x5A,0x02,0x0C}` = 手机） |
+| `src/u2/u2_sink_policy.{h,c}` | 新增 `u2_sink_policy_on_adapter_on()`（`BTA_DmSetVisibility(GENERAL_DISC, CONN, IGNORE, IGNORE)`）与 `u2_sink_policy_force_scan_mode()` |
+| `src/btif/src/btif_core.c` | `btif_enable_bluetooth_evt()` 成功分支调用 `on_adapter_on()`；`btif_set_adapter_property()` 的 `BT_PROPERTY_ADAPTER_SCAN_MODE` 分支调用 `force_scan_mode()` |
+
+字节序已核对：`stack/include/bt_types.h:247` 的 `DEVCLASS_TO_STREAM` 按
+`a[2],a[1],a[0]` 写出 → `BTA_DM_COD` 数组是 **MSB 在前**。
+二进制层对照（直接扫产物字节，含 `bta_dm_cfg` 其余字段，可确认改对了结构体）：
+
+```
+原厂 stock : 5a 02 0c 00 0f 00 00 20 40 1f 01   → COD 0x5A020C（手机）
+P1b 我们的 : 24 04 14 00 0f 00 00 20 40 1f 01   → COD 0x240414（Loudspeaker）
+```
+
+**为什么必须拦截 Java 的 scan mode**：实测适配器 ON 后约 5 秒，Java 下发
+`disc=0x0 conn=0x1`（只可连接、不可发现）—— 日志 `W u2_sink_policy: 覆盖上层 scan mode 请求
+disc=0x0 conn=0x1 → GENERAL_DISC + CONN` 证明拦截是必要的且生效。
+
+**P1b 构建/刷入**：md5 `84f09a4cd465d1130f913c9f35517f2e`（1768488 B），原子刷入成功，
+STATE_ON，零 tombstone，策略日志完整（install → SINK armed → focus → adapter ON visibility → 覆盖降级）。
+
+### ★HCI 层硬证据（新工具链：btsnoop 落盘 + 本地解析）
+
+新增 `scripts/device/enable_snoop.sh`、`scripts/device/dump_snoop.sh`、`tools/dev/parse_snoop.py`。
+**不需要第二台蓝牙设备**即可验证射频侧参数：
+
+```
+=== Class of Device（HCI Write_Class_of_Device, 0x0C24）===
+  [  58] bytes(LE)=14 04 24  →  COD=0x240414  major=0x04(Audio/Video)  minor=0x05(Loudspeaker)  services=[Rendering,Audio]
+  [ 128] bytes(LE)=14 04 34  →  COD=0x340414  …services=[Rendering,Object Transfer,Audio]
+=== Scan Enable（HCI Write_Scan_Enable, 0x0C1A）===
+  [  84] 0x01 → [86..122] 0x03 = inquiry + page scan（可发现 AND 可连接）
+```
+
+- `0x240414` 正是 R1 要求的"扬声器"身份 ✅
+- 稍后变成 `0x340414` 是 SDP 记录建立后 Fluoride 自动把 **Object Transfer** 服务位或进去
+  （MAP/PBAP 之类），主类/次类仍是 Audio/Video + Loudspeaker，属外观差异；
+  后续裁掉用不到的 profile 时会自然消失。
+- Scan Enable 终值 `0x03` → 手机现在**无需进设置界面**就能扫到并配对 ✅
+
+### 本轮新入册的坑（已写入 docs/04）
+
+1. **`getprop log.tag` = `E`**：本机把全机日志最低优先级压到 ERROR，
+   所以 `LOG_INFO/LOG_WARN` 全被 liblog 过滤（只有 `E bt_btif` 这类能看见）。
+   对策：`setprop log.tag.<我们的TAG> V`（只影响单 tag，不动全机设置）。
+   → 这就是第一版验证脚本"什么都看不到"的原因，不是代码没跑。
+2. **`bt_stack.conf` 里 `BtSnoopFileName=/sdcard/mtklog/btlog/btsnoop_hci.log`，而
+   `/sdcard/mtklog` 目录根本不存在** → `btsnoop.c` 的 `open()` 失败、`is_logging=false`，
+   一个字节都不写（logcat: `E bt_snoop: update_logging unable to open ...`）。
+   对策：改成 AOSP 默认 `/data/misc/bluedroid/btsnoop_hci.log`（bluetooth uid 自己的目录）。
+3. `/data/misc/bluedroid` 是 `bluetooth:net_bt_stack 750`，adb shell 读不到、本机又没 `su`
+   → snoop 文件必须先用 root executor `cp` 到 `/data/local/tmp` 并 `chmod 666`。
+4. `mount -o ro,remount /system` 在 BT 进程运行时可能 `Device or resource busy`（rc=1），
+   不影响刷入结果（`mv` 已完成、`sync` 已做），但要知道 /system 会留在 rw。
+5. `build_bt.py` 的增量判断只看**源文件** mtime，不跟踪头文件 →
+   改了 `bdroid_buildcfg.h` 这类头之后必须 `--force` 全量重编，否则改动不生效。
+
+### 下一步（等用户配合的真机出声测试）
+R1 剩下的部分必须有第二台设备：手机扫描 → 应显示为**扬声器/音频设备** → 配对 →
+勾选"媒体音频" → 播放。届时我方会抓 `audio_config_cb` 的 `sample_rate`
+（预期 44100，因为 sink caps 还广告 `48|44`）与 snoop 里的 AVDTP SET_CONFIG，
+然后进入 **P1c：把 `bta_av_co_sbc_sink_caps` 收敛到 48k-only**（全局硬约束）。
+风险预判：`BtifAvrcpAudioTrackCreate` 用了 `AUDIO_OUTPUT_FLAG_FAST`，44.1k 的 FAST track
+在 MTK 48k AudioFlinger 上可能 `initCheck()` 失败 → 表现为"连上但没声"，
+届时日志会有 `A2dpSink: Track creation fails!!!`；若如此，P1c 的 48k-only 正好一并解决。

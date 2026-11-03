@@ -62,6 +62,24 @@ STATIC_EXTRA = ["libbt-qcom_sbc_decoder"]
 # 我们照做，保证 DT_NEEDED 与原厂一致（不新增运行时依赖）。
 EXTRA_AOSP_SOURCES = ["hardware_libhardware/hardware.c"]
 
+# 本项目自有源文件（路径相对仓库根），静态编入 bluetooth.default.so。
+# 它们不在任何官方 Android.mk 里，所以由本列表显式加入；编译时使用 libbtif 的
+# include/flags 上下文（需要 btif_common.h / btif_av.h / btif_media.h / bta_api.h）。
+#   src/u2/u2_sink_policy.c —— P1a：native 侧启用 A2DP SINK + 授予音频焦点
+#                              （详见 docs/05-roadmap-and-design.md）
+EXTRA_PROJECT_SOURCES = ["src/u2/u2_sink_policy.c"]
+
+# 本项目自有编译宏（会附加到全局 flags）。
+#   USE_AUDIO_TRACK —— ★P1a 关键：AOSP r36 官方 make **没有**定义它
+#     （grep -rn "USE_AUDIO_TRACK" --include=*.mk src/ → 0 命中）。
+#     未定义时 sink 的 PCM 出口是 UIPC_Send(UIPC_CH_ID_AV_AUDIO,…)，手机上没有消费者，
+#     而且 btif_media_task_handle_inc_media() 会因 data_channel_open==FALSE 直接 return。
+#     定义后改走 BtifAvrcpAudioTrackWriteData() → native android::AudioTrack
+#     （btif/src/btif_avrcp_audio_track.cpp，AUDIO_STREAM_MUSIC / PCM_16 / FAST / SYNC，
+#      采样率直接取协商值 → 48k 无重采样）。
+EXTRA_PROJECT_DEFINES = ["-DUSE_AUDIO_TRACK"]
+
+
 # 链接用的设备库（DT_NEEDED 与原厂一致；libcustom_prop/libstagefright 是 MTK 追加的，
 # 干净 AOSP 源码不需要，故不链接）
 LINK_DEVICE_LIBS = ["libcutils", "libdl", "liblog", "libz", "libpower",
@@ -157,8 +175,10 @@ def base_flags(env, args):
         # MergeFrom(const Message&) 退化为反射实现（语义等价，仅指标上报路径，非热路径）。
         "-DGOOGLE_PROTOBUF_NO_RTTI",
         '-DEXPORT_SYMBOL=__attribute__((visibility("default")))',
+        # 本项目自有宏（见文件顶部 EXTRA_PROJECT_DEFINES 的注释）。
+        # USE_AUDIO_TRACK：把 A2DP sink 的 PCM 出口从 UIPC 切到 native AudioTrack。
         "-O%d" % args.opt,
-    ]
+    ] + list(EXTRA_PROJECT_DEFINES)
     if args.opt == 0:
         f += ["-g", "-fno-omit-frame-pointer"]
     f += WARN_RELAX
@@ -242,6 +262,21 @@ def collect_sources(plan, env, args):
             picked.append(("aosp_extra", ap,
                            {"includes": [aosp(env, "hardware_libhardware", "include")],
                             "cflags": [], "cppflags": [], "conlyflags": [], "path": ""}))
+
+    # 本项目自有源文件（不在任何官方 Android.mk 里）：借用 libbtif 的 include/flags 上下文
+    for rel in EXTRA_PROJECT_SOURCES:
+        ap = os.path.normpath(os.path.join(REPO, rel))
+        if not os.path.exists(ap):
+            print("  !! EXTRA_PROJECT_SOURCES 里找不到 %s" % rel)
+            continue
+        if ap in seen:
+            continue
+        seen.add(ap)
+        m = mods.get("libbtif")
+        if m is None:
+            print("  !! plan.json 中找不到 libbtif，%s 用空上下文编译" % rel)
+            m = {"includes": [], "cflags": [], "cppflags": [], "conlyflags": [], "path": ""}
+        picked.append(("u2_project", ap, m))
 
     # 生成的 protobuf C++
     pb = os.path.join(REPO, "bld", "out", "gen", "proto", "system", "bt", "osi", "src", "protos", "bluetooth.pb.cc")

@@ -27,7 +27,8 @@
 |---|---|
 | 地址 | `00:00:46:03:35:01`（`bt_config.conf` 与运行时一致） |
 | 名称 | `U2` |
-| 扫描模式 | `ScanMode=0`（不可发现；P1 需设为可发现 + COD） |
+| 扫描模式 | `bt_config.conf` 里 `ScanMode=0`；**但 Java 每次都会下发"只可连接"**（实测 `disc=0x0 conn=0x1`）→ P1b 起由我们的 `.so` 强制顶回 `0x03`（inquiry+page scan） |
+| COD | 原厂 `bta_dm_cfg.dev_class = {0x5A,0x02,0x0C}` → **0x5A020C（手机）**；P1b 起改为 `{0x24,0x04,0x14}` → **0x240414（Audio/Video · Loudspeaker）**，SDP 记录建立后 Fluoride 会再或上 Object Transfer 位变成 `0x340414`（外观差异，主/次类不变） |
 | DID | `vendorId=0x0046`、`productId=0x1200`、`vendorIdSource=0x0002`(USB-IF) |
 | Vendor HAL | `/vendor/lib/libbt-vendor.so`(13844B) + `/vendor/lib/libbluetooth_mtk.so`(30268B) |
 | BT 固件 | `/system/etc/firmware/mt6627_patch_e1_hdr.bin`（`ro.bt.chip=mt6627`）；MTK FW log `C1/C2` |
@@ -61,6 +62,15 @@ Gatt, Headset, A2dp(=A2DP SRC), Hid, Health, Pan, Map
 - `/system/etc/bluetooth/bt_stack.conf.debug`：`TRC_*=6` + MTK FW log C1/C2（**调试期用它的内容覆盖，或直接改 TRC_***）
 - snoop 落盘目录：`/sdcard/mtklog/btlog/btsnoop_hci.log`（MTK）
 - A2DP 编解码偏好：原厂只有 SBC/AAC 声明，**无 LDAC**（R3 要自己加）
+- **`getprop log.tag` = `E`**（全机日志最低优先级被压到 ERROR）→ 我们自己的 `LOG_INFO/LOG_WARN`
+  默认**看不见**；调试前必须 `setprop log.tag.<自己的TAG> V`（详见 docs/04 C12）
+- **btsnoop 落盘**（P1b 起已打开，是验证射频侧参数的主要手段，不需要第二台蓝牙设备）：
+  - `BtSnoopLogOutput=true`
+  - `BtSnoopFileName` 原厂写的是 `/sdcard/mtklog/btlog/btsnoop_hci.log`，**该目录不存在** → 必须改成
+    AOSP 默认 `/data/misc/bluedroid/btsnoop_hci.log`（详见 docs/04 C13）
+  - conf 备份在设备 `/data/local/tmp/bt_stack.conf.stock`（md5 `6d85e7288d03525a7b60e8162b72b39d`）
+  - 取文件：`scripts/device/dump_snoop.sh`（root cp 到 `/data/local/tmp` + chmod 666）→
+    Windows `adb pull` → tar → uguu → 沙箱 `tools/dev/parse_snoop.py`
 
 ## 6. 常用命令速查（本机实测可用）
 
