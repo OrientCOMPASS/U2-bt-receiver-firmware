@@ -74,3 +74,6 @@
 | F2 | 改了 caps，真机行为毫无变化 | Android / Windows **都缓存对端的 codec 偏好**，重连时不重新走完整 SET_CONFIG 协商 | 改任何 A2DP caps 后必须**两端都"忘记设备 → 重新配对"**；Windows 还要 stop/start bthserv + `Disable-PnpDevice`/`Enable-PnpDevice` + sleep 90，实测常需 2–3 轮 |
 | F3 | 用文件大小/`ls -l` 判断有没有编进去 | 小改动被段对齐吸收 | 见 D7：用 `llvm-nm` 查符号 + F1 的 dump 法 |
 | F4 | `logcat` 里什么都看不到 | 设备 `log.tag` 全局被设成 `E` | 诊断前先 `setprop log.tag.<TAG> V`（如 `u2_sink_policy`、`bt_stack`、`bt_bta`、`btif_rc`），否则 INFO/WARN 全被吞 |
+| F5 | `setprop log.tag.X V` 之后**仍然**看不到刚才那段日志 | liblog 是在**写入时**按 `log.tag` 过滤的：prop 设置之前产生的 INFO/WARN 根本没进 buffer，事后设 prop 也捞不回来 | 先设 prop，**再**触发行为（连接/调音量）；或设完 prop 后重启 BT 进程让初始化日志重来一遍。`adb reboot` 会清掉这些 prop，重启后必须重设 |
+| F6 | 脚本里 `ps -A` 抓不到进程（输出空，grep 无命中） | 本机 toybox 的 `ps` 不接受 `-A`（`ps -A -o PID,NAME` 同样无效） | 一律用裸 `ps`，再 `grep -i -e blue`；不要用 `-A`/`-o` |
+| F7 | 改完 A2DP caps，真机"连不上"，但 logcat 里干干净净什么错都没有 | source 在 GET_CAPABILITIES 之后发现能力集不相交，就**在心里放弃**了：不发 SET_CONFIG，不报错，随后断开（HCI reason=0x13） | 判据只有一个：snoop 里有没有 `SET_CONFIGURATION`。用 `parse_snoop.py --avdtp` 看两端 caps 的采样率交集（P1c 就是这么定位的） |

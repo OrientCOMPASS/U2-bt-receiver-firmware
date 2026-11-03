@@ -124,6 +124,11 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
 
 ### ★ 策略（2026-11-04 线上取证后**重写**；旧策略 1"只广告 48k"已被证伪）
 
+> **用户已定案（2026-11-04）**：采用下面的**路径 1 + 2**——SBC caps 保持 `48|44`、
+> 由 source 决定采样率（Android/Windows 实际给 44.1k），48kHz 的目标改由
+> **P2(AAC) / P3(LDAC)** 承担；解码输出与 AudioTrack 始终等于协商值，**任何情况下都不重采样**。
+> 双 SEP 与"条件式拒绝"两条路暂不做（记录在策略 4，留作 P2 之后的可选实验）。
+
 **证伪过程**（`tools/dev/parse_snoop.py --avdtp`，抓包文件 `sn_p1c.bin`）：
 
 ```

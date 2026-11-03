@@ -48,6 +48,11 @@
 #include "osi/include/properties.h"
 #include "btu.h"
 #include "log/log.h"
+
+/* P1d（本项目自有代码）：native-only sink 场景下的 AVRCP TG 绝对音量策略层。
+ * 协议编解码仍留在本文件（要用 send_metamsg_rsp / send_reject_response 这些
+ * static 助手与 btif_rc_cb），策略层只持有音量状态并负责把增益落到 AudioTrack。 */
+#include "u2/u2_sink_policy.h"
 #define RC_INVALID_TRACK_ID (0xFFFFFFFFFFFFFFFFULL)
 
 /*****************************************************************************
@@ -670,6 +675,8 @@ void handle_rc_disconnect (tBTA_AV_RC_CLOSE *p_rc_close)
     btif_rc_cb.rc_features = 0;
     btif_rc_cb.rc_vol_label=MAX_LABEL;
     btif_rc_cb.rc_volume=MAX_VOLUME;
+    /* P1d：清掉我们自己的绝对音量状态，避免把上一台设备的音量带到下一次连接 */
+    u2_sink_policy_rc_reset();
     init_all_transactions();
     if (bt_rc_callbacks != NULL)
     {
@@ -986,6 +993,154 @@ void handle_rc_metamsg_cmd (tBTA_AV_META_MSG *pmeta_msg)
 }
 
 /***************************************************************************
+**
+** Function         u2_sink_rc_metamsg_cmd        （P1d，本项目自有代码）
+**
+** Description      native-only A2DP SINK 场景下的**最小 AVRCP TG 实现**。
+**
+**                  为什么需要：本机是纯 native 接收器，Java 的 AvrcpTargetService 与
+**                  AvrcpControllerService 都没起，于是 bt_rc_callbacks 与
+**                  bt_rc_ctrl_callbacks **都是 NULL**（真机 logcat 实锤：
+**                  "### ASSERT : btif_rc.c line 466 Callback is NULL ###"）。
+**                  原厂 btif_rc_handler 的 BTA_AV_META_MSG_EVT 派发在这种情况下只打印
+**                  "Neither CTRL, nor TG is up, drop meta commands" 就把命令丢掉，
+**                  连 AVRC_Ctrl_ParsCommand() 都不执行 —— 对端既拿不到 interim
+**                  也拿不到 accept。
+**
+**                  实测后果：Android 判定绝对音量不可用 → 回退软件音量 → 听感正常；
+**                  Windows 只认绝对音量 → 音量滑块完全无效（本阶段要修的就是这个）。
+**
+**                  只实现两个 PDU（其余一律 reject，与原厂 TG 的 default 分支一致）：
+**                    AVRC_PDU_REGISTER_NOTIFICATION + AVRC_EVT_VOLUME_CHANGE
+**                        → 记 label、置 rc_notif[].bNotify，回 **INTERIM**（当前音量）
+**                    AVRC_PDU_SET_ABSOLUTE_VOLUME
+**                        → 交给策略层落增益，回 **ACCEPT**
+**
+**                  BTA 层无需改动：因为注册的是 SINK，bta_av_api_register() 已选中
+**                  bta_avk_cfg，其 p_meta_evt_ids = {AVRC_EVT_VOLUME_CHANGE}
+**                  （产物二进制实测 0x0d），所以 GetCapabilities 会如实广告、
+**                  RegisterNotification 也能过 bta_av_chk_notif_evt_id() 校验并被上报到这里。
+**                  GetCapabilities 本身更是根本到不了 btif —— bta_av_proc_meta_cmd()
+**                  在 BTA 层就地应答了。
+**
+** Returns          void
+**
+***************************************************************************/
+#if (AVRC_CTLR_INCLUDED == TRUE)
+static void u2_sink_rc_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg)
+{
+    tAVRC_COMMAND  avrc_cmd = {0};
+    tAVRC_RESPONSE avrc_rsp = {0};
+    tAVRC_STS      status;
+
+    if (pmeta_msg == NULL || pmeta_msg->p_msg == NULL)
+    {
+        BTIF_TRACE_ERROR("%s: NULL meta msg", __FUNCTION__);
+        return;
+    }
+
+    /* 只处理 vendor command（与 handle_avk_rc_metamsg_cmd 相同的入口条件）。
+     * response 方向的包不属于 TG 职责，忽略。 */
+    if ((AVRC_OP_VENDOR != pmeta_msg->p_msg->hdr.opcode) ||
+        (pmeta_msg->code > AVRC_CMD_GEN_INQ))
+    {
+        BTIF_TRACE_DEBUG("%s: not a vendor command (opcode=0x%x code=0x%x), ignore",
+                         __FUNCTION__, pmeta_msg->p_msg->hdr.opcode, pmeta_msg->code);
+        return;
+    }
+
+    /* AVRC_Ctrl_ParsCommand → avrc_ctrl_pars_vendor_cmd()：
+     * 只认 SET_ABSOLUTE_VOLUME 与 REGISTER_NOTIFICATION，其余 pdu 返回 BAD_CMD；
+     * 并且它已把 volume 与 AVRC_MAX_VOLUME(0x7F) 相与，脏高位漏不进来。 */
+    status = AVRC_Ctrl_ParsCommand(pmeta_msg->p_msg, &avrc_cmd);
+    if (status != AVRC_STS_NO_ERROR)
+    {
+        BTIF_TRACE_WARNING("%s: parse failed status=0x%02x pdu=0x%02x -> reject",
+                           __FUNCTION__, status, avrc_cmd.pdu);
+        send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label, avrc_cmd.pdu, status);
+        return;
+    }
+
+    switch (avrc_cmd.pdu)
+    {
+    case AVRC_PDU_REGISTER_NOTIFICATION:
+    {
+        UINT8 event_id = avrc_cmd.reg_notif.event_id;
+        BTIF_TRACE_EVENT("%s: RegisterNotification event_id=0x%02x(%s) label=%d",
+                         __FUNCTION__, event_id, dump_rc_notification_event_id(event_id),
+                         pmeta_msg->label);
+
+        /* 边界检查：MAX_RC_NOTIFICATIONS == AVRC_EVT_VOLUME_CHANGE(13) → rc_notif[]
+         * 只有 13 个元素、合法下标 0..12，而写入用的是 [event_id-1]（VOLUME_CHANGE
+         * 恰好落在最后一个合法下标 12）。BTA 层已按 caps 过滤过（我们只广告
+         * VOLUME_CHANGE），这里再挡一次：越界写会踩坏 btif_rc_cb_t 的后续成员。 */
+        if ((event_id != AVRC_EVT_VOLUME_CHANGE) ||
+            (event_id < 1) || (event_id > MAX_RC_NOTIFICATIONS))
+        {
+            BTIF_TRACE_WARNING("%s: 只支持 VOLUME_CHANGED，event_id=0x%02x -> reject",
+                               __FUNCTION__, event_id);
+            send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label,
+                                 avrc_cmd.pdu, AVRC_STS_BAD_PARAM);
+            return;
+        }
+
+        /* 与原厂 TG 路径（handle_rc_metamsg_cmd）一致地登记：send_metamsg_rsp 的
+         * CHANGED 分支要靠 rc_notif[].bNotify/label 才能把变更通知发出去。 */
+        btif_rc_cb.rc_notif[event_id - 1].bNotify = TRUE;
+        btif_rc_cb.rc_notif[event_id - 1].label = pmeta_msg->label;
+        btif_rc_cb.rc_vol_label = pmeta_msg->label;
+
+        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
+        avrc_rsp.reg_notif.opcode = AVRC_OP_VENDOR;
+        avrc_rsp.reg_notif.pdu = AVRC_PDU_REGISTER_NOTIFICATION;
+        avrc_rsp.reg_notif.status = AVRC_STS_NO_ERROR;
+        avrc_rsp.reg_notif.event_id = AVRC_EVT_VOLUME_CHANGE;
+        avrc_rsp.reg_notif.param.volume = u2_sink_policy_rc_get_abs_vol();
+
+        /* AVRC_CMD_NOTIF → send_metamsg_rsp 内部映射成 AVRC_RSP_INTERIM。
+         * 事务不释放：后续音量变化还要用同一个 label 发 CHANGED（P1e 会用到）。 */
+        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_NOTIF, &avrc_rsp);
+        BTIF_TRACE_EVENT("%s: VOLUME_CHANGED registered, interim abs_vol=%d/127",
+                         __FUNCTION__, (int)avrc_rsp.reg_notif.param.volume);
+        break;
+    }
+
+    case AVRC_PDU_SET_ABSOLUTE_VOLUME:
+    {
+        UINT8 vol = (UINT8)(avrc_cmd.volume.volume & AVRC_MAX_VOLUME);
+        BTIF_TRACE_EVENT("%s: SetAbsoluteVolume abs_vol=%d/127 label=%d",
+                         __FUNCTION__, (int)vol, pmeta_msg->label);
+
+        /* 落增益 + 记状态都在策略层。若此刻 AudioTrack 还没创建
+         * （Windows 常在连接时就下发音量），策略层会存下来，
+         * 由 u2_sink_policy_rc_on_track_created() 在 track 建好后重放。 */
+        u2_sink_policy_rc_set_abs_vol(vol);
+        btif_rc_cb.rc_volume = vol;
+        btif_rc_cb.rc_vol_label = pmeta_msg->label;
+
+        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
+        avrc_rsp.volume.opcode = AVRC_OP_VENDOR;
+        avrc_rsp.volume.pdu = AVRC_PDU_SET_ABSOLUTE_VOLUME;
+        avrc_rsp.volume.status = AVRC_STS_NO_ERROR;
+        avrc_rsp.volume.volume = vol;
+
+        /* AVRC_CMD_CTRL → send_metamsg_rsp 内部映射成 AVRC_RSP_ACCEPT */
+        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_CTRL, &avrc_rsp);
+        break;
+    }
+
+    default:
+        /* 其余 pdu 与原厂 TG 的 default 分支行为一致：reject(BAD_CMD)。 */
+        BTIF_TRACE_DEBUG("%s: pdu=0x%02x 未实现 -> reject(BAD_CMD)",
+                         __FUNCTION__, avrc_cmd.pdu);
+        send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label,
+                             avrc_cmd.pdu, AVRC_STS_BAD_CMD);
+        break;
+    }
+}
+#endif /* AVRC_CTLR_INCLUDED */
+
+/***************************************************************************
  **
  ** Function       btif_rc_handler
  **
@@ -1110,6 +1265,22 @@ void btif_rc_handler(tBTA_AV_EVT event, tBTA_AV *p_data)
 
             }
 #endif
+            else if (u2_sink_policy_rc_enabled())
+            {
+                /* P1d（本项目）：native-only sink —— 两个 Java 回调都是 NULL。
+                 * 原厂在这里直接丢弃命令，导致 Windows 的绝对音量完全无效。
+                 * 改为交给我们自己的最小 TG 处理（只实现 VOLUME_CHANGED 注册与
+                 * SetAbsoluteVolume，其余 reject）。开关关掉即回到原厂行为。 */
+#if (AVRC_CTLR_INCLUDED == TRUE)
+                BTIF_TRACE_DEBUG("%s no Java RC callbacks -> native sink TG handler "
+                                 "(code:%d label:%d len:%d handle:%d)", __FUNCTION__,
+                                 p_data->meta_msg.code, p_data->meta_msg.label,
+                                 p_data->meta_msg.len, p_data->meta_msg.rc_handle);
+                u2_sink_rc_metamsg_cmd(&(p_data->meta_msg));
+#else
+                BTIF_TRACE_ERROR("Neither CTRL, nor TG is up, drop meta commands");
+#endif
+            }
             else
             {
                 BTIF_TRACE_ERROR("Neither CTRL, nor TG is up, drop meta commands");

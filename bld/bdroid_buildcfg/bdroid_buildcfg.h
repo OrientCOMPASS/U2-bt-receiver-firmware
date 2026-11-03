@@ -86,6 +86,28 @@
 #define U2_SBC_SINK_48K_ONLY FALSE
 #endif
 
+/* ---------------------------------------------------------------------------
+ * P1d：AVRCP TG 绝对音量（Absolute Volume）—— 修 Windows 音量滑块无效
+ *
+ * 事实（真机 logcat + 源码核对，详见 WORKLOG 2026-11-04）：
+ *   本机是 native-only sink，Java 的 AvrcpTarget/AvrcpController 都没起，
+ *   bt_rc_callbacks 与 bt_rc_ctrl_callbacks 都是 NULL（logcat:
+ *   "### ASSERT : btif_rc.c line 466 Callback is NULL ###"），于是
+ *   btif_rc_handler 的 BTA_AV_META_MSG_EVT 派发命中第三支
+ *   "Neither CTRL, nor TG is up, drop meta commands" —— SetAbsoluteVolume 与
+ *   RegisterNotification(VOLUME_CHANGED) 连解析都没做就被丢弃，一个字节都不回。
+ *   Android 会因此回退软件音量（听感正常），Windows 只认绝对音量（滑块完全无效）。
+ *
+ * 置 1：btif_rc.c 的第三支改走我们自己的最小 TG 处理（回 interim / accept，
+ *       并把音量落到 AudioTrack 增益）；置 0：完全回到原厂行为（只打日志丢弃）。
+ * 注意 BTA 层不需要动：sink 注册选中的是 bta_avk_cfg，其 p_meta_evt_ids 已经
+ * 只有 AVRC_EVT_VOLUME_CHANGE（产物二进制实测 0x0d），GetCapabilities 由
+ * bta_av_proc_meta_cmd() 在 BTA 层就地应答。
+ * ------------------------------------------------------------------------- */
+#ifndef U2_AVRCP_TG_ABSVOL
+#define U2_AVRCP_TG_ABSVOL 1
+#endif
+
 /* 48kHz 优先的全局约束在 codec 协商与 AudioTrack 侧落实（P2/P3），
  * 这里先记录 source 侧默认值以便对照（原厂 AOSP 默认 44100）。 */
 #define BTIF_A2DP_SRC_SAMPLING_RATE 48000

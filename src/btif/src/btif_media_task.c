@@ -80,6 +80,7 @@
 
 #ifdef USE_AUDIO_TRACK
 #include "btif_avrcp_audio_track.h"
+#include "u2/u2_sink_policy.h"   /* P1d：track 建好后重放已保存的绝对音量 */
 #endif
 
 #if (BTA_AV_SINK_INCLUDED == TRUE)
@@ -2276,6 +2277,14 @@ static void btif_media_task_aa_handle_decoder_reset(BT_HDR *p_msg)
         APPL_TRACE_ERROR("%s A2dpSink: Track creation fails!!!", __func__);
         return;
     }
+    /* P1d（本项目）：track 刚建好，把对端此前下发的绝对音量重放一次。
+     *
+     * 必须有这一步：btif_a2dp_set_audio_track_gain() →
+     * BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain)，而它在 handle==NULL
+     * 时只打一条 DEBUG 就返回。Windows 常在**连接时**（还没开流、audio_track 仍为 NULL）
+     * 就下发 SetAbsoluteVolume，那次设置会被静默吞掉 → 用户拖了滑块却没反应。
+     * 策略层把音量存着，这里补一次。本函数运行在 media task，与 audio_track 同线程。 */
+    u2_sink_policy_rc_on_track_created();
 #else
     UIPC_Open(UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb);
 #endif

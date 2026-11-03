@@ -776,3 +776,72 @@ AAC 需要先实测手机的 AAC source caps（本次抓包里 nubia Z40 的 DIS
 - PowerShell `Set-Content -Encoding ascii` 会写 **CRLF**，设备侧 `cut -d" " -f1` 读出来带 `\r`，
   导致 flash 脚本的 md5 门控比较失败（`ABORT: bt_new.so 与 bt_want.txt 不一致`）。
   → 写纯文本给设备用时一律 `[IO.File]::WriteAllText($p,$s,[Text.Encoding]::ASCII)`。
+
+---
+
+## 2026-11-04（再续）· P1d 实现 + 刷入：native AVRCP TG 绝对音量
+
+### 用户定案（本轮两个决定）
+1. **48kHz 策略 = 走 codec 路线**：SBC caps 保持 `48|44`，采样率由 source 决定
+   （Android/Windows 实际给 44.1k）；48k 的目标改由 **P2(AAC) / P3(LDAC)** 承担；
+   解码输出与 AudioTrack 始终等于协商值，**任何情况下不重采样**。
+   双 SEP / 条件式拒绝两条路暂不做（留在 docs/05 §3.5 策略 4 作为 P2 之后的可选实验）。
+2. **优先级维持原顺序**：P1d 音量 → P1e 线控 → P1f HFP。
+
+### 实现（4 个文件，全部带开关，纯 native）
+
+| 文件 | 改动 |
+|---|---|
+| `src/u2/u2_sink_policy.h/.c` | 新增音量状态机：`u2_sink_policy_rc_{get,set}_abs_vol` / `_on_track_created` / `_reset` / `_enabled`。状态放独立静态结构 `u2_rc_vol_t` 并带 head/tail canary（0x5532C0DE / 0xC0DE5532），破坏时只报不自愈 |
+| `src/btif/src/btif_rc.c` | ① 新增 `u2_sink_rc_metamsg_cmd()`：最小 TG 实现，只做 `RegisterNotification(VOLUME_CHANGED)`→INTERIM 与 `SetAbsoluteVolume`→落增益+ACCEPT，其余 pdu 一律 `reject(BAD_CMD)`（与原厂 TG 的 default 一致）；② `BTA_AV_META_MSG_EVT` 派发器**第三支**改为先问 `u2_sink_policy_rc_enabled()`；③ `handle_rc_disconnect()` 里调 `u2_sink_policy_rc_reset()` |
+| `src/btif/src/btif_media_task.c` | `btif_media_task_aa_handle_decoder_reset()` 里 `BtifAvrcpAudioTrackCreate()` 成功后调 `u2_sink_policy_rc_on_track_created()`，把此前存下的音量重放一次 |
+| `bld/bdroid_buildcfg/bdroid_buildcfg.h` | 新增 `U2_AVRCP_TG_ABSVOL 1`（置 0 即完全回到原厂行为） |
+
+复用的原厂设施（没有自己造 AVRCP 协议代码）：
+- `AVRC_Ctrl_ParsCommand()` → `avrc_ctrl_pars_vendor_cmd()`：只认 SET_ABSOLUTE_VOLUME /
+  REGISTER_NOTIFICATION，其余 pdu 直接返回 `BAD_CMD`，**并且已经把 volume 与
+  `AVRC_MAX_VOLUME(0x7F)` 相与**，脏高位漏不进来。
+- `send_metamsg_rsp()`：`AVRC_CMD_NOTIF(3)` → `AVRC_RSP_INTERIM`、`AVRC_CMD_CTRL(0)` →
+  `AVRC_RSP_ACCEPT`；`AVRC_RSP_CHANGED` 分支还会自动用 `rc_notif[event_id-1].bNotify/label`
+  做一次性变更通知（P1e 的本地音量键会用到）。
+- `send_reject_response()`、`AVRC_BldResponse()`（`avrc_bld_tg.c:979` 已支持
+  SET_ABSOLUTE_VOLUME 应答）。
+- 线程模型与原厂一致：`btif_rc_handler` 在 btif task，而 r36 里 Java 调 HAL 的
+  `update_audio_track_gain()`（`btav_interface_t` 成员，`btif_av.c:1265`）本来也是从
+  非 media 线程调 `btif_a2dp_set_audio_track_gain()` → `AudioTrack::setVolume()`
+  （经 proxy 写共享内存，跨线程安全）。
+
+防御性细节：`MAX_RC_NOTIFICATIONS == AVRC_EVT_VOLUME_CHANGE(13)`，`rc_notif[]` 只有 13 个元素、
+合法下标 0..12，而写入用 `[event_id-1]`（VOLUME_CHANGE 恰好落在最后一个合法下标）。
+处理函数里仍显式挡了 `event_id != AVRC_EVT_VOLUME_CHANGE || <1 || >MAX_RC_NOTIFICATIONS`。
+
+### 构建与刷入
+
+| 项 | 值 |
+|---|---|
+| 构建 | `--force --jobs 2`，313 obj，**0 error / 0 warning**，符号审计 229 UND / 0 未解析 |
+| 产物 md5 | **`94feb99d190028dc0877e2a6169fe2df`**（1 772 608 B，比回退版 +4120 B） |
+| 新符号（unstripped） | `u2_sink_rc_metamsg_cmd@0x8cb88`、`u2_sink_policy_rc_{get_abs_vol@0x14f5e0, set_abs_vol@0x14f664, on_track_created@0x14f7a8, reset@0x14f7d4, enabled@0x14f83c}`、`u2_rc_canary_check@0x14f5fc`、`u2_rc_apply_gain_locked@0x14f718`、`u2_rc_vol@0x1b15b0(.data)` |
+| 回归校验（字节级） | sink caps `30 0f f0 0c 03 fa 02`(48\|44) ✅ / SRC caps `20 01 10 04 01 35 02` ✅ / `bta_avk_meta_caps_evt_ids = 0d` ✅ / COD `24 04 14` ✅ |
+| canary | 两个常量在产物里各出现 1 次 ✅ |
+| 刷入 | 原子（cp→`.bt_swap.tmp`→mv→sync），备份门控通过，installed md5 复核一致；`adb reboot` |
+| 重启后 | `boot_completed=1`、`bluetooth_on=1`、**STATE_ON**、name=U2、addr=00:00:46:03:35:01、**`/data/tombstones` total 0** |
+
+⚠️ 本次刷入含**两个变量**（P1c 回退 + P1d），因为回退版已在机、P1d 叠在其上；
+验收时用客观证据分别归因：snoop 里出现 `SET_CONFIGURATION`+`START` = 回退有效；
+logcat 里出现 `u2_sink_rc_metamsg_cmd: SetAbsoluteVolume` + `rc gain: abs_vol=…` = P1d 有效。
+若"没声音"，先把 `U2_AVRCP_TG_ABSVOL` 置 0 重刷一次即可把 P1d 单独摘出来。
+
+### 待验（需要用户操作）
+1. Android + Windows **都要重新配对**（caps 从 48k-only 改回 48|44，偏好有缓存）；
+2. 播放音乐确认**出声恢复**（回到 P1b 的已知良好状态）；
+3. 在 **Windows** 上拖音量滑块 → 预期滑块生效（P1d）；
+4. 我这边跑 `scripts/device/p1d_capture_avrcp.sh` 取证归因。
+
+### 本轮新入册的坑（docs/04 F5/F6/F7）
+- **`setprop log.tag.X V` 之后看不到"刚才"的日志**：liblog 在**写入时**按 prop 过滤，
+  prop 设置之前的 INFO/WARN 根本没进 buffer。必须先设 prop 再触发行为；`adb reboot` 会清掉 prop。
+- **`ps -A` 在本机 toybox 上输出为空**（`ps -A -o PID,NAME` 同样无效）→ 一律用裸 `ps` + `grep -i -e blue`。
+- **改 caps 后"连不上"却没有任何错误日志**：source 在 GET_CAPABILITIES 之后自行放弃，
+  不发 SET_CONFIG、不报错、随后断开（HCI reason=0x13）。判据只有 snoop 里有没有
+  `SET_CONFIGURATION`（用 `parse_snoop.py --avdtp` 看两端采样率交集）。

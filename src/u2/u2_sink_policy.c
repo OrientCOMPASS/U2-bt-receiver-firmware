@@ -242,3 +242,131 @@ void u2_sink_policy_force_scan_mode(tBTA_DM_DISC *disc_mode, tBTA_DM_CONN *conn_
 unsigned int u2_sink_policy_sample_rate(void)   { return u2_state.sample_rate; }
 unsigned int u2_sink_policy_channel_count(void) { return u2_state.channel_count; }
 int          u2_sink_policy_is_installed(void)  { return u2_state.installed; }
+
+/* ===========================================================================
+ * P1d：AVRCP TG 绝对音量（Absolute Volume）
+ *
+ * 状态量单独成一个结构体并带 canary（项目铁律：新结构体单独分配 + canary）。
+ * 这里是**静态**存储、不在 media 热路径上、无堆分配；canary 仍保留，
+ * 因为一旦有人越界写 rc_notif[]（见 btif_rc.c 的 MAX_RC_NOTIFICATIONS 边界）
+ * 或误改本结构体，宁可日志里留下一条可查的证据，也不要静默跑飞。
+ *
+ * 线程：写入只发生在 btif task（AVRCP 命令派发、RC 断开）与 media task
+ * （track 创建后的重放读），读多写少且都是单字节/单字的量；
+ * 与 r36 里 Java 调 HAL update_audio_track_gain 的路径等价。
+ * ========================================================================= */
+
+#define U2_RC_CANARY_HEAD  0x5532C0DEu
+#define U2_RC_CANARY_TAIL  0xC0DE5532u
+
+typedef struct {
+    unsigned int  canary_head;
+    unsigned char abs_vol;      /* 0..127，对端最近一次下发的绝对音量 */
+    unsigned char have_vol;     /* 是否已从对端收到过音量（否则用 U2_RC_ABS_VOL_DEF） */
+    unsigned char reserved[2];
+    unsigned int  set_count;    /* SetAbsoluteVolume 次数，便于日志核对 */
+    unsigned int  replay_count; /* track 创建后重放增益的次数 */
+    unsigned int  clamp_count;  /* 越界被夹住的次数（>0 说明对端固件不规范） */
+    unsigned int  canary_tail;
+} u2_rc_vol_t;
+
+static u2_rc_vol_t u2_rc_vol = {
+    U2_RC_CANARY_HEAD, U2_RC_ABS_VOL_DEF, 0, {0, 0}, 0, 0, 0, U2_RC_CANARY_TAIL
+};
+
+static void u2_rc_canary_check(const char *who)
+{
+    if (u2_rc_vol.canary_head != U2_RC_CANARY_HEAD ||
+        u2_rc_vol.canary_tail != U2_RC_CANARY_TAIL) {
+        /* 只报不改：任何"自愈"都会掩盖真正的越界写（任务书明令禁止 masking） */
+        LOG_ERROR(U2_TAG, "canary 被破坏 @%s head=0x%08x tail=0x%08x —— 有越界写，请查 rc_notif[] 下标",
+                  who, u2_rc_vol.canary_head, u2_rc_vol.canary_tail);
+    }
+}
+
+/* 把 0..127 的绝对音量映射成 AudioTrack 增益（线性）。
+ *
+ * 为什么用线性而不是 dB：AVRCP 绝对音量在规范里就是"0..127 的线性百分比"，
+ * AudioTrack::setVolume 也是线性幅度；对端 UI 的滑块行为与之一致。
+ * 若实测听感觉得低端太陡，再考虑加一条 0.5 次幂曲线（属调音，不属本阶段）。 */
+#if (U2_AVRCP_TG_ABSVOL == 1)
+static void u2_rc_apply_gain_locked(const char *why)
+{
+    float gain;
+
+    if (!u2_rc_vol.have_vol) {
+        /* 对端还没下发过音量：不去动 AudioTrack，保持它自己的默认值（1.0）。
+         * 这样"连接后没调过音量"的场景与原厂行为一致，不会平白改变响度。 */
+        LOG_INFO(U2_TAG, "rc gain: 对端尚未下发音量，保持默认（%s）", why);
+        return;
+    }
+    gain = (float)u2_rc_vol.abs_vol / (float)U2_RC_ABS_VOL_MAX;
+    LOG_INFO(U2_TAG, "rc gain: abs_vol=%u/127 → AudioTrack gain=%.3f (%s)",
+             (unsigned int)u2_rc_vol.abs_vol, gain, why);
+    btif_a2dp_set_audio_track_gain(gain);
+}
+#endif /* U2_AVRCP_TG_ABSVOL */
+
+unsigned char u2_sink_policy_rc_get_abs_vol(void)
+{
+    u2_rc_canary_check("get_abs_vol");
+    return u2_rc_vol.abs_vol;
+}
+
+void u2_sink_policy_rc_set_abs_vol(unsigned char vol)
+{
+#if (U2_AVRCP_TG_ABSVOL == 1)
+    u2_rc_canary_check("set_abs_vol");
+
+    if (vol > U2_RC_ABS_VOL_MAX) {
+        /* 低 7 位才是有效值，高位是保留位；对端若塞了脏数据，夹住而不是信任它 */
+        u2_rc_vol.clamp_count++;
+        LOG_WARN(U2_TAG, "abs_vol=%u 超出 0..%d，夹到 %d（第 %u 次）",
+                 (unsigned int)vol, U2_RC_ABS_VOL_MAX, U2_RC_ABS_VOL_MAX,
+                 u2_rc_vol.clamp_count);
+        vol = U2_RC_ABS_VOL_MAX;
+    }
+    u2_rc_vol.abs_vol = vol;
+    u2_rc_vol.have_vol = 1;
+    u2_rc_vol.set_count++;
+    LOG_INFO(U2_TAG, "SetAbsoluteVolume: abs_vol=%u/127 (第 %u 次)",
+             (unsigned int)vol, u2_rc_vol.set_count);
+    u2_rc_apply_gain_locked("set_abs_vol");
+#else
+    (void)vol;
+#endif
+}
+
+void u2_sink_policy_rc_on_track_created(void)
+{
+#if (U2_AVRCP_TG_ABSVOL == 1)
+    u2_rc_canary_check("on_track_created");
+    u2_rc_vol.replay_count++;
+    /* 关键：Windows 常在还没开流（audio_track==NULL）时就下发音量，
+     * 那次调用会被 BtifAvrcpSetAudioTrackGain 的 NULL 检查静默吞掉，
+     * 所以 track 一建好就把保存的值重放一次。 */
+    u2_rc_apply_gain_locked("track_created");
+#endif
+}
+
+void u2_sink_policy_rc_reset(void)
+{
+#if (U2_AVRCP_TG_ABSVOL == 1)
+    u2_rc_canary_check("reset");
+    LOG_INFO(U2_TAG, "rc reset：abs_vol %u→%d（set=%u replay=%u clamp=%u）",
+             (unsigned int)u2_rc_vol.abs_vol, U2_RC_ABS_VOL_DEF,
+             u2_rc_vol.set_count, u2_rc_vol.replay_count, u2_rc_vol.clamp_count);
+    u2_rc_vol.abs_vol = U2_RC_ABS_VOL_DEF;
+    u2_rc_vol.have_vol = 0;
+    /* set_count / replay_count / clamp_count 是累计计数，跨连接保留便于排查 */
+#endif
+}
+
+int u2_sink_policy_rc_enabled(void)
+{
+#if (U2_AVRCP_TG_ABSVOL == 1)
+    return 1;
+#else
+    return 0;
+#endif
+}

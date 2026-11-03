@@ -71,6 +71,67 @@ void u2_sink_policy_on_adapter_on(void);
  */
 void u2_sink_policy_force_scan_mode(tBTA_DM_DISC *disc_mode, tBTA_DM_CONN *conn_mode);
 
+/* ===========================================================================
+ * P1d：AVRCP TG 绝对音量（Absolute Volume）
+ *
+ * 为什么要有这一层（真机取证，见 WORKLOG 2026-11-04）
+ * -------------------------------------------------
+ * 我们是 A2DP **SINK**，所以对端（手机/PC）是 AVRCP **CT**，通过 1.4 的绝对音量控制
+ * **我们**的输出电平。BTA 层其实已经就绪：因为注册的是 SINK，bta_av_api_register()
+ * 选中 bta_avk_cfg，其 p_meta_evt_ids = {AVRC_EVT_VOLUME_CHANGE}（产物二进制实测 0x0d），
+ * TG 的 SDP 记录也是 AVRC_REV_1_4。
+ * 但 btif_rc.c 的 BTA_AV_META_MSG_EVT 派发器有三支：
+ *     bt_rc_callbacks != NULL        → handle_rc_metamsg_cmd()      (Java AvrcpTarget)
+ *     bt_rc_ctrl_callbacks != NULL   → handle_avk_rc_metamsg_cmd()  (Java AvrcpController)
+ *     else                           → "Neither CTRL, nor TG is up, drop meta commands"
+ * 我们是 native-only，两个回调**都是 NULL**（真机 logcat 实锤：
+ * `### ASSERT : btif_rc.c line 466 Callback is NULL ###`）→ 命中第三支，
+ * SetAbsoluteVolume / RegisterNotification(VOLUME_CHANGED) **连解析都没做就被丢弃**。
+ * 后果：Android 回退软件音量所以听感正常；Windows 只认绝对音量，滑块完全无效。
+ *
+ * 分工：AVRCP 协议编解码留在 btif_rc.c（要用它的 static send_metamsg_rsp /
+ * send_reject_response 与 btif_rc_cb），本模块**只持有音量状态**并负责把增益落到
+ * AudioTrack。线程：全部在 btif task（与 r36 里 Java 调 HAL update_audio_track_gain
+ * 的路径等价，AudioTrack::setVolume 经 proxy 写共享内存，跨线程安全）。
+ * ========================================================================= */
+
+/* P1d 总开关（默认开；置 0 则整条绝对音量路径回到原厂行为，便于对照实验）。
+ * 也在 bld/bdroid_buildcfg/bdroid_buildcfg.h 里显式声明一份。 */
+#ifndef U2_AVRCP_TG_ABSVOL
+#define U2_AVRCP_TG_ABSVOL 1
+#endif
+
+/* AVRCP 绝对音量范围：0..127（AVRC_EVT_VOLUME_CHANGE 的 param 只有低 7 位有效） */
+#define U2_RC_ABS_VOL_MIN   0
+#define U2_RC_ABS_VOL_MAX   127
+/* 对端还没下发音量时的默认值。选 127 而不是 0：宁可先给满音量，
+ * 也不要出现"连上了却完全没声音"这种最难排查的现象。 */
+#define U2_RC_ABS_VOL_DEF   127
+
+/* 当前绝对音量（0..127）。用于回 RegisterNotification(VOLUME_CHANGED) 的 interim。 */
+unsigned char u2_sink_policy_rc_get_abs_vol(void);
+
+/* 记录对端下发的绝对音量并**立即**应用到 AudioTrack 增益（vol/127）。
+ * 超出范围的值会被夹到 0..127 并打 WARNING（对端固件不规范时的自保）。 */
+void u2_sink_policy_rc_set_abs_vol(unsigned char vol);
+
+/* AudioTrack 刚创建好时调用：把已保存的音量重放一次。
+ *
+ * 必须有的原因（源码级）：btif_a2dp_set_audio_track_gain() →
+ * BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain)，而该函数在
+ * handle==NULL 时只打一条 DEBUG 就返回。Windows 常在**连接时**（还没开流、
+ * audio_track 仍为 NULL）就下发 SetAbsoluteVolume，那次设置会被静默丢掉。
+ * 调用点：btif_media_task.c 的 btif_media_task_aa_handle_decoder_reset()，
+ *         BtifAvrcpAudioTrackCreate() 成功之后。 */
+void u2_sink_policy_rc_on_track_created(void);
+
+/* RC 断开时清状态（音量恢复到默认，注册标记清零），避免跨连接串味。 */
+void u2_sink_policy_rc_reset(void);
+
+/* P1d 总开关：U2_AVRCP_TG_ABSVOL == 0 时本模块全部为空操作，
+ * btif_rc.c 的派发器回到原厂行为（第三支只打日志），便于做对照实验。 */
+int u2_sink_policy_rc_enabled(void);
+
 /* 只读快照，便于日志/调试（不进 media 热路径）。 */
 unsigned int u2_sink_policy_sample_rate(void);   /* 最近一次协商采样率，0 = 尚未协商 */
 unsigned int u2_sink_policy_channel_count(void);
