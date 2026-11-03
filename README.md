@@ -77,7 +77,9 @@ kernel build, no camera, no multi-stream mixing, no LDAC *receive*.
 .
 ├── docs/
 │   ├── DEVELOPMENT_PLAN.md       full specification (features, resources, decisions)
-│   └── FIRMWARE_BUILD.md         build -> repack -> SP_Flash_Tool package -> release
+│   ├── FIRMWARE_BUILD.md         build -> repack -> SP_Flash_Tool package -> release
+│   ├── MULTIPOINT_STD_ANALYSIS.md  sink multipoint defects D1-D9 vs android10/11
+│   └── DECODE_POWER_OPTIMIZATION.md decode power phases A-C + measurement gates
 ├── device/keenplus/u2/           AOSP device tree (product + board config)
 │   ├── BoardConfig.mk            partition sizes, kernel args, non-Treble, verity off
 │   ├── device.mk / u2.mk         package whitelist, copy-files, board properties
@@ -96,6 +98,10 @@ kernel build, no camera, no multi-stream mixing, no LDAC *receive*.
 │   ├── system_bt/                AAC sink codec + decoder backport, SBC-XQ bitpool
 │   └── packages_apps_Bluetooth/  per-device StreamHandler binding (+ MULTIDEVICE.md)
 ├── vendor/keenplus/u2/           generated prebuilt makefiles (blobs gitignored)
+├── third_party/
+│   ├── libldacdec/               vendored MIT LDAC decoder core (double, reference)
+│   └── libldacdec_float/         float32 + NEON variant (patch 0011 --opt builds)
+├── tools/decode-bench/           codec decode harness (psnr/bench gates, qemu-arm)
 ├── scripts/                      apply/build/measure/logo/repack/publish + tests
 └── .github/workflows/
     ├── ci.yml                    every push: lint, unit tests, patch + package verify

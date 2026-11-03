@@ -1,0 +1,205 @@
+From 717dcf8adfe0f546e8bc44b142350bf0fe8ba9cf Mon Sep 17 00:00:00 2001
+From: OrientCOMPASS <316423573+OrientCOMPASS@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 10:13:46 +0000
+Subject: [PATCH] Patch 0011: decode power optimization -- sink glue
+
+- BTIF_SINK_MEDIA_TIME_TICK_MS 20 -> 40 ms: halves the sink decode-alarm
+  wakeup rate (dominant periodic cost during A2DP sink playback) for
+  +20 ms pipeline latency.  All tick-derived budgets (SBC
+  frames_to_process, LDAC per-tick feeding, scheduling stats) scale off
+  the constant automatically.
+- Pool the per-RTP-packet RX buffers of RxSbcQ: a fixed_queue free list
+  (32 soft-capped 2048B uniform slots, malloc/free fallback, oversize
+  payload guard) replaces the osi_malloc()/osi_free() churn that ran for
+  every media packet on the BTU and media threads (~50/s per stream).
+- AudioTrack frameCount 0 -> 80 ms (2x the new tick): explicit underrun
+  margin for the sync writer; no steady-state latency added.
+
+Decode results are unchanged (pure scheduling/allocation glue).
+Verified: -O0 and -O2 standalone builds compile and link GREEN
+(NDK r25c clang-14, armv7a-linux-androideabi26).
+---
+ btif/src/btif_avrcp_audio_track.cpp |  9 +++-
+ btif/src/btif_media_task.c          | 81 +++++++++++++++++++++++++----
+ 2 files changed, 79 insertions(+), 11 deletions(-)
+
+diff --git a/btif/src/btif_avrcp_audio_track.cpp b/btif/src/btif_avrcp_audio_track.cpp
+index a591efa..bf90863 100644
+--- a/btif/src/btif_avrcp_audio_track.cpp
++++ b/btif/src/btif_avrcp_audio_track.cpp
+@@ -42,9 +42,16 @@ void *BtifAvrcpAudioTrackCreate(int trackFreq, int channelType)
+      * fail (or stay silent) for non-native rates such as the 44.1 kHz AAC
+      * stream from Windows sources; the primary/deep mixer resamples fine
+      * and A2DP sink latency is dominated by the jitter buffer anyway. */
++    /* Patch 0011 (decode power optimization): explicit 80 ms track buffer
++     * (2x the 40 ms sink pump tick).  frameCount 0 asked AudioFlinger for
++     * its minimum, which was sized for the old 20 ms tick; with the longer
++     * tick the sync writer could underrun between wakeups.  A larger track
++     * buffer does not add steady-state latency (AudioFlinger consumes at
++     * real-time rate), it only raises the underrun margin. */
++    const size_t frameCount = (size_t)trackFreq * 80 / 1000;
+     sp<android::AudioTrack> track =
+         new android::AudioTrack(AUDIO_STREAM_MUSIC, trackFreq, AUDIO_FORMAT_PCM_16_BIT,
+-                                channelType, (size_t) 0 /*frameCount*/,
++                                channelType, frameCount,
+                                 (audio_output_flags_t)AUDIO_OUTPUT_FLAG_NONE,
+                                 NULL /*callback_t*/, NULL /*void* user*/, 0 /*notificationFrames*/,
+                                 AUDIO_SESSION_ALLOCATE, android::AudioTrack::TRANSFER_SYNC);
+diff --git a/btif/src/btif_media_task.c b/btif/src/btif_media_task.c
+index f73b625..24f63b1 100644
+--- a/btif/src/btif_media_task.c
++++ b/btif/src/btif_media_task.c
+@@ -168,7 +168,16 @@ enum {
+ 
+ #define BTIF_MEDIA_TIME_TICK                     (20 * BTIF_MEDIA_NUM_TICK)
+ #define A2DP_DATA_READ_POLL_MS    (BTIF_MEDIA_TIME_TICK / 2)
+-#define BTIF_SINK_MEDIA_TIME_TICK_MS             (20 * BTIF_MEDIA_NUM_TICK)
++/* Patch 0011 (decode power optimization): 40 ms sink pump tick, was 20 ms.
++ * The decode alarm is the dominant periodic wakeup during A2DP sink
++ * playback; halving the wakeup rate halves the per-second scheduler and
++ * audio-write overhead at the cost of +20 ms pipeline latency (acceptable
++ * for a sink).  All tick-derived budgets scale off this constant
++ * automatically: frames_to_process (SBC), LDAC frames-per-tick feeding,
++ * scheduling stats. */
++#ifndef BTIF_SINK_MEDIA_TIME_TICK_MS
++#define BTIF_SINK_MEDIA_TIME_TICK_MS             (40 * BTIF_MEDIA_NUM_TICK)
++#endif
+ 
+ 
+ /* buffer pool */
+@@ -463,6 +472,43 @@ static pthread_mutex_t sink_media_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+ #define SINK_MEDIA_LOCK()   pthread_mutex_lock(&sink_media_lock)
+ #define SINK_MEDIA_UNLOCK() pthread_mutex_unlock(&sink_media_lock)
+ 
++/* Patch 0011 (decode power optimization): pool the per-RTP-packet RX
++ * buffers of RxSbcQ.  btif_media_sink_enque_buf() used to osi_malloc() a
++ * fresh tBT_SBC_HDR+payload buffer for EVERY incoming media packet (up to
++ * ~50/s per stream) and the decode pump osi_free()d it right after -- a
++ * constant malloc/free churn on the BTU and media threads.  A fixed_queue
++ * free list of uniformly sized slots removes the allocator traffic; the
++ * pool is soft-capped and falls back to osi_malloc()/osi_free() so nothing
++ * can deadlock or leak on size outliers.  fixed_queue ops are internally
++ * thread-safe (BTU producer, media-worker consumer). */
++#define BTIF_SINK_RX_POOL_MAX    32
++/* Uniform slot size: sizeof(tBT_SBC_HDR) + AVDT/RTP offset (~20) + the
++ * largest A2DP media payload this stack negotiates (LDAC MTU ~1008,
++ * SBC 5 frames ~600, AAC ~1008).  Enqueue guards against outliers. */
++#define BTIF_SINK_RX_POOL_BUF    2048
++
++static fixed_queue_t *btif_sink_rx_pool_q;  /* free list; NULL until init */
++
++static void *btif_sink_rx_pool_get(void) {
++    if (btif_sink_rx_pool_q != NULL) {
++        void *buf = fixed_queue_try_dequeue(btif_sink_rx_pool_q);
++        if (buf != NULL) return buf;
++    }
++    return osi_malloc(BTIF_SINK_RX_POOL_BUF);
++}
++
++static void btif_sink_rx_pool_put(void *buf) {
++    if (buf == NULL) return;
++    /* capacity SIZE_MAX: the length check is a soft cap, a producer race
++     * may overshoot by one without tripping a full-queue abort */
++    if (btif_sink_rx_pool_q != NULL &&
++        fixed_queue_length(btif_sink_rx_pool_q) < BTIF_SINK_RX_POOL_MAX) {
++        fixed_queue_enqueue(btif_sink_rx_pool_q, buf);
++        return;
++    }
++    osi_free(buf);
++}
++
+ static fixed_queue_t *btif_media_cmd_msg_queue;
+ static thread_t *worker_thread;
+ 
+@@ -1443,7 +1489,7 @@ static void btif_media_task_avk_handle_timer(UNUSED_ATTR void *context)
+                 if (p_msg == NULL)
+                     break;
+                 btif_media_task_handle_inc_media(p_msg);
+-                osi_free(p_msg);
++                btif_sink_rx_pool_put(p_msg);
+             }
+             return;
+         }
+@@ -1480,7 +1526,7 @@ static void btif_media_task_avk_handle_timer(UNUSED_ATTR void *context)
+                      break;
+                 }
+                 num_frames_to_process = num_frames_to_process - p_msg->num_frames_to_be_processed;
+-                osi_free(p_msg);
++                btif_sink_rx_pool_put(p_msg);
+             }
+         } while(num_frames_to_process > 0);
+ 
+@@ -1533,6 +1579,7 @@ static void btif_media_thread_init(UNUSED_ATTR void *context) {
+ #if (BTA_AV_INCLUDED == TRUE)
+   btif_media_cb.TxAaQ = fixed_queue_new(SIZE_MAX);
+   btif_media_cb.RxSbcQ = fixed_queue_new(SIZE_MAX);
++  btif_sink_rx_pool_q = fixed_queue_new(SIZE_MAX);  /* Patch 0011 pool */
+   UIPC_Open(UIPC_CH_ID_AV_CTRL , btif_a2dp_ctrl_cb);
+ #endif
+ 
+@@ -1552,6 +1599,8 @@ static void btif_media_thread_cleanup(UNUSED_ATTR void *context) {
+   btif_media_cb.TxAaQ = NULL;
+   fixed_queue_free(btif_media_cb.RxSbcQ, NULL);
+   btif_media_cb.RxSbcQ = NULL;
++  fixed_queue_free(btif_sink_rx_pool_q, osi_free);  /* Patch 0011 pool */
++  btif_sink_rx_pool_q = NULL;
+ #endif
+ 
+   /* Clear media task flag */
+@@ -1588,9 +1637,13 @@ BOOLEAN btif_media_task_send_cmd_evt(UINT16 Evt)
+  *******************************************************************************/
+ static void btif_media_flush_q(fixed_queue_t *p_q)
+ {
++    /* Patch 0011: every caller flushes RxSbcQ, whose buffers come from
++     * btif_sink_rx_pool_get(); return them to the pool instead of freeing.
++     * (If this helper is ever reused for non-pool queues, restore
++     * osi_free() there.) */
+     while (! fixed_queue_is_empty(p_q))
+     {
+-        osi_free(fixed_queue_try_dequeue(p_q));
++        btif_sink_rx_pool_put(fixed_queue_try_dequeue(p_q));
+     }
+ }
+ 
+@@ -1654,7 +1707,7 @@ static void btif_media_thread_handle_cmd(fixed_queue_t *queue, UNUSED_ATTR void
+     default:
+         APPL_TRACE_ERROR("ERROR in %s unknown event %d", __func__, p_msg->event);
+     }
+-    osi_free(p_msg);
++    btif_sink_rx_pool_put(p_msg);
+     LOG_VERBOSE(LOG_TAG, "%s: %s DONE", __func__, dump_media_event(p_msg->event));
+ }
+ 
+@@ -3286,16 +3339,24 @@ UINT8 btif_media_sink_enque_buf(BT_HDR *p_pkt)
+     if (fixed_queue_length(btif_media_cb.RxSbcQ) == MAX_OUTPUT_A2DP_FRAME_QUEUE_SZ)
+     {
+         ret = fixed_queue_length(btif_media_cb.RxSbcQ);
+-        osi_free(fixed_queue_try_dequeue(btif_media_cb.RxSbcQ));
++        btif_sink_rx_pool_put(fixed_queue_try_dequeue(btif_media_cb.RxSbcQ));
+         SINK_MEDIA_UNLOCK();
+         return ret;
+     }
+ 
+     BTIF_TRACE_VERBOSE("%s +", __func__);
+-    /* allocate and Queue this buffer */
+-    tBT_SBC_HDR *p_msg =
+-        (tBT_SBC_HDR *)osi_malloc(sizeof(tBT_SBC_HDR) + p_pkt->offset +
+-                                  p_pkt->len);
++    /* Patch 0011: take a uniform slot from the RX pool instead of
++     * osi_malloc()ing per packet; guard pathological payloads that would
++     * not fit the slot (drop them rather than overflow). */
++    if (p_pkt->len >
++        BTIF_SINK_RX_POOL_BUF - (int)sizeof(tBT_SBC_HDR)) {
++        BTIF_TRACE_ERROR("%s: payload %d exceeds pool slot %d - dropped",
++                         __func__, p_pkt->len, BTIF_SINK_RX_POOL_BUF);
++        ret = fixed_queue_length(btif_media_cb.RxSbcQ);
++        SINK_MEDIA_UNLOCK();
++        return ret;
++    }
++    tBT_SBC_HDR *p_msg = (tBT_SBC_HDR *)btif_sink_rx_pool_get();
+     memcpy((UINT8 *)(p_msg + 1), (UINT8 *)(p_pkt + 1) + p_pkt->offset,
+            p_pkt->len);
+     if (btif_media_cb.sink_codec_type == BTIF_SINK_CODEC_AAC)
+-- 
+2.39.5
+

@@ -50,6 +50,11 @@
 #   --smoke          compile only the 14-TU smoke set (fast sanity check)
 #   --link           after compiling, link bluetooth.default.so,
 #                    audio.a2dp.default.so, libldacBT_*.so, libFraunhoferAAC.a
+#   --opt            power-optimized variant (patch 0011): compile every TU
+#                    with -O2 -ffp-contract=off instead of -O0, and build the
+#                    float+NEON LDAC decoder (third_party/libldacdec_float)
+#                    in place of the double-precision libldacdec.  Use a
+#                    separate --workdir; artifact names are unchanged.
 #   --skip-setup     reuse workdir contents as-is (no clone/download)
 #   -h, --help       this text
 #
@@ -63,6 +68,7 @@ WORKDIR=""
 JOBS="$(nproc 2>/dev/null || echo 2)"
 SMOKE=0
 LINK=0
+OPT=0
 SKIP_SETUP=0
 
 die() { echo "bt_standalone_build: $*" >&2; exit 2; }
@@ -77,6 +83,7 @@ while [ $# -gt 0 ]; do
     --jobs)       JOBS="${2:-}"; shift 2 ;;
     --smoke)      SMOKE=1; shift ;;
     --link)       LINK=1; shift ;;
+    --opt)        OPT=1; shift ;;
     --skip-setup) SKIP_SETUP=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            die "unknown option: $1 (see --help)" ;;
@@ -91,7 +98,7 @@ if [ -z "$TREE" ]; then
   esac
 fi
 case "$TREE" in 8.1|nougat) ;; *) die "--tree must be 8.1 or nougat (got: $TREE)" ;; esac
-echo "[cfg] tree=$TREE tag=$TAG"
+echo "[cfg] tree=$TREE tag=$TAG opt=$OPT"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 if [ "$TREE" = nougat ]; then
@@ -171,12 +178,19 @@ setup_sources() {
   # link -- no shim, no dlopen), see DEVELOPMENT_PLAN 16.8.  Stage it next to
   # the cloned sources so compile/link treat it like any other source root.
   [ "$TREE" = nougat ] || clone_full libldac "$AOSP/external/libldac"
-  if [ -d "$REPO_ROOT/third_party/libldacdec" ]; then
-    echo "[src] stage libldacdec (vendored, third_party)"
+  local ldacdec_src="$REPO_ROOT/third_party/libldacdec"
+  if [ "$OPT" = 1 ]; then
+    # patch 0011: float+NEON variant (same API/ABI, drop-in sources)
+    [ -d "$REPO_ROOT/third_party/libldacdec_float" ] \
+      || die "--opt needs third_party/libldacdec_float"
+    ldacdec_src="$REPO_ROOT/third_party/libldacdec_float"
+    echo "[src] --opt: staging libldacdec_float (float+NEON LDAC decoder)"
+  fi
+  if [ -d "$ldacdec_src" ]; then
+    echo "[src] stage libldacdec (vendored, third_party: $(basename "$ldacdec_src"))"
     rm -rf "$SRC/libldacdec"
     mkdir -p "$SRC/libldacdec"
-    cp "$REPO_ROOT"/third_party/libldacdec/*.c "$REPO_ROOT"/third_party/libldacdec/*.h \
-       "$SRC/libldacdec/"
+    cp "$ldacdec_src"/*.c "$ldacdec_src"/*.h "$SRC/libldacdec/"
   fi
   clone_full    aac       "$AOSP/external/aac"
   if [ "$TREE" = nougat ]; then
@@ -367,6 +381,10 @@ verify_headers() {
 # ---------------------------------------------------------------------------
 write_env() {
   local bd_def="-DHAS_BDROID_BUILDCFG"
+  # patch 0011 --opt: -O2 everywhere; -ffp-contract=off pins IEEE FP rounding
+  # so optimized builds stay numerically identical to the -O0 reference
+  local opt_flag="-O0"
+  [ "$OPT" = 1 ] && opt_flag="-O2 -ffp-contract=off"
   if [ "$TREE" = nougat ] && [ ! -f "$BDCFG_DIR/bdroid_buildcfg.h" ]; then
     bd_def=""   # pristine gate: pure AOSP N defaults from bt_target.h
     echo "[env] nougat pristine: no bdroid_buildcfg (AOSP defaults)"
@@ -437,8 +455,8 @@ DEFS=(
   -DEXPORT_SYMBOL=__attribute__\\(\\(visibility\\(\\"default\\"\\)\\)\\)
   -DLOG_NDEBUG=1 -DBUILDCFG -DHAS_NO_BDROID_BUILDCFG $bd_def -DNDEBUG
 )
-CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c -O0 -fPIC -w -Wno-c++11-narrowing -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
-CFLAGS=(   "\${TARGET[@]}" "\${SYSROOT[@]}" -std=c99     -c -O0 -fPIC -w -fno-strict-aliasing -fvisibility=hidden -fcommon "\${DEFS[@]}" )
+CXXFLAGS=( "\${TARGET[@]}" "\${SYSROOT[@]}" -std=gnu++14 -c ${opt_flag} -fPIC -w -Wno-c++11-narrowing -fno-strict-aliasing -fvisibility=hidden "\${DEFS[@]}" )
+CFLAGS=(   "\${TARGET[@]}" "\${SYSROOT[@]}" -std=c99     -c ${opt_flag} -fPIC -w -fno-strict-aliasing -fvisibility=hidden -fcommon "\${DEFS[@]}" )
 ENVEOF
   cat > "$WORKDIR/compile_one.sh" <<'ONEEOF'
 #!/usr/bin/env bash

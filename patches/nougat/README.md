@@ -25,6 +25,7 @@ compile (433+ TUs) -> link (`bluetooth.default.so`, `audio.a2dp.default.so`)
 | 0008 | multipoint 3 devices + preemptive suspend + 48 kHz | **shipped** | `system_bt/0008-*.patch` |
 | 0009 | slot routing by runtime scb hndl | **shipped** (device-tested silence fix) | `system_bt/0009-*.patch` |
 | 0010 | multipoint STANDARD rework: transactional media switch | **new** (standalone build GREEN, awaiting device test) | `system_bt/0010-*.patch` |
+| 0011 | decode power opt: 40 ms sink tick, RX buffer pool, 80 ms track | **new** (sandbox-verified: -O0/-O2 builds GREEN; see `docs/DECODE_POWER_OPTIMIZATION.md`) | `system_bt/0011-*.patch` |
 | ~~0002'~~ | sbc-xq | **no-op** | see below |
 | ~~0003'~~ | avdt-mtu | **no-op** | see below |
 | ~~0004'~~ | ldac bco-shim | **superseded** | direct static libldacdec, no shim/dlopen |
@@ -106,6 +107,31 @@ against android11-release `btif_a2dp_sink.cc`, android10-release
 * Companion config: `AVDT_NUM_SEPS` 8 -> 12 (D6 -- each of the 3
   registrations creates 4 local SEPs; with 8, the third peer's SEID 9+
   failed `AVDT_CreateStream`).
+
+### 0011 -- decode power optimization: sink glue (40 ms tick, RX pool, track buffer)
+
+Part of the stage-2 decode power work (full analysis, phases A/B and all
+measurement gates: `docs/DECODE_POWER_OPTIMIZATION.md`).  Pure
+scheduling/allocation glue -- decode output is unchanged:
+
+* `btif_media_task.c`: `BTIF_SINK_MEDIA_TIME_TICK_MS` 20 -> 40 ms
+  (halves the decode-alarm wakeup rate; every tick-derived budget scales
+  off the constant); the per-RTP-packet `osi_malloc`/`osi_free` of
+  `btif_media_sink_enque_buf()` is replaced by a soft-capped
+  `fixed_queue` pool of uniform 2048 B slots (malloc fallback +
+  oversize guard), with ALL release paths (pump drains, write-fail
+  drop, flush, queue-full drop) returning buffers to the pool; pool
+  lifecycle follows the media thread.
+* `btif_avrcp_audio_track.cpp`: explicit 80 ms AudioTrack buffer
+  (2x the new tick) instead of frameCount 0 -- underrun margin for the
+  sync writer, no steady-state latency add.
+* Build companion: `scripts/bt_standalone_build.sh --opt` compiles
+  every TU `-O2 -ffp-contract=off` and stages
+  `third_party/libldacdec_float` (float32 + NEON DCT-IV LDAC decoder;
+  PSNR 112.5/115.8 dB vs the -O0 double reference, 1-LSB max diff).
+* Latency cost: worst case ~ +20 ms pipeline (tick).
+* Sandbox gates: both variants compile + link GREEN; -O2 decode is
+  bit-exact vs -O0 for SBC/AAC/LDAC (harness `tools/decode-bench/`).
 
 ### No-ops (kept out of the series deliberately)
 
