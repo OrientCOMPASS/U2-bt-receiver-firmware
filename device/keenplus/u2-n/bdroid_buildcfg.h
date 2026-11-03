@@ -29,9 +29,14 @@
 #define USE_AUDIO_TRACK             TRUE
 
 /* ---- multi-SEP sink (SBC src + SBC/AAC/LDAC sink) ---- */
-/* stock default 3 -- one more than our 4 audio SEPs would need headroom for
- * the AR/AVRCP registrations; keep generous. */
-#define AVDT_NUM_SEPS               8
+/* Patch 0010 (D6): every BTA_AvRegister instance creates its OWN set of
+ * BTA_AV_MAX_SEPS local SEPs in the AVDT SEP table (bta_av_register ->
+ * AVDT_CreateStream loop).  Multipoint registers one instance per slot
+ * (3 slots), so the table needs 3 x 4 = 12 entries.  The previous value
+ * of 8 made the third instance's SEPs (SEID 9+, including its LDAC sink)
+ * fail creation, so a third peer could not negotiate the full codec set.
+ * 12 is also the stock bt_target.h default; kept explicit for clarity. */
+#define AVDT_NUM_SEPS               12
 /* stock default 10 octets; the LDAC vendor CIE is LOSC(1) + 10 = 11.
  * Matches the 16-octet size later AOSP generations use. */
 #define AVDT_CODEC_SIZE             16

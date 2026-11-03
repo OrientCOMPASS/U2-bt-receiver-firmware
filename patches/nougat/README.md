@@ -17,6 +17,14 @@ compile (433+ TUs) -> link (`bluetooth.default.so`, `audio.a2dp.default.so`)
 | -- | *(pristine)* | GREEN (run 40949835930) | r36 tree compiles & links as-is -- foundation gate |
 | 0001 | a2dp-sink control plane | **shipped** | `system_bt/0001-*.patch` |
 | 0002 | a2dp-sink data plane | **shipped** | `system_bt/0002-*.patch` |
+| 0003 | loudspeaker COD, SDP attr len 1024 | **shipped** | `system_bt/0003-*.patch` |
+| 0004 | raise AV SEP/link/str limits (AAC+LDAC+multipoint) | **shipped** | `system_bt/0004-*.patch` |
+| 0005 | passive sink: no active INT open on CONNECT_REQ | **shipped** | `system_bt/0005-*.patch` |
+| 0006 | declare AVDTP/A2DP 1.3 in SDP records | **shipped** | `system_bt/0006-*.patch` |
+| 0007 | true multipoint A2DP sink (一拖二): dual SCB slots | **shipped** | `system_bt/0007-*.patch` |
+| 0008 | multipoint 3 devices + preemptive suspend + 48 kHz | **shipped** | `system_bt/0008-*.patch` |
+| 0009 | slot routing by runtime scb hndl | **shipped** (device-tested silence fix) | `system_bt/0009-*.patch` |
+| 0010 | multipoint STANDARD rework: transactional media switch | **new** (standalone build GREEN, awaiting device test) | `system_bt/0010-*.patch` |
 | ~~0002'~~ | sbc-xq | **no-op** | see below |
 | ~~0003'~~ | avdt-mtu | **no-op** | see below |
 | ~~0004'~~ | ldac bco-shim | **superseded** | direct static libldacdec, no shim/dlopen |
@@ -63,6 +71,42 @@ LDAC caps `0A 00 FF 2D 01 AA 00 3C 07 00 00 00 00`.
   media payload header) and the 20 ms decode tick drains whole packets
   for AAC/LDAC instead of the SBC per-frame budget.
 
+### 0010 -- multipoint standard rework: transactional media switch, strict routing/ownership, preemptive AVRCP PAUSE
+
+Fixes the field bug: two phones connected, the second preempts the first;
+when the first resumes playback the receiver stays **permanently silent**.
+Full analysis in `docs/MULTIPOINT_STD_ANALYSIS.md` (defects D1-D9 audited
+against android11-release `btif_a2dp_sink.cc`, android10-release
+`A2dpSinkStreamHandler` and BlueALSA).
+
+* `btif_media_task.c`: new `BTIF_MEDIA_AUDIO_SINK_SWITCH` event +
+  `btif_media_task_sink_switch_req(codec_info)` -- the switch (stop pump,
+  flush queue, tear down track/decoders, rebuild from codec_info) executes
+  as ONE media-worker message, mirroring A11 `btif_a2dp_sink_restart_session`.
+  A recursive `sink_media_lock` (A11 `g_mutex` model) serializes enqueue
+  (BTU thread, incl. the delayed start at 5 frames), rx_flush, start/stop
+  decoding, clear_track and decoder reset, closing the D1 race.  NULL-track
+  guards in `start_decoding` / `btif_sink_write_audio` / AudioTrack
+  Start+WriteData (A11 parity).
+* `btif_av.c`: strict stream-event routing -- an event whose hndl matches no
+  slot is dropped + logged, never falls back to slot 0 (D2 poison: a stray
+  CLOSE used to unbind healthy slot 0 and wedge `rx_flush=TRUE` forever);
+  audio ownership is claimed in the START router BEFORE the SM dispatch and
+  posts the transactional switch; all SUSPEND/STOP ownership guards are
+  strict `owner == ctx` (D4); `stop_with_fallback` scans all 3 slots (D3);
+  the media accept gate is owner-only (D7); OPEN-failure unbinds the
+  pre-bound slot; IDLE entry clears the runtime hndl; a preempted peer now
+  also receives AVRCP PASS THROUGH PAUSE over its own RC channel (D8, the
+  android10 focus-loss policy) so its player cannot auto-reSTART into a
+  switch war; `BTA_AvClose/OpenRc/CloseRc` use the runtime scb hndl (D9 --
+  the register hndl hit the wrong scb whenever streaming hndl != register
+  hndl, killing Java-initiated disconnect/RC).
+* `bta_av_aact.c`: NULL scb guard in the `bta_av_stream_data_cback` scan
+  (D5 -- `BTA_AV_NUM_STRS` > allocated scbs was a NULL deref).
+* Companion config: `AVDT_NUM_SEPS` 8 -> 12 (D6 -- each of the 3
+  registrations creates 4 local SEPs; with 8, the third peer's SEID 9+
+  failed `AVDT_CreateStream`).
+
 ### No-ops (kept out of the series deliberately)
 
 * **sbc-xq**: r36 `bta_av_co_sbc_sink_caps` already advertises the full
@@ -75,7 +119,8 @@ LDAC caps `0A 00 FF 2D 01 AA 00 3C 07 00 00 00 00`.
 
 `device/keenplus/u2-n/bdroid_buildcfg.h` (consumed via `-I$BDCFG`):
 `BTA_AV_SINK_INCLUDED=TRUE`, `USE_AUDIO_TRACK=TRUE`, `BTA_AV_MAX_SEPS=4`,
-`AVDT_NUM_SEPS=8`, `AVDT_CODEC_SIZE=16` (LDAC CIE is LOSC+10=11 octets;
+`AVDT_NUM_SEPS=12` (3 registrations x 4 SEPs; was 8 until patch 0010/D6),
+`AVDT_CODEC_SIZE=16` (LDAC CIE is LOSC+10=11 octets;
 stock 10 is too small), `BTM_DEF_LOCAL_NAME="KeenPlus U2"`.
 All symbols are `#ifndef`-guarded in the stock tree -- no stock edits.
 
