@@ -640,3 +640,139 @@ static bt_status_t volume_change_notification_rsp(bd_addr, rsp_type, abs_vol, la
       打印的 `\tsamp_freq:%d (48000)`；
    ③ snoop 里 AVDTP SET_CONFIG 的 SBC 参数第 1 字节 = `0x10`。
    取证脚本：`scripts/device/p1d_capture_avrcp.sh`（一次跑完同时回答 Q1 采样率 / Q2 AVRCP 落点）。
+
+---
+
+## 2026-11-04（续）· P1c 证伪与回退：48k-only SBC sink caps 让设备连不上
+
+### 用户报告的现象（P1c 刷入后）
+- **Windows**：能连上 U2，但**不被识别为可用的音频设备**（没有音频端点）
+- **Android（nubia Z40）**：**根本连不上**
+
+P1b 版本（caps = 48|44）时两端都能正常出声 → 唯一变量就是 P1c 的 caps，先取证再动手。
+
+### 线上取证：AVDTP 层给出决定性答案
+
+抓包 `sn_p1c.bin`（42547 B，993 条记录，md5 `f13e55ae4fc4a2913d2ad0090b9364c2`）。
+为此把 `tools/dev/parse_snoop.py` 补强了（见下"工具修复"），解出完整协商过程：
+
+```
+[148] Connection_Request  bdaddr=50:AF:4D:D7:EE:4C COD=0x5A020C(手机)
+[151] Connection_Complete status=0x00 handle=0x0032     → ACL 建立成功
+[180] Remote_Name_Request_Complete name='HQC nubia Z40'
+[211] Encryption_Change  enc=ON                          → 配对/加密成功
+[221] AVDTP rx DISCOVER CMD
+[222] AVDTP tx DISCOVER RSP :: SEID=1 inUse=0 media=audio tsep=SNK   ← 我们的 sink SEP 正常
+[225] AVDTP rx GET_CAPABILITIES CMD  ACP_SEID=1
+[226] AVDTP tx GET_CAPABILITIES RSP :: SBC freq[48k] mode[MONO|DUAL|STEREO|JOINT]
+                                      blocks[4|8|12|16] subbands[4|8] alloc[SNR|LOUDNESS] bitpool 2..250
+[316] AVDTP tx DISCOVER CMD                    ← 我们作为 CT 反查对端 SEP
+[318] AVDTP rx DISCOVER RSP :: SEID=1 media=audio tsep=SRC
+[321] AVDTP rx GET_CAPABILITIES RSP :: SBC freq[44.1k] mode[MONO|JOINT] subbands[8]
+                                       alloc[LOUDNESS] bitpool 2..53
+[335] Disconnection_Complete reason=0x13 (REMOTE_USER_TERMINATED)
+```
+
+**整份抓包里没有任何 `SET_CONFIGURATION`、没有 `OPEN`、没有 `START`。**
+手机看到我们只有 48k、自己只有 44.1k → 采样率交集为空 → 静默放弃 → 断开。
+Windows(C-TX4，COD=Computer，records 698+) 走的是同一条路：只到 GET_CAPABILITIES 就停 →
+在 Windows 上就表现为"已连接，但没有可用音频端点"。
+
+**根因不在我们的实现，而在对端的能力集**：AOSP r36 `btif/co/bta_av_co.c` 的
+`bta_av_co_sbc_caps`（SRC）只广告 `A2D_SBC_IE_SAMP_FREQ_44`；Android 手机作为 source
+就是这个能力集，Windows 的 SBC source 实测同样只给 44.1k。
+→ **"只广告 48k"= 把自己做成砖**，P1c 的原始设计判断错误，我低估了 source 侧的现实。
+
+### 处置：回退（单变量，开关早已预留）
+
+`bld/bdroid_buildcfg/bdroid_buildcfg.h`：`U2_SBC_SINK_48K_ONLY` **TRUE → FALSE**，
+并在注释里完整记录证伪证据与后续两条可行路线（双 SEP / 条件式拒绝，见 docs/05 §3.5）。
+
+| 项 | 值 |
+|---|---|
+| 构建 | `--force --jobs 2`，313 obj，符号审计 229 UND / 0 未解析，DT_NEEDED 未变 |
+| 产物 md5 | **`20f6380d54aea5d1ed0baa72fe7be537`**（1768488 B） |
+| 字节校验 | `bta_av_co_sbc_sink_caps` @0x1a75ee = `30 0f f0 0c 03 fa 02` → samp_freq **0x30 = 48k\|44.1k** ✅ |
+| 未受影响 | SRC caps `20 01 10 04 01 35 02`、`bta_avk_meta_caps_evt_ids = 0d`(VOLUME_CHANGE)、COD `24 04 14` |
+| 刷入 | 原子（cp→`.bt_swap.tmp`→mv→sync），备份门控通过（原厂 `e0dd373e…` 在位），installed md5 复核一致 |
+| 重启 | `adb reboot`（按坑册，不用反复 killall） |
+| 重启后 | `boot_completed=1`、`bluetooth_on=1`、**STATE_ON**、name=U2、addr=00:00:46:03:35:01、BT pid 1540、`/data/tombstones` total 0 |
+
+`mount -o ro,remount /system` 仍报 EBUSY（已知无害，/system 保持 rw）。
+
+### 意外收获 1：P1d 的分支判断被活体日志证实
+
+重启后 logcat 里出现：
+```
+E bt_btif_avrc: ### ASSERT : .../src/btif/src/btif_rc.c line 466 Callback is NULL (0) ###
+```
+`btif_rc.c:466` 正是 `HAL_CBACK(bt_rc_ctrl_callbacks, getrcfeatures_cb, &rc_addr, rc_features);`
+→ **`bt_rc_ctrl_callbacks == NULL` 在真机上确认**。结合上一节的派发器分析，
+P1d 的修复点就是第三支（`Neither CTRL, nor TG is up`）—— 不再是推测。
+（`ASSERTC` 只打日志不 abort，所以没有 tombstone。）
+
+### 意外收获 2：sink 模式下 AVRCP 通道确实建立了（利好 P1e）
+
+同一批日志：
+```
+E bt_btif : bta_av_rc_create ACP handle exist for shdl:0
+E bt_btif : bta_av_rc_opened rcb[1] shdl:1 lidx:1/0
+```
+且 `btif_rc.c:462-463`：`if (btif_av_is_sink_enabled()) getcapabilities_cmd(AVRC_CAP_COMPANY_ID);`
+→ sink 场景下 r36 **会**建立 AVCTP 连接并作为 CT 主动发 GetCapabilities。
+这意味着 **P1e 需要的 CT 通道天然存在**，不必自己再开一条 AVCTP 连接
+（`btif_rc_cb.rc_connected/rc_handle` 也已就绪，`pass_through_cmd` 的 `CHECK_RC_CONNECTED` 能过）。
+
+### 需求层面的结论（需要用户确认）
+
+全局"48kHz 全链路"约束**在 SBC 上无法实现**——不是实现问题，是 Android/Windows 的
+SBC source 只发 44.1k。建议把约束改写为：
+
+> 在 source 支持的前提下全链路 48kHz（AAC/LDAC 为主路径）；
+> SBC 场景以 source 实际能力为准（Android/Windows = 44.1k），**禁止任何形式的重采样**。
+
+48k 的真正落点因此变成 **P2(AAC)** 与 **P3(LDAC)**：LDAC 48k@990kbps 本来就是 R3 的目标；
+AAC 需要先实测手机的 AAC source caps（本次抓包里 nubia Z40 的 DISCOVER 应答**只有 1 个 SEP**
+且是 SBC —— 这点可疑，可能是该机型只在特定条件下注册 AAC SEP，P2 第一件事就是把
+手机的完整 SEP/caps 抓下来）。
+
+若仍坚持"SBC 也要 48k 优先"，只有两条路（都在 docs/05 §3.5 策略 4）：
+(a) 注册双 SEP（SEID1=48k-only, SEID2=48|44），属结构性改动，需独立阶段；
+(b) caps 保持 48|44，但当对端 caps 含 48k 时拒绝其 44.1k 的 SET_CONFIG —— 本次抓包已证明
+    **手机不会重试而是直接放弃**，所以 (b) 对 Android 极可能同样把设备做砖，只在
+    Linux/BlueZ source 上验证过后才可考虑。
+
+### 工具修复（本轮踩到并修好，避免以后再被骗）
+
+`tools/dev/parse_snoop.py` 有两个错误，正是它们让第一眼看抓包时得出"没有 AVDTP"的错误结论：
+
+1. **PSM off-by-two**：L2CAP Connection Request 的 payload 是 `code(1) id(1) len(2) PSM(2) scid(2)`，
+   PSM 在 payload 偏移 **4**（即 `d[13],d[14]`）。原代码读的是 `d[11],d[12]`（= length 字段），
+   于是所有连接请求都被误报成 `PSM 0x0004`，SDP(0x0001)/AVDTP(0x0019)/AVCTP(0x0017) 全被藏起来。
+2. **AVDTP 头部位序照抄了规范文字而不是 Fluoride 实现**：真实布局来自
+   `stack/avdt/avdt_defs.h`：
+   ```c
+   #define AVDT_MSG_PRS_HDR(p, lbl, pkt, msg)  lbl = *(p)>>4; pkt = (*(p)>>2)&3; msg = *(p++)&3;
+   #define AVDT_MSG_PRS_SIG(p, sig)            sig = *(p++) & 0x3F;
+   #define AVDT_MSG_BLD_HDR(p, lbl, pkt, msg)  *(p)++ = ((lbl)<<4)|((pkt)<<2)|(msg);
+   ```
+   即 octet0 = **label[7:4] | packet_type[3:2] | message_type[1:0]**，
+   且 `CMD=0 / GRJ=1 / RSP=2 / REJ=3`（与规范正文里"00=general reject"的顺序**不同**）。
+   按规范文字写的解码器会把我们的 GET_CAPABILITIES **应答**读成"命令 + 一般拒绝"。
+
+新增能力：`--avdtp`（L2CAP CID↔PSM 映射 + AVDTP 信令全解码，含 SBC/AAC/Vendor codec
+能力与配置、DISCOVER 的 SEP 列表含 **tsep=SRC/SNK**、REJECT 的 category+error code）、
+`--events`（HCI 事件：Connection_Request 的 COD、Connection_Complete、
+**Disconnection 原因码翻译**、Remote_Name、Encryption_Change）。
+这两个开关在 P2/P3 验收 codec 协商时是主力工具。
+
+### 本轮新入册的坑
+- **改 A2DP caps 属于"能一次把设备做砖"的改动**，且砖得很安静：配对成功、ACL 成功、
+  加密成功、DISCOVER/GET_CAPS 都正常，只在 source 心里放弃，logcat 里没有任何错误。
+  → 任何 caps 改动，**必须先用 snoop 抓到 SET_CONFIGURATION 成功**才算数；
+    "手机连不上"这类现象要先看 AVDTP 有没有 SET_CONFIG，再怀疑别的。
+- **source 的能力集比想象的窄**：别假设"现代手机 SBC 支持 48k"。r36 SRC caps 只有 44.1k，
+  Windows 实测也只有 44.1k。想拿 48k 请走 AAC/LDAC。
+- PowerShell `Set-Content -Encoding ascii` 会写 **CRLF**，设备侧 `cut -d" " -f1` 读出来带 `\r`，
+  导致 flash 脚本的 md5 门控比较失败（`ABORT: bt_new.so 与 bt_want.txt 不一致`）。
+  → 写纯文本给设备用时一律 `[IO.File]::WriteAllText($p,$s,[Text.Encoding]::ASCII)`。

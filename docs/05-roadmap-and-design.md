@@ -122,17 +122,53 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
     A2D_SBC_IE_MAX_BITPOOL, A2D_SBC_IE_MIN_BITPOOL };
 ```
 
-策略（按优先级）：
-1. **P1c 单变量实验**：caps 只广告 `A2D_SBC_IE_SAMP_FREQ_48` → 逼手机协商 48k。
-   风险：某些老旧 source 可能 SET_CONFIG 失败 → 需要回退路径（见 3）。
-2. 解码输出即 48k（`btif_media_cb.sample_rate = btif_a2dp_get_track_frequency(sbc_cie.samp_freq)`），
-   `BtifAvrcpAudioTrackCreate(trackFreq, channelType)` 直接用协商值建 AudioTrack → **无重采样**。
-3. 回退：若 48-only 导致某台手机连不上，则改为"48|44 + 在 `bta_av_co_audio_sink_supports_config()`
-   里优先接受 48"，并在 WORKLOG 记录哪台设备走了回退。
-4. P2/P3 的 AAC/LDAC caps 同样按"48k 优先、必要时 48k-only"设定；
-   **任何重采样都视为违反全局约束**，需要显式评审。
-5. 验证手段：`audio_config_cb` 打印 `sample_rate`，并在 `btif_media_task_aa_handle_decoder_reset`
-   的 TRACE 里核对；同时读 AudioTrack 的实际采样率（P1 验收项）。
+### ★ 策略（2026-11-04 线上取证后**重写**；旧策略 1"只广告 48k"已被证伪）
+
+**证伪过程**（`tools/dev/parse_snoop.py --avdtp`，抓包文件 `sn_p1c.bin`）：
+
+```
+[222] AVDTP tx DISCOVER RSP  :: SEID=1 inUse=0 media=audio tsep=SNK      ← 我们确实是 SNK
+[226] AVDTP tx GET_CAPABILITIES RSP :: MEDIA_TRANSPORT; MEDIA_CODEC=SBC freq[48k]
+        mode[MONO|DUAL|STEREO|JOINT] blocks[4|8|12|16] subbands[4|8] alloc[SNR|LOUDNESS] bitpool 2..250
+[316] AVDTP tx DISCOVER CMD                       ← 我们作为 CT 反查对端
+[318] AVDTP rx DISCOVER RSP  :: SEID=1 media=audio tsep=SRC
+[321] AVDTP rx GET_CAPABILITIES RSP :: SBC freq[44.1k] mode[MONO|JOINT] subbands[8]
+        alloc[LOUDNESS] bitpool 2..53            ← nubia Z40 只有 44.1kHz！
+```
+**整份抓包里没有任何 `SET_CONFIGURATION`**：手机拿到我们的 caps 后发现采样率交集为空，
+直接放弃并断开（HCI `Disconnection_Complete reason=0x13 REMOTE_USER_TERMINATED`）。
+Windows(C-TX4) 行为相同——只到 GET_CAPABILITIES 就停，所以在 Windows 上表现为
+"设备已连接，但不是可用的音频设备"。
+
+**根因不在我们**：AOSP r36 的 SRC caps 只广告 44.1kHz
+（`btif/co/bta_av_co.c`：`bta_av_co_sbc_caps = { A2D_SBC_IE_SAMP_FREQ_44, JOINT, BLOCKS_16,
+SUBBAND_8, ALLOC_MD_L, 53, 2 }`）；Android 手机作为 source 就是这个能力集，
+Windows 的 SBC source 实测同样只有 44.1k。
+
+**结论：48kHz 硬约束在 SBC 上不可能靠"只广告 48k"实现**，那样等于把设备做成砖。
+正确路径是分层的：
+
+1. **SBC caps 回到 `48|44`**（P1c 已回退，`U2_SBC_SINK_48K_ONLY=FALSE`）：
+   采样率由 source 决定；Android/Windows 会给 44.1k，愿意给 48k 的 source（如 BlueZ
+   自建源）则拿 48k。**接受 44.1k 不是"违反约束"，而是 SBC 的现实上限。**
+2. **48k 的真正落点是 P2(AAC) / P3(LDAC)**：这两个 codec 的 source 能力集普遍含 48k
+   （LDAC 48k 是 R3 的既定目标）。全局 48k 约束应表述为
+   *"在 source 支持的前提下全链路 48k；SBC 场景下以 source 实际能力为准并记录"*。
+3. 解码/AudioTrack 侧**始终用协商值**建 track（`btif_media_task_aa_handle_decoder_reset`：
+   `sample_rate = btif_a2dp_get_track_frequency(sbc_cie.samp_freq)`），**任何重采样都禁止**。
+   HAL 侧已确认可行：`audio_policy.conf` primary output `sampling_rates 44100|48000`。
+4. 若将来仍要"SBC 优先 48k"，只有两条不会把设备变砖的路，且都必须在 P2 之后单独实验：
+   - **(a) 双 SEP**：注册两个 SNK SEP，SEID1 = 48k-only、SEID2 = 48|44。
+     source 遍历 DISCOVER 结果时会挑第一个能满足的；44.1-only 的 source 自动落到 SEID2。
+     代价：r36 的 `bta_av_co` 是"每 channel 一个 SEP"，要改成多 SEP（`AVDT_CreateConn` 多次），
+     属结构性改动，需独立阶段。
+   - **(b) 条件式拒绝**：caps 保持 48|44，但在 `bta_av_co_audio_sink_supports_config()` 里
+     "若对端 caps 含 48k（我们作为 CT 已经通过 GET_CAPABILITIES 拿到了，见 snoop [319]）
+     则拒绝 44.1k 的 SET_CONFIG"。风险：source 可能不重试而直接失败（本机抓包已看到
+     手机不重试就放弃），**必须先在 Linux/BlueZ source 上验证重试行为**。
+5. 验收手段（三源互证）：`dumpsys media.audio_flinger` 的 Output thread `sampleRate`（最权威）、
+   logcat 里 `btif_media_task_aa_handle_decoder_reset` 的 `samp_freq:%d`、snoop 里
+   SET_CONFIGURATION 的 SBC 参数字节。
 
 ### 3.6 P1 已知风险
 

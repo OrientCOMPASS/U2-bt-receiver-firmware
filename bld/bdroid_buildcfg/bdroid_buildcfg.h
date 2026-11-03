@@ -62,7 +62,28 @@
  *   2) 把下面改成 FALSE 回退到 48|44，并在 WORKLOG 标注该机型走了回退。
  * ------------------------------------------------------------------------- */
 #ifndef U2_SBC_SINK_48K_ONLY
-#define U2_SBC_SINK_48K_ONLY TRUE
+/* 2026-11-04 回退为 FALSE（原为 TRUE）—— **线上取证证明 48k-only 不可行**：
+ *
+ *   AVDTP GET_CAPABILITIES 实测（snoop，tools/dev/parse_snoop.py --avdtp）
+ *     [226] 本机 SNK 应答 : SBC freq[48k]   mode[MONO|DUAL|STEREO|JOINT] bitpool 2..250
+ *     [321] nubia Z40 SRC : SBC freq[44.1k] mode[MONO|JOINT] subbands[8] alloc[LOUDNESS] bitpool 2..53
+ *   → 采样率交集为空；整份抓包里 **没有任何 SET_CONFIGURATION**，
+ *     手机在 GET_CAPS 之后直接放弃并断开（HCI Disconnection reason=0x13）。
+ *     Windows(C-TX4) 表现相同：只到 GET_CAPS 就停，故"连上但不是可用音频设备"。
+ *
+ * 根因不在我们：AOSP r36 的 SRC caps `bta_av_co_sbc_caps` 只广告
+ * `A2D_SBC_IE_SAMP_FREQ_44`（btif/co/bta_av_co.c），Android 手机作为 source 只有 44.1k SBC；
+ * Windows 的 SBC source 实测同样只有 44.1k。
+ * → **48kHz 硬约束在 SBC 上无法通过"只广告 48k"实现**，只能靠 source 自己愿意发 48k，
+ *   或改用 AAC(P2)/LDAC(P3) —— 这两条链路才是 48k 的正确落点。
+ *
+ * 后续若要"优先 48k、回退 44.1k"，有两条不会把设备变砖的路（详见 docs/05 §3.5 策略 5/6）：
+ *   (a) 注册**两个 SNK SEP**：SEID1 = 48k-only，SEID2 = 48|44；source 会挑第一个能满足的；
+ *   (b) caps 保持 48|44，但在 SET_CONFIG 校验时"若对端 caps 含 48k 则拒绝 44.1k"
+ *       （对端 caps 我们已经作为 CT 通过 GET_CAPABILITIES 拿到了，见 snoop [319]）。
+ *   两者都有"source 不重试就直接失败"的风险，必须在 P2 之后单独做一轮实验。
+ */
+#define U2_SBC_SINK_48K_ONLY FALSE
 #endif
 
 /* 48kHz 优先的全局约束在 codec 协商与 AudioTrack 侧落实（P2/P3），
