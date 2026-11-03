@@ -11,6 +11,7 @@
 | A3 | 输出被截断，看不到中间内容 | 桥接单轮消息上限 64KB（头尾保留） | 大输出落设备/Windows 文件，再分段 `Get-Content -TotalCount N` / `Select-Object -Skip N -First M` |
 | A4 | 设备侧 UTF-8 文件回显成乱码（`鍓嶇疆妫€鏌`） | PowerShell `Get-Content` 默认按本地代码页(GBK)解码；`>` 重定向还会写成 UTF-16 | 用 `[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8)` 读；写文件用 `Set-Content -Encoding ascii` 或 `[IO.File]::WriteAllBytes` |
 | A5 | 含反斜杠路径 / PnP InstanceId 的命令被转义毁掉 | printf/引号嵌套转义 | 一律用 bash quoted heredoc（`cat <<'PSEOF'`）构造 PowerShell 文本，再作为单个参数传给 `rc.sh`；需要变量替换时用占位符 + `${VAR//__X__/...}` |
+| A6 | 跑到一半所有 root 脚本报 `NO_OUTPUT_FILE`，`adb devices` 变成空列表 | **设备自己从 adb 掉了**（Windows PnP 里 `VID_0E8D&PID_2008` 状态转 Unknown；USB 松动 / USB 模式被切走 / 设备休眠断链），与桥接无关 | 跑长流程前先 `adb devices` 探活；掉了就请用户重插 USB 并确认不是"仅充电"。**不要**用 `adb kill-server` 试图恢复（触发 A1）。注意：设备掉 adb 时蓝牙功能仍在跑，只是我们无法取证 |
 
 ## B. 文件传输（沙箱 ↔ Windows ↔ 设备）
 
@@ -64,3 +65,12 @@
 | E6 | `-llibcutils`（多了 lib 前缀） | 设备库文件名与 `-l` 参数写法混淆 | `build_bt.py` 里统一 `_lname()` 去前缀/后缀 |
 | E7 | 顶层 Android.mk 里的 `bluetooth_CFLAGS` 展开成空 | 顶层 mk 结尾会 `bluetooth_CFLAGS :=`（清空），真实 make 是先展开子目录再清空 | `mk2plan.py` 解析顶层文件时在 `include $(call all-subdir-makefiles)` 处**停住** |
 | E8 | 编译期符号全过、设备上 `dlopen` 失败 | 引用了设备上不存在的符号（NDK 新版 libc / libchrome 版本差异） | `tools/build/audit_symbols.py` 递归解析 DT_NEEDED，刷入前必须 0 个未解析强符号 |
+
+## F. 取证 / 验证
+
+| # | 现象 | 根因 | 规避 |
+|---|---|---|---|
+| F1 | 按"直觉位序"扫二进制找 `tA2D_SBC_CIE`，0 命中，误以为改动没编进去 | A2DP SBC 的 caps 位段与直觉相反：`ch_mode` 是 **b3..b0**（MONO=0x08/STEREO=0x04/JOINT=0x02/DUAL=0x01），`samp_freq` 是 b7..b4，`block` 在第二字节高位……手拼字节模式极易错 | **别猜字节模式**。一律 `llvm-nm` 取符号 vaddr + `llvm-readelf -S` 算 `file_off = vaddr - sh_addr + sh_offset`，然后 `dd`/python 直接 dump 该结构体的原始字节比对 |
+| F2 | 改了 caps，真机行为毫无变化 | Android / Windows **都缓存对端的 codec 偏好**，重连时不重新走完整 SET_CONFIG 协商 | 改任何 A2DP caps 后必须**两端都"忘记设备 → 重新配对"**；Windows 还要 stop/start bthserv + `Disable-PnpDevice`/`Enable-PnpDevice` + sleep 90，实测常需 2–3 轮 |
+| F3 | 用文件大小/`ls -l` 判断有没有编进去 | 小改动被段对齐吸收 | 见 D7：用 `llvm-nm` 查符号 + F1 的 dump 法 |
+| F4 | `logcat` 里什么都看不到 | 设备 `log.tag` 全局被设成 `E` | 诊断前先 `setprop log.tag.<TAG> V`（如 `u2_sink_policy`、`bt_stack`、`bt_bta`、`btif_rc`），否则 INFO/WARN 全被吞 |

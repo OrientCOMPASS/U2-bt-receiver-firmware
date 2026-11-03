@@ -50,6 +50,21 @@
 #define BTA_DM_COD {0x24, 0x04, 0x14}
 #endif
 
+/* ---------------------------------------------------------------------------
+ * P1c：SBC sink caps 收敛到 48kHz-only（全局 48k 硬约束）
+ *
+ * A2DP 的能力集是位掩码，表达不了"优先"，采样率由 source 在我们的 caps 里挑。
+ * 原厂 caps 同时广告 48|44 → 手机/PC 通常挑 44.1k。只广告 48k 是唯一能真正拿到
+ * 48k 的办法（source 若坚持 44.1 会在 SET_CONFIG 阶段被拒，符合 A2DP 规范）。
+ *
+ * 实测记录见 WORKLOG.md（P1c 一节）。若某台 source 因此连不上：
+ *   1) 先记录机型/系统版本到 WORKLOG；
+ *   2) 把下面改成 FALSE 回退到 48|44，并在 WORKLOG 标注该机型走了回退。
+ * ------------------------------------------------------------------------- */
+#ifndef U2_SBC_SINK_48K_ONLY
+#define U2_SBC_SINK_48K_ONLY TRUE
+#endif
+
 /* 48kHz 优先的全局约束在 codec 协商与 AudioTrack 侧落实（P2/P3），
  * 这里先记录 source 侧默认值以便对照（原厂 AOSP 默认 44100）。 */
 #define BTIF_A2DP_SRC_SAMPLING_RATE 48000

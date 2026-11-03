@@ -81,9 +81,32 @@ const tA2D_SBC_CIE bta_av_co_sbc_caps =
 };
 
 /* SBC SINK codec capabilities */
+/* ---------------------------------------------------------------------------
+ * U2 P1c：48kHz 全链路硬约束。
+ *
+ * A2DP 的 caps 是**位掩码**，无法表达"优先 48k"——采样率完全由 source 侧在
+ * 我们广告的能力集里挑。原厂同时广告 48|44 时，手机/PC 通常挑 44.1kHz。
+ * 要真正拿到 48k，唯一办法是**只广告 48k**。
+ *
+ * 生效范围（都是 sink 侧）：
+ *   - AVDTP SEP caps：bta_av_co_audio_sink_getconfig() → A2D_BldSbcInfo(...&bta_av_co_sbc_sink_caps)
+ *   - SET_CONFIG 校验：bta_av_co_audio_sink_supports_config() → bta_av_sbc_cfg_in_cap()
+ *     （source 若坚持 44.1，会被拒绝；这符合规范：source 必须从 sink 的能力集里选）
+ *
+ * 回退开关：bld/bdroid_buildcfg/bdroid_buildcfg.h 里把 U2_SBC_SINK_48K_ONLY 置 FALSE
+ * 即可恢复 48|44（若某台 source 因此连不上，就记录到 WORKLOG 并走回退）。
+ * ------------------------------------------------------------------------- */
+#ifndef U2_SBC_SINK_48K_ONLY
+#define U2_SBC_SINK_48K_ONLY FALSE
+#endif
+
 const tA2D_SBC_CIE bta_av_co_sbc_sink_caps =
 {
+#if (U2_SBC_SINK_48K_ONLY == TRUE)
+    (A2D_SBC_IE_SAMP_FREQ_48), /* samp_freq —— 只广告 48kHz */
+#else
     (A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
+#endif
     (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
     (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
     (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */

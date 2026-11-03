@@ -375,3 +375,163 @@ R1 剩下的部分必须有第二台设备：手机扫描 → 应显示为**扬�
 风险预判：`BtifAvrcpAudioTrackCreate` 用了 `AUDIO_OUTPUT_FLAG_FAST`，44.1k 的 FAST track
 在 MTK 48k AudioFlinger 上可能 `initCheck()` 失败 → 表现为"连上但没声"，
 届时日志会有 `A2dpSink: Track creation fails!!!`；若如此，P1c 的 48k-only 正好一并解决。
+
+---
+
+## 2026-11-04 · 真机出声测试（Android + Windows）与 P1c
+
+### ★里程碑：SBC 出声成功（R1 前半达成）
+
+用户实测（P1b 版本 `84f09a4c…` 在机时）：
+
+| source | 识别身份 | 出声 | 音量 |
+|---|---|---|---|
+| Android 手机 | 扬声器 ✅ | **正常出声** ✅ | **可正常调节** ✅ |
+| Windows PC | 扬声器 ✅ | **正常出声** ✅ | **无效**（仅降到 0 时触发静音）❌ |
+
+这证明 P1a 的两个关键判断都成立：`-DUSE_AUDIO_TRACK` 把 PCM 出口切到 native AudioTrack 是对的，
+native 侧自授予 audio focus 也是必要的（否则解码定时器会一直丢帧）。
+
+### Windows 音量失效 —— 根因（源码级定位，未修，排入 P1d）
+
+`btif/src/btif_rc.c` 的 `handle_avk_rc_metamsg_cmd()`（AVK = A2DP **sink** 侧的 AVRCP 命令入口，
+即我们作为 **TG** 收到远端 **CT** 的命令）对两个关键 PDU **只打日志，然后转给 Java**：
+
+```c
+if (avrc_cmd.pdu == AVRC_PDU_REGISTER_NOTIFICATION) { BTIF_TRACE_EVENT("Register notification event_id: %s", ...); }
+else if (avrc_cmd.pdu == AVRC_PDU_SET_ABSOLUTE_VOLUME) { BTIF_TRACE_EVENT("Abs Volume Cmd Recvd"); }
+btif_rc_ctrl_upstreams_rsp_cmd(avrc_cmd.pdu, &avrc_cmd, pmeta_msg->label);
+   → HAL_CBACK(bt_rc_ctrl_callbacks, setabsvol_cmd_cb / registernotification_absvol_cb, ...)
+```
+
+`bt_rc_ctrl_callbacks` 是 Java **AvrcpControllerService** 的回调，我们没有它（HAL_CBACK 有 NULL 保护）
+→ **命令被静默丢弃**：既没把音量应用到 AudioTrack（缺 `btif_a2dp_set_audio_track_gain()`），
+也没给 `RegisterNotification(VOLUME_CHANGED)` 回 interim response。
+
+配合 `bta/av/bta_av_main.c:557-566`（sink 注册时 TG 记录**明确用 AVRC_REV_1_4**，
+注释写着 "Initialize AVRCP1.4 to provide Absolute Volume control"）就能解释两端差异：
+
+- **Android**：注册通知拿不到 interim response → 判定绝对音量不可用 → **退回软件音量**
+  （在编码前缩放 PCM）→ 听感正常 ✅
+- **Windows**：不做软件缩放，只认绝对音量；我们不应答 → 滑块无效，只有 0 时静音 ❌
+
+**P1d 修复方案**（纯 native，不依赖 Java）：在我们的策略层实现 TG 侧绝对音量：
+① `RegisterNotification(VOLUME_CHANGED)` 回 interim（当前音量 0–127）并保持事务不释放，
+后续音量变化再发 changed；② `SetAbsoluteVolume` → `btif_a2dp_set_audio_track_gain(vol/127.0f)`
++ 回 accept；③ 本地音量变化时主动发 changed 通知，让手机 UI 同步。
+
+### 顺带解释：COD 为什么会从 0x240414 变成 0x340414
+
+`bta/av/bta_av_main.c:568-575`：Fluoride 在注册 AV 通道时**按角色自动或上服务类位**
+（SOURCE→`BTM_COD_SERVICE_CAPTURING`，SINK→`BTM_COD_SERVICE_RENDERING`），
+多出来的 Object Transfer 位来自 APK 启用的 MAP（Message Access Server）。
+主类/次类（Audio/Video · Loudspeaker）不受影响，属外观差异。
+
+### 需求修订（用户本轮明确）
+
+1. **R1 身份修订**：用户期望的不是"扬声器"，而是**"有麦克风的耳机"**，且要**真 HFP**
+   （能接打电话 + 真麦克风上行），不是只改图标。
+   → 新增阶段 **P1f：HFP HF + SCO 音频路由**（r36 有 `btif/src/btif_hf_client.c` = HF 角色，
+   native 侧可走与 A2DP sink 同样的"抢槽位 + 置 service 位"套路：
+   `BTA_HFP_HS_SERVICE_ID` → `btif_hf_client_execute_service(TRUE)`）。
+   COD 届时改为 headset 类（提案 `0x2C0404` = Audio/Video · Wearable Headset ·
+   Rendering+Capturing+Audio），并实测手机/PC 的识别结果。
+   注意 SCO 语音是 8k(CVSD)/16k(mSBC)，与 48k 音乐链路共存，需要显式的音频通路切换设计。
+2. **AVRCP 方向修订**：使用场景是**线控插在 U2 上**（耳机线控/有线控制器），
+   由 U2 去控制**手机/PC 侧**的播放暂停 —— 即 U2 是 AVRCP **CT**（发 passthrough），
+   不是我先前假设的"手机控制 U2"。
+   → 新增阶段 **P1e：本地线控 → AVRCP CT passthrough**。
+   r36 native 侧已有 CT 接口（`bt_rc_ctrl_interface.pass_through_cmd`），
+   我们要做的是把 U2 的耳机按键（`KEY_HEADSETHOOK` / `KEY_PLAYPAUSE` / `KEY_NEXTSONG` …）
+   从 `/dev/input/eventX` 读出来并映射成 passthrough opcode。
+   音量键则本地调 AudioTrack 增益，并按 P1d 的机制回发 VOLUME_CHANGED 通知保持手机 UI 同步。
+
+### P1c：SBC sink caps 收敛到 48k-only（已构建 + 已刷入，待真机确认）
+
+A2DP 的 caps 是**位掩码**，表达不了"优先 48k"——采样率完全由 source 在我们的能力集里挑。
+原厂 sink caps 同时广告 `48|44`，手机/PC 通常挑 44.1k。**只广告 48k 是唯一能真正拿到 48k 的办法。**
+
+改动（单变量，带回退开关）：
+
+| 文件 | 改动 |
+|---|---|
+| `src/btif/co/bta_av_co.c` | `bta_av_co_sbc_sink_caps.samp_freq` 由 `48\|44` 改为 `#if (U2_SBC_SINK_48K_ONLY == TRUE)` 时只留 `A2D_SBC_IE_SAMP_FREQ_48` |
+| `bld/bdroid_buildcfg/bdroid_buildcfg.h` | `#define U2_SBC_SINK_48K_ONLY TRUE`（置 FALSE 即回退到 48\|44） |
+
+同时影响两处（都是 sink 侧，语义一致）：AVDTP SEP caps
+（`bta_av_co_audio_sink_getconfig()` → `A2D_BldSbcInfo`）与 SET_CONFIG 校验
+（`bta_av_co_audio_sink_supports_config()` → `bta_av_sbc_cfg_in_cap()`）。
+source 若坚持 44.1 会在 SET_CONFIG 阶段被拒 —— 符合 A2DP 规范（source 必须从 sink 能力集里选）。
+
+**字节级验证**（用符号地址直接 dump `.rodata`，不靠猜字节模式）：
+
+```
+bta_av_co_sbc_sink_caps @0x1a75ee : 10 0f f0 0c 03 fa 02
+   samp_freq = 0x10 = A2D_SBC_IE_SAMP_FREQ_48 仅 48k   ← 改前是 0x30 (48|44)
+   ch_mode=0x0f(MONO|DUAL|STEREO|JOINT) block=0xf0(4|8|12|16) subband=0x0c(4|8)
+   alloc=0x03(SNR|LOUDNESS) bitpool=2..250
+bta_av_co_sbc_caps(SRC) @0x1a75e7 : 20 01 10 04 01 35 02   ← 未改动（44 only）
+bta_dm_cfg             @0x1a6164 : 24 04 14 00 0f 00 00 20 40 1f 01   ← COD 0x240414 仍在
+```
+
+构建 md5 `bd7bcef2c0239b75dd917f78226baff0`（1768488 B），符号审计 229 UND / 0 未解析，
+DT_NEEDED 未变。已原子刷入（原厂备份门控通过），**STATE_ON、`/data/tombstones` total 0**。
+
+⚠️ 真机验证前必须做：**Android 与 Windows 都要"忘记设备 → 重新配对"**
+（两端都会缓存 codec 偏好，见 docs/03 §7）。Windows 还需 bthserv 重启 + PnP Disable/Enable，
+实测常要 2–3 轮。验收判据：我方 `audio_config_cb` 日志报 `sample_rate=48000`，
+且 snoop 里 AVDTP SET_CONFIG 的 SBC 参数为 48kHz。
+
+### 本轮新入册的坑
+- **adb 会掉线**：测试过程中 U2 从 adb 掉了一次（PnP 里 `VID_0E8D&PID_2008` 状态变 Unknown，
+  `adb devices` 空列表），root executor 脚本因此全部失败并报 `NO_OUTPUT_FILE`。
+  对策：跑长流程前先 `adb devices` 探活；掉线时请用户重插 USB / 确认 USB 模式不是"仅充电"。
+  **绝不用 `adb kill-server` 试图恢复**（会卡死远端代理，见 docs/04 A1）。
+- 猜字节模式不可靠：`tA2D_SBC_CIE` 各位段的 bit 位置与直觉相反
+  （ch_mode 是 b3..b0 而非 b7..b4），扫二进制会 0 命中。
+  → 一律用 `llvm-nm` 取符号 vaddr + `llvm-readelf -S` 算 file offset 后直接 dump。
+
+### P1e / P1f 前置探测（不刷机，只取事实）
+
+设备回到 adb 后，写了两个只读探测脚本（`scripts/device/p1e_probe_input.sh`、
+`scripts/device/p1f_probe_audio.sh`），一次性拿到 P1e（线控）与 P1f（HFP 音频）所需的全部平台事实：
+
+**① 线控输入设备 = `/dev/input/event0`，name `ACCDET`**（MTK accessory-detect 驱动）
+
+```
+B: EV=3 (SYN|KEY)   KEY (0001): 0072 0073 00a4 0246
+   114 KEY_VOLUMEDOWN / 115 KEY_VOLUMEUP / 164 KEY_PLAYPAUSE / 582 KEY_VOICECOMMAND
+/sys/class/switch/h2w/state = 0   （0 无配件 / 1 带麦耳机 / 2 无麦耳机）
+```
+
+**注意**：ACCDET **不上报** `KEY_NEXTSONG`/`KEY_PREVIOUSSONG`/`KEY_HEADSETHOOK`。
+线控的"切歌"要靠 MTK accdet 对**单击/双击/长按**的时序翻译（最终落到上面 4 个 code），
+所以 P1e 第一步必须是插着线控跑 `getevent -lt /dev/input/event0` 抓原始事件序列，
+按实测时序写映射表 —— 不能照抄别的平台的按键码。
+
+**② 音频平台（P1f 的 SCO 通路判定，结论：F1 平台 PCM 路由有戏）**
+
+声卡 `mt-snd-card` 里存在 BT SCO 专用 PCM DAI：
+`00-10 Voice_MD1_BT_Playback`、`00-11 VOIP_Call_BT_Playback`、`00-12 VOIP_Call_BT_Capture`、
+`00-09 DL1_AWB_Record`、`00-16 I2S0AWB_Capture`（AWB=16k 宽带，对应 mSBC）、`00-04 ULDL_Loopback`。
+→ BT 芯片与音频 DSP 之间有 **PCM 硬连线**，SCO 由**平台**路由，
+这解释了为什么 r36 的 `BTM_CreateSco()` 不带 route 参数、
+`btif_hf_client.c:888-897` 只把 `AUDIO_OPEN/MSBC_OPEN` 事件转给 Java（`audio_state_cb` → AudioManager）。
+
+`/vendor/etc/audio_policy.conf`：
+- primary output `sampling_rates 44100|48000`，devices 含 `AUDIO_DEVICE_OUT_ALL_SCO`
+  → **AudioTrack 48k 有 HAL 支持**，48k 硬约束在输出侧成立（不会被迫降到 44.1）
+- primary input `8000|16000|32000|44100|48000`，devices 含 `AUDIO_DEVICE_IN_ALL_SCO` /
+  `IN_COMMUNICATION` / `IN_VOICE_CALL`，channel_masks 含 `VOICE_UPLINK|VOICE_DNLINK`
+  → **麦克风采集在 HAL 层存在**（R1′ 真麦克风有物理基础）
+- a2dp 模块还声明了 input `AUDIO_DEVICE_IN_BLUETOOTH_A2DP`（44100 stereo）
+  → 再次印证 P0 结论：MTK 固件本来就带 sink 能力，只是 Java 层没启用
+- `attached_input_devices` 里**没有** SCO → SCO 输入必须运行时声明
+  （`AudioSystem::setDeviceConnectionState(AUDIO_DEVICE_IN_ALL_SCO, AVAILABLE, …)`，
+  等价于 Java 侧 `AudioManager.startBluetoothSco()` 的底层动作，可在 native 直接做）
+- `tinymix` 不存在（exit 127）→ 不能命令行改 mixer，只能走 audio HAL / AudioSystem API
+
+**③ 顺带确认**：在机 `bluetooth.default.so` md5 = `bd7bcef2c0239b75dd917f78226baff0`，
+与 `/data/local/tmp/bt_want.txt` 一致（P1c 仍在机上，未被回滚）。
+
+设计结论已写入 `docs/05` §3.8（P1c）/§3.9（AVRCP 双向）/§3.10（HFP 分层可行性 + F1′ 推荐路径）。

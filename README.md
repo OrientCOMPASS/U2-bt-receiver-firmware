@@ -15,7 +15,11 @@
 | **P0** | 干净 AOSP `bluetooth.default.so` 可构建 / 可原子刷入 / BT 起得来 | ✅ **达成**（Release `p0-baseline-build-flash-20261104`） |
 | **P1a** | `-DUSE_AUDIO_TRACK` + native 主动启用 A2DP SINK service | ✅ **已刷入验证**（STATE_ON，零 tombstone） |
 | **P1b** | 扬声器身份 COD 0x240414 + 常驻可发现（HCI 层实证） | ✅ **已刷入验证** |
-| P1c/P1d | SBC 48k 收敛 + 真机出声 + AVRCP 播放/暂停/音量 | ⏳ 进行中 |
+| — | **★ 真机出声**：Android 手机 + Windows PC 均以 SBC 正常播放 | ✅ **达成**（Android 音量正常；Windows 音量失效 → P1d） |
+| **P1c** | SBC sink caps 收敛到 **48k-only**（`U2_SBC_SINK_48K_ONLY`） | ✅ 已刷入 `bd7bcef2…` + 字节级取证；⏳ 待重配对后确认协商到 48000 |
+| **P1d** | AVRCP **TG** 绝对音量（修 Windows 音量） | ⏳ 根因已定位（`handle_avk_rc_metamsg_cmd` 只转发给 NULL 的 Java 回调） |
+| **P1e** | AVRCP **CT**：U2 上的线控 → 控制手机/PC 播放 | ⏳ 待做（`pass_through_cmd` + `/dev/input/eventX`） |
+| **P1f** | **HFP HF**：真麦克风 + 通话音频；身份改为"带麦克风的耳机" | ⏳ 待做（信令层机制已确认可行；SCO 音频通路需先做 F1/F2 判定实验，见 docs/05 §3.10） |
 | P2 | AAC（fdk-aac，LATM） | ⏳ |
 | P3 | LDAC（libldac 2.0.72 全源码静态链接） | ⏳ |
 | P4 | 一拖二（2 台手机、单路活跃流、切换 ≤1s、24h） | ⏳ |
