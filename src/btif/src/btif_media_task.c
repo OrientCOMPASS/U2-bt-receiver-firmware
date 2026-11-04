@@ -117,7 +117,9 @@ enum
     BTIF_MEDIA_AUDIO_RECEIVING_INIT,
     BTIF_MEDIA_AUDIO_SINK_CFG_UPDATE,
     BTIF_MEDIA_AUDIO_SINK_CLEAR_TRACK,
-    BTIF_MEDIA_AUDIO_SINK_SET_FOCUS_STATE
+    BTIF_MEDIA_AUDIO_SINK_SET_FOCUS_STATE,
+    /* U2（P1d2）：追加在末尾，避免改动既有枚举值 */
+    BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN
 };
 
 enum {
@@ -487,6 +489,7 @@ UNUSED_ATTR static const char *dump_media_event(UINT16 event)
         CASE_RETURN_STR(BTIF_MEDIA_AUDIO_SINK_CFG_UPDATE)
         CASE_RETURN_STR(BTIF_MEDIA_AUDIO_SINK_CLEAR_TRACK)
         CASE_RETURN_STR(BTIF_MEDIA_AUDIO_SINK_SET_FOCUS_STATE)
+        CASE_RETURN_STR(BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN)
 
         default:
             return "UNKNOWN MEDIA EVENT";
@@ -1299,8 +1302,27 @@ void btif_a2dp_set_audio_focus_state(btif_media_audio_focus_state state)
 
 void btif_a2dp_set_audio_track_gain(float gain)
 {
-    APPL_TRACE_DEBUG("%s set gain to %f", __func__, gain);
-    BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain);
+    /* U2（P1d2）：改为投递到 media task 执行。
+     *
+     * 原版实现是 BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain) —— 直接在
+     * **调用者线程**（AVRCP 命令 = btif task；Java update_audio_track_gain = binder 线程）
+     * 解引用 audio_track，而该指针的创建/销毁/置 NULL 全在 media task
+     * （decoder_reset / BTIF_MEDIA_AUDIO_SINK_CLEAR_TRACK）。二者无锁并发 →
+     * track 关闭窗口内的调用就是 use-after-free（SIGSEGV tombstone）。
+     * 绝对音量路径让这条本来很冷的通道变成了"每次拖滑块都走一次"，
+     * 竞态命中率随之上升，所以在这一阶段一并修掉（R5：72h 零 tombstone）。
+     *
+     * 分配语义与 focus state 那条完全一致：osi_malloc() 内部 assert(ptr)，
+     * 失败即 abort（AOSP 语义），不存在"分配失败后继续跑"的路径，
+     * 因此无需额外的 NULL 处理；消息由 media task 处理后 osi_free()。 */
+    tBTIF_MEDIA_SINK_TRACK_GAIN *p_buf =
+        osi_malloc(sizeof(tBTIF_MEDIA_SINK_TRACK_GAIN));
+
+    APPL_TRACE_DEBUG("%s set gain to %f (posted to media task)", __func__, gain);
+
+    p_buf->gain = gain;
+    p_buf->hdr.event = BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN;
+    fixed_queue_enqueue(btif_media_cmd_msg_queue, p_buf);
 }
 #endif
 
@@ -1514,6 +1536,16 @@ static void btif_media_thread_handle_cmd(fixed_queue_t *queue, UNUSED_ATTR void 
             break;
         btif_media_cb.rx_audio_focus_state = ((tBTIF_MEDIA_SINK_FOCUS_UPDATE *)p_msg)->focus_state;
         APPL_TRACE_DEBUG("Setting focus state to %d ",btif_media_cb.rx_audio_focus_state);
+        break;
+    case BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN:
+        /* U2（P1d2）：AVRCP 绝对音量落地点。运行在 media task —— 与
+         * audio_track 的创建/销毁同线程，因此这里的解引用没有竞态。
+         * 刻意**不加** btif_av_is_connected() 门禁：track 已建好但 AV 状态机
+         * 尚未标记 connected 的窗口里也要能落增益；audio_track==NULL 时
+         * BtifAvrcpSetAudioTrackGain() 内部会安全返回（策略层保存的值
+         * 由 u2_sink_policy_rc_on_track_created() 在 track 建好后重放）。 */
+        BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track,
+                                   ((tBTIF_MEDIA_SINK_TRACK_GAIN *)p_msg)->gain);
         break;
 #endif
     case BTIF_MEDIA_AUDIO_SINK_CFG_UPDATE:

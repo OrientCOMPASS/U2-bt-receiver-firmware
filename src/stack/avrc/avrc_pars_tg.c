@@ -337,6 +337,18 @@ static tAVRC_STS avrc_pars_vendor_cmd(tAVRC_MSG_VENDOR *p_msg, tAVRC_COMMAND *p_
     {
         if(len!=1)
             status = AVRC_STS_INTERNAL_ERR;
+        else
+        {
+            /* U2 修正（P1d2）：r36 原版这里**只校验长度、不取操作数**，
+             * 于是 TG 侧解析出来的 p_result->volume.volume 永远是调用者初值（0）。
+             * 后果：任何按规范实现的 sink 都会把 SetAbsoluteVolume 当成"音量设为 0"，
+             * 表现为"拖一下滑块就静音"。真机 snoop 已证明 Windows 确实在每次拖动时
+             * 下发本 PDU（见 WORKLOG 2026-11-04 P1d2）。
+             * 修法与本文件 AVRC_Ctrl_ParsCommand() 里的同名分支保持一致：
+             * 读出字节并用 AVRC_MAX_VOLUME(0x7F) 掩掉保留位 bit7（防对端脏数据）。 */
+            BE_STREAM_TO_UINT8 (p_result->volume.volume, p);
+            p_result->volume.volume = AVRC_MAX_VOLUME & p_result->volume.volume;
+        }
         break;
     }
 

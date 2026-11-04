@@ -845,3 +845,183 @@ logcat 里出现 `u2_sink_rc_metamsg_cmd: SetAbsoluteVolume` + `rc gain: abs_vol
 - **改 caps 后"连不上"却没有任何错误日志**：source 在 GET_CAPABILITIES 之后自行放弃，
   不发 SET_CONFIG、不报错、随后断开（HCI reason=0x13）。判据只有 snoop 里有没有
   `SET_CONFIGURATION`（用 `parse_snoop.py --avdtp` 看两端采样率交集）。
+
+---
+
+## 2026-11-04（P1d2）· Windows 音量滑块修好了：根因不是"对端不发命令"，而是我们在**第一支**里把它 REJECT 了
+
+### 结论先行（一句话）
+
+P1d 的假设（"两个 Java 回调都是 NULL → 命中第三支 → 命令被丢弃"）**被真机 snoop 推翻**：
+本机 `AvrcpTargetService` 是起来的（`bt_rc_callbacks != NULL`），命令走**第一支**
+`handle_rc_metamsg_cmd()` → `btif_rc_upstreams_evt()`，而后者**没有 `SET_ABSOLUTE_VOLUME` 的 case**，
+落到 `default: send_reject_response(AVRC_STS_BAD_CMD)`。P1d 新加的第三支是**死代码**。
+修点因此必须在第一支内部截获 —— 改完 **22/22 条 SetAbsoluteVolume 全部 ACCEPTED、
+增益实测落到 AudioFlinger 的 track 上（−0.71 dB ↔ gain 0.921 精确吻合）、零 tombstone**。
+
+### 取证：17.6MB snoop 逐帧说话（`tools/dev/parse_snoop.py --avrcp`，P1d 版固件）
+
+| 记录 | 方向 | 内容 | 判定 |
+|---|---|---|---|
+| `[486]` | rx CMD | `GET_CAPABILITIES cap=EVENTS_SUPPORTED` | Windows 在探测能力 |
+| `[487]` | tx RSP | `IMPL_STABLE … events=['0xd']` | ✅ 我们如实广告了 EVENT_VOLUME_CHANGED（BTA 层就地应答，`bta_avk_cfg`） |
+| `[496]` | rx CMD | `REGISTER_NOTIFICATION event=VOLUME_CHANGED` | ❌ **我们一个字节都没回**（应回 INTERIM） |
+| `[786][833][879][925][972][1018]` | tx RSP | **`REJECTED SET_ABSOLUTE_VOLUME`** ×6 | ❌ 一次拖动一条拒绝 = 滑块完全无效 |
+| `[516][6145]` | tx CMD | 我们自己发 `REGISTER_NOTIFICATION` | 来自 `handle_rc_features()` 的 `register_volumechange()`（CT 身份） |
+| `[6150][524]` | rx RSP | `REJECTED`（回给我们自己） | Windows 不接受我们当 CT 注册音量；无害噪声 |
+| `[7337]` | rx CMD | nubia 手机也注册 `VOLUME_CHANGED` | 同样没回 → 手机回退软件音量（所以听感一直"正常"） |
+
+对端**确实在发**绝对音量命令，且发的音量值各不相同（70 / 110 / 15 / 0 / 1）—— 这直接排除了
+"Windows 不发命令"和"重配对能解决"两种猜测，也说明**不需要**再动 caps 或 SDP。
+
+### 顺带挖出的 r36 上游 bug（不修就是"一拖滑块就静音"）
+
+`src/stack/avrc/avrc_pars_tg.c` 的 `avrc_pars_vendor_cmd()`：
+
+```c
+case AVRC_PDU_SET_ABSOLUTE_VOLUME:
+{
+    if(len!=1)
+        status = AVRC_STS_INTERNAL_ERR;
+    break;          /* ← 只校验长度，从不 BE_STREAM_TO_UINT8 取音量字节 */
+}
+```
+
+TG 侧解析出来的 `p_result->volume.volume` 永远是调用者的初值（`{0}` → 0）。
+也就是说：**即使正确拦截并 ACCEPT，音量也会被设成 0**。同文件的
+`AVRC_Ctrl_ParsCommand()`（CT 侧）反而是对的 —— 照它的写法补上取值 + `AVRC_MAX_VOLUME` 掩码即可。
+真机复核：修好后 ACCEPTED 响应里的音量与对端命令**逐条相同**（60/57/62/66/…/127），
+若 bug 还在则全是 0。
+
+### 实现（4 个文件）
+
+| 文件 | 改动 |
+|---|---|
+| `src/stack/avrc/avrc_pars_tg.c` | 补 `SET_ABSOLUTE_VOLUME` 的音量字节解析 + `AVRC_MAX_VOLUME` 掩码（上游 bug） |
+| `src/btif/src/btif_rc.c` | 新增共享函数 `u2_sink_rc_take_metamsg_cmd(pmeta_msg, pavrc_cmd)`（入参是**已解析**的 `tAVRC_COMMAND`，返回 TRUE=已就地应答）；在**第一支** `handle_rc_metamsg_cmd()` 解析成功后调用它，命中即 `return`（**绝不再上报 Java**，否则同一 label 被应答两次）；第三支 `u2_sink_rc_metamsg_cmd()` 重构成"解析 → 调共享函数 → 否则 reject(BAD_CMD)"；**删除** P1d 对 `rc_vol_label` / `rc_volume` 的写入 |
+| `src/btif/include/btif_media.h` | 新增 `tBTIF_MEDIA_SINK_TRACK_GAIN` 与枚举 `BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN`（追加在末尾，不动既有值） |
+| `src/btif/src/btif_media_task.c` | `btif_a2dp_set_audio_track_gain()` 改为**投递到 media task**，handler 里才调 `BtifAvrcpSetAudioTrackGain()` |
+
+**为什么删 `rc_vol_label` / `rc_volume`**：这两个字段属于 **CT** 侧机制 ——
+`handle_rc_features()` 会拿 `rc_vol_label` 判断"是否已在注册音量变化"并 `get_transaction_by_lbl()`，
+`handle_avk_rc_metamsg_rsp()` 还会用它 `release_transaction()`。TG 侧写它们 = 跨角色串扰
+（可能释放错事务）。TG 侧真正需要的簿记只有 `rc_notif[AVRC_EVT_VOLUME_CHANGE-1].{bNotify,label}`
+（`send_metamsg_rsp()` 发 CHANGED 时依赖它）。
+
+**为什么把增益改成投递到 media task**：原版在**调用者线程**（AVRCP=btif task、
+Java `update_audio_track_gain()`=binder 线程）直接解引用 `btif_media_cb.audio_track`，
+而该指针的创建/销毁/置 NULL 全在 media task（`decoder_reset` / `CLEAR_TRACK`）。
+无锁并发 → track 关闭窗口内的调用就是 use-after-free（SIGSEGV tombstone）。
+绝对音量让这条本来很冷的路径变成"每拖一次滑块就走一次"，命中率上升；R5 要求 72h 零 tombstone，
+所以在本阶段一并修掉。消息由 media task 处理后 `osi_free()`（`btif_media_task.c:1568` 已有），不泄漏。
+
+### 对照 Microsoft 官方要求（learn.microsoft.com · Bluetooth Classic audio accessories · AVRCP – Volume）
+
+| 官方条款 | 我们的状态 |
+|---|---|
+| Shall implement the Absolute Volume feature for the **TG** role | ✅ 本轮修好 |
+| **Shall adjust audible speaker volume when receiving SetAbsoluteVolume** | ✅ gain=vol/127 → AudioTrack，AudioFlinger 实测生效 |
+| **Shall fully mute the speaker when the AVRCP volume is 0** | ✅ 线性映射，vol=0 → `setVolume(0)` |
+| Shall properly support receiving the GetCapabilities PDU（检查 EVENT_VOLUME_CHANGED） | ✅ BTA 层就地应答 `events=[0x0d]`（snoop 实证） |
+| Shall complete the Volume Change Notification when the volume changes **locally** | ⚠️ **暂缺**：本机无本机音量 UI（硬件音量键改的是 AudioFlinger stream volume，我们观测不到）。簿记已就位，P1e 线控接入时补 |
+| When Windows changes volume remotely with SetAbsoluteVolume, **shall NOT** complete the Volume Change Notification（AVRCP 1.6.2 §6.13.3） | ✅ 刻意不回 CHANGED；snoop 实测 `ctype=CHANGED` **0 条** |
+| Shall implement AVRCP 1.6.2+；SDP 里 TG 记录 Should 支持 Category 2 | ⚠️ r36 是 1.4 世代、SDP 未声明 Category 2（浏览）。Windows 实测不因此拒连/拒用绝对音量，暂不动（避免又一轮重配对） |
+
+### 构建 / 刷入
+
+| 项 | 值 |
+|---|---|
+| 构建 | `mk2plan.py` + `build_bt.py --force --jobs 2`，313 obj，**0 error / 0 warning**；符号审计 229 UND / **0 未解析** |
+| 产物 md5 | **`ced7ee9dd15428c9c3ce4c8f6dba030b`**（1 772 608 B） |
+| 刷入 | 原子（cp→`.bt_swap.tmp`→mv→sync）+ md5 门控 + 备份校验（`e0dd373e…` 在位）；`adb reboot` |
+| 重启后 | `boot_completed=1`、`bluetooth_on=1`、BT pid 1554、**`/data/tombstones` total 0** |
+| 环境 | `/tmp` 又被清空 → `setup_env.sh --all` 重建；`/tmp/devlibs` 用软链指回工作区 `devlibs/`（50 个设备库快照） |
+
+### 验收证据（三层，全部客观）
+
+**① 协议层（snoop，24.7MB → `--avrcp --vol-only`）**
+
+```
+[314] rx CMD  GET_CAPABILITIES cap=EVENTS_SUPPORTED
+[322] tx RSP  IMPL_STABLE events=['0xd']
+[330] rx CMD  REGISTER_NOTIFICATION event=VOLUME_CHANGED          ← Windows 注册
+[331] tx RSP  INTERIM   REGISTER_NOTIFICATION event=VOLUME_CHANGED ← ✅ 我们回 INTERIM 了
+[653] rx CMD  SET_ABSOLUTE_VOLUME volume=60/127
+[654] tx RSP  ACCEPTED  SET_ABSOLUTE_VOLUME volume=60/127          ← ✅ 不再是 REJECTED
+… 共 22 组 rx CMD / tx ACCEPTED，音量值逐条相同 …
+统计：rx SET_ABS=22  tx ACCEPTED=22  tx REJECTED=0  ctype=CHANGED=0  INTERIM=1
+```
+
+**② 应用层（logcat `u2_sink_policy`，42 次设置全部落地）**
+
+```
+SetAbsoluteVolume: abs_vol=124/127 (第 35 次)
+rc gain: abs_vol=124/127 → AudioTrack gain=0.976 (set_abs_vol)
+… 124→122→119→117→114→112（音量键 ↓）再 114→117→119→122→124→127（↑）
+rc gain: 对端尚未下发音量，保持默认（track_created）   ← 开流前的重放路径也验证到了
+```
+
+**③ 音频层（`dumpsys media.audio_flinger` 的 Tracks 表 —— 最硬的证据）**
+
+```
+Name Active Client Type      Fmt Chn mask Session fCount S F SRate  L dB  R dB
+   1    yes   1554    3 00000001 00000003       9   4096 A 3 44100 -0.71 -0.71
+```
+
+`Client 1554` = com.android.bluetooth，`SRate 44100`（Windows 给的 SBC 44.1k），
+`10^(-0.71/20) = 0.9216` ≈ 最后一条 **gain=0.921（abs_vol=117）** —— 精确吻合，
+说明增益穿过 media task 投递真的写进了 AudioTrack。
+（AVDTP 侧同一份 snoop：`DISCOVER → SEID=1 media=audio tsep=SNK`、`GET_CAPABILITIES`、
+`SET_CONFIGURATION RSP`、`OPEN`、`START`，media RTP 13 744 帧 / 13.26MB 已折叠。）
+
+反面证据：`grep -e "Sending error notification" -e "Neither CTRL" -e "drop meta commands"` **全空**；
+canary 自检段**全空**；tombstones **0**。
+
+### 自动化的 Windows 侧刺激（`scripts/windows/p1d2_vol_test.ps1`）
+
+验收不靠人耳：脚本循环播放系统 wav 拉起 A2DP 流，再用 `user32!keybd_event` 注入
+`VK_VOLUME_DOWN(0xAE)` / `VK_VOLUME_UP(0xAF)`，Windows 便对默认端点下发 SetAbsoluteVolume。
+配套 `scripts/device/p1d2_verify.sh`（取证）与 `scripts/device/p1d2_logprops.sh`（先开阈值再刺激）。
+
+### 工具修复：`parse_snoop.py` 的 CID 映射（本轮新挖，会误导后续所有阶段）
+
+修 P1d2 时发现解出的 AVCTP **只有 tx、没有 rx**。两个真 bug：
+
+1. **CID 是"目的 CID"，同一数值在两个方向属于不同命名空间**。本机实例：
+   `[288] tx ConnRsp dcid=0x0043`（我方 AVCTP 本地 CID）与 `[309] rx ConnRsp dcid=0x0043`
+   （对端 SDP 本地 CID）撞号 → 扁平 `cid2psm` 被 SDP 覆盖 → 所有 rx AVCTP 帧被当 SDP 丢掉。
+2. **CID 会跨时间复用**，而映射是预扫描建的 → 后学到的映射被套到更早的帧上
+   （`[163]` 的 SDP 响应被解成 `AVDTP tx SIG 0x00 RSP`）。
+
+修法：`l2cap_cid_maps()` 返回**按方向分开的两张表** `in_map`(rx) / `out_map`(tx)，
+值带 `learned_idx`，只在 `rec.idx >= learned_idx` 时生效；AVDTP 侧再把
+**media 通道与 signaling 通道共用 PSM 0x19** 的 RTP 包（首字节 version=2）折叠成一行统计。
+`avdtp_decode` 与 `avrcp_decode` 共用该函数。回归：旧的 `sn_big.bin` 仍如实解出 6 条 REJECTED
+（且现在能看到对应的 rx CMD 音量值 70/110/15/0/1），新 snoop 解出 22 rx + 22 ACCEPTED。
+
+### 本轮新入册的坑（docs/04：A7/A8/A9、F8/F9/F10）
+
+- **A7** `.ps1` 必须 **UTF-8 with BOM**：无 BOM 时 PS 5.1 按 GBK 解码，中文标点的尾字节会吃掉
+  紧随的 ASCII 引号 → "字符串缺少终止符" + 一堆倒挂的 `Missing closing '}'`。
+- **A8** `Stop-Service bthserv` 会卡 `StopPending` 并把整条远控命令拖到超时；恢复办法是
+  `Start-Service bthserv`。★**绝不能 kill 它的宿主 svchost**：本机它与 **nsi**（断网=断桥接）、
+  CDPSvc、FontCache 同宿主。
+- **A9** 设备重启后 `adb devices` = `offline`，`adb reconnect offline` 反而清空列表 →
+  `Disable-PnpDevice`/`Enable-PnpDevice` 那个 `VID_0E8D&PID_201D&MI_01` 的 **ADB Interface** 节点即恢复。
+- **F8** `BTIF_TRACE_*` / `APPL_TRACE_*` **不看 `log.tag`**，看运行时 `btif_trace_level` /
+  `appl_trace_level`（默认只到 ERROR）。所以本轮 btif 层日志一条都没有，
+  改用自有 `LOG_INFO` + F9 的 audio_flinger 手段取证。
+- **F9** `dumpsys media.audio_flinger` 的 Tracks 表 `L dB/R dB` 是验证 `AudioTrack::setVolume()`
+  是否真生效的客观手段（−0.71 dB ↔ 0.9216）。
+- **F10** snoop 解码器的 CID 映射必须按方向分表 + 带 learned_idx（见上）。
+
+### 已知缺口 / 下一步
+
+1. **手机端待验**：Android source 拿到 INTERIM 后可能从"软件音量"切到"绝对音量"，
+   需要用 nubia 手机实测（连上 → 放歌 → 按手机音量键，确认 U2 实际响度跟着变、且不双重衰减）。
+   Windows 侧已由 ①②③ 三层证据证明；人耳确认待用户复核。
+2. **CHANGED 上报缺失**（见上表）：等 P1e 线控音量接入时补，届时本机音量变化要通知对端。
+3. 我们自己以 CT 身份发的 `REGISTER_NOTIFICATION`（`[329]`）总被 Windows REJECTED（`[333]`）——
+   无害噪声，但可以在 `u2_sink_policy_rc_enabled()` 时抑制 `register_volumechange()`（P1e 一并考虑，
+   因为 P1e 才真正需要我们当 CT）。
+4. 路线图不变：**P1e 线控（CT passthrough）→ P1f HFP → P2 AAC → P3 LDAC → P4 multipoint → P5 soak**。

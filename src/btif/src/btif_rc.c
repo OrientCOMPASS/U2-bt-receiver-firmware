@@ -895,6 +895,155 @@ void handle_uid_changed_notification(tBTA_AV_META_MSG *pmeta_msg, tAVRC_COMMAND 
 }
 
 /***************************************************************************
+**
+** Function         u2_sink_rc_take_metamsg_cmd      （P1d2，本项目自有代码）
+**
+** Description      U2 native A2DP SINK 的**绝对音量截获点**（AVRCP TG 角色）。
+**
+**                  只消费两条 PDU，其余一律返回 FALSE 交回调用者按原厂语义处理：
+**                    AVRC_PDU_SET_ABSOLUTE_VOLUME                     → 落增益 + ACCEPT
+**                    AVRC_PDU_REGISTER_NOTIFICATION(VOLUME_CHANGED)   → INTERIM(当前音量)
+**
+**                  ── 为什么必须"截获"而不是"新增一条派发分支"（真机取证）──
+**                  P1d 在 btif_rc_handler 的 BTA_AV_META_MSG_EVT 里加了第三支，
+**                  但真机 logcat 显示 Java AvrcpTargetService 是**起来了**的
+**                  （`get_profile_interface avrcp`），于是 bt_rc_callbacks != NULL，
+**                  命令永远走**第一支** handle_rc_metamsg_cmd() → btif_rc_upstreams_evt()，
+**                  而后者没有 AVRC_PDU_SET_ABSOLUTE_VOLUME 的 case，落到
+**                  `default: send_reject_response(..., AVRC_STS_BAD_CMD)`。
+**                  17.6MB snoop（Windows 拖动音量滑块）逐帧实锤：
+**                    [486] rx GET_CAPABILITIES(EVENTS) → [487] tx events=[0x0d] ✔ 已广告
+**                    [496] rx REGISTER_NOTIFICATION(VOLUME_CHANGED) → **我们没有任何响应** ✘
+**                    [786][833][879][925][972][1018] tx RSP **REJECTED** SET_ABSOLUTE_VOLUME ✘
+**                  一次拖动一条 REJECTED —— 这就是 Windows 滑块完全无效的原因。
+**                  所以修点必须落在第一支内部：截获这两条、其余照旧上报 Java，
+**                  既不破坏 Android 手机作为 source 时的元数据/播放状态等功能，
+**                  也不会出现同一 label 被应答两次（协议违规）。
+**
+**                  ── 为什么收到 SetAbsoluteVolume 后**不**回发 VOLUME_CHANGED ──
+**                  Microsoft《Bluetooth Classic audio accessories》AVRCP–Volume 一节明确要求：
+**                    "When Windows changes volume remotely with the SetAbsoluteVolume command,
+**                     audio accessories shall not complete the Volume Change Notification
+**                     (do not send the EVENT_VOLUME_CHANGED PDU). See AVRCP 1.6.2 §6.13.3."
+**                  即：CHANGED 只用于**本机**音量变化；对端自己下发的变化再回发一次
+**                  会形成回声/循环。同一节的另外两条也已满足：
+**                    "shall adjust audible speaker volume when receiving SetAbsoluteVolume"
+**                    "shall fully mute the speaker when the AVRCP volume is 0"
+**                  （策略层 gain = vol/127，vol==0 → AudioTrack::setVolume(0) → 全静音。）
+**
+**                  ── 刻意**不**碰的字段 ──
+**                  btif_rc_cb.rc_vol_label / rc_volume 属于 **CT** 侧机制：
+**                  handle_rc_features() 会在 bt_rc_callbacks != NULL 的分支里用它们
+**                  向对端 TG 注册音量变化（snoop [516]/[6145] 就是我们发出的
+**                  REGISTER_NOTIFICATION，随后 [6150] 被 Windows REJECTED），
+**                  handle_avk_rc_metamsg_rsp() 还会拿 rc_vol_label 去 release_transaction()。
+**                  TG 侧往这两个字段写值会造成跨角色串扰（可能释放错事务），
+**                  因此 P1d 里的那两行赋值在 P1d2 中删除。TG 侧只需要
+**                  rc_notif[AVRC_EVT_VOLUME_CHANGE-1] 的 bNotify/label —— 那正是
+**                  send_metamsg_rsp() 发 CHANGED 时依赖的簿记，后续本机音量变化（P1e
+**                  线控）会用到。
+**
+** Arguments        pmeta_msg  收到的 vendor command 原始消息（提供 rc_handle / label）
+**                  pavrc_cmd  **已解析**的命令（第一支用 AVRC_ParsCommand，
+**                             第三支用 AVRC_Ctrl_ParsCommand，两者产出的 volume.volume
+**                             语义一致 —— 前者依赖上面 avrc_pars_tg.c 的修正）
+**
+** Returns          TRUE  = 已就地应答，调用者不得再处理
+**                  FALSE = 未消费，调用者按原厂语义继续
+**
+** Thread           btif task（与 send_metamsg_rsp / BTA_AvMetaRsp 同线程）
+**
+***************************************************************************/
+static BOOLEAN u2_sink_rc_take_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg,
+                                           tAVRC_COMMAND *pavrc_cmd)
+{
+    tAVRC_RESPONSE avrc_rsp;
+
+    if ((pmeta_msg == NULL) || (pavrc_cmd == NULL))
+        return FALSE;
+
+    switch (pavrc_cmd->cmd.pdu)
+    {
+    case AVRC_PDU_SET_ABSOLUTE_VOLUME:
+    {
+        /* avrc_pars_vendor_cmd() 已用 AVRC_MAX_VOLUME 掩过；这里再掩一次，
+         * 因为第三支（native-only 场景）走的是 AVRC_Ctrl_ParsCommand()。 */
+        UINT8 vol = (UINT8)(pavrc_cmd->volume.volume & AVRC_MAX_VOLUME);
+
+        BTIF_TRACE_EVENT("%s: SetAbsoluteVolume abs_vol=%d/127 label=%d handle=%d",
+                         __FUNCTION__, (int)vol, pmeta_msg->label, pmeta_msg->rc_handle);
+
+        /* 落增益 + 存状态都在策略层。若此刻 AudioTrack 还没建好
+         * （Windows 常在连接时就下发音量），策略层会存下来，
+         * 由 u2_sink_policy_rc_on_track_created() 在 track 建好后重放。 */
+        u2_sink_policy_rc_set_abs_vol(vol);
+
+        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
+        avrc_rsp.volume.opcode = AVRC_OP_VENDOR;
+        avrc_rsp.volume.pdu    = AVRC_PDU_SET_ABSOLUTE_VOLUME;
+        avrc_rsp.volume.status = AVRC_STS_NO_ERROR;
+        avrc_rsp.volume.volume = vol;
+
+        /* AVRC_CMD_CTRL → send_metamsg_rsp 内部映射成 AVRC_RSP_ACCEPT；
+         * avrc_bld_set_absolute_volume_rsp() 会带上 1 字节音量操作数（AOSP 原样）。 */
+        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_CTRL, &avrc_rsp);
+
+        /* 按 Microsoft 要求：**不**回发 EVENT_VOLUME_CHANGED。 */
+        return TRUE;
+    }
+
+    case AVRC_PDU_REGISTER_NOTIFICATION:
+    {
+        UINT8 event_id = pavrc_cmd->reg_notif.event_id;
+
+        /* 只接管 VOLUME_CHANGED；PLAYBACK_STATUS_CHANGED / TRACK_CHANGED 等
+         * 仍由 Java AvrcpTargetService 处理（返回 FALSE 让调用者继续）。 */
+        if (event_id != AVRC_EVT_VOLUME_CHANGE)
+        {
+            BTIF_TRACE_DEBUG("%s: RegisterNotification event_id=0x%02x 非音量事件 -> 交回原厂路径",
+                             __FUNCTION__, event_id);
+            return FALSE;
+        }
+
+        /* 边界自保：MAX_RC_NOTIFICATIONS == AVRC_EVT_VOLUME_CHANGE(13)，
+         * rc_notif[] 合法下标 0..12，写入用 [event_id-1] → 12，恰好是最后一个。
+         * 越界写会踩坏 btif_rc_cb 的后续成员，所以宁可提前返回。 */
+        if ((event_id < 1) || (event_id > MAX_RC_NOTIFICATIONS))
+        {
+            BTIF_TRACE_WARNING("%s: event_id=0x%02x 越界 -> 不消费", __FUNCTION__, event_id);
+            return FALSE;
+        }
+
+        BTIF_TRACE_EVENT("%s: RegisterNotification(VOLUME_CHANGED) label=%d handle=%d",
+                         __FUNCTION__, pmeta_msg->label, pmeta_msg->rc_handle);
+
+        /* 与原厂 TG 路径一致地登记：send_metamsg_rsp 的 CHANGED 分支
+         * 要靠 rc_notif[].bNotify / label 才能把变更通知发出去。 */
+        btif_rc_cb.rc_notif[event_id - 1].bNotify = TRUE;
+        btif_rc_cb.rc_notif[event_id - 1].label   = pmeta_msg->label;
+
+        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
+        avrc_rsp.reg_notif.opcode   = AVRC_OP_VENDOR;
+        avrc_rsp.reg_notif.pdu      = AVRC_PDU_REGISTER_NOTIFICATION;
+        avrc_rsp.reg_notif.status   = AVRC_STS_NO_ERROR;
+        avrc_rsp.reg_notif.event_id = AVRC_EVT_VOLUME_CHANGE;
+        avrc_rsp.reg_notif.param.volume = u2_sink_policy_rc_get_abs_vol();
+
+        /* AVRC_CMD_NOTIF → send_metamsg_rsp 内部映射成 AVRC_RSP_INTERIM。
+         * avrc_bld_notify_rsp() 对 VOLUME_CHANGE 写 event_id + 1 字节音量（len=2）。
+         * 注册保持挂起：本机音量变化时（P1e 线控）用同一 label 发 CHANGED。 */
+        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_NOTIF, &avrc_rsp);
+        BTIF_TRACE_EVENT("%s: VOLUME_CHANGED registered, interim abs_vol=%d/127",
+                         __FUNCTION__, (int)avrc_rsp.reg_notif.param.volume);
+        return TRUE;
+    }
+
+    default:
+        return FALSE;
+    }
+}
+
+/***************************************************************************
  *  Function       handle_rc_metamsg_cmd
  *
  *  - Argument:    tBTA_AV_VENDOR Structure containing the received
@@ -963,6 +1112,26 @@ void handle_rc_metamsg_cmd (tBTA_AV_META_MSG *pmeta_msg)
     }
     else
     {
+        /* P1d2（U2，本项目）：绝对音量必须在这里截获。
+         *
+         * 真机 snoop 实锤：本机 Java AvrcpTargetService 是起来的（bt_rc_callbacks != NULL），
+         * 所以 SetAbsoluteVolume / RegisterNotification(VOLUME_CHANGED) 永远走这条第一支；
+         * 而下游 btif_rc_upstreams_evt() 没有 SET_ABSOLUTE_VOLUME 的 case，
+         * 会落到 default 分支 send_reject_response(BAD_CMD) —— Windows 每拖一次滑块
+         * 就收到一条 REJECTED，音量纹丝不动。
+         *
+         * 截获后**必须直接 return**：这两条 PDU 已由我们应答，若继续上报 Java，
+         * Java 侧会对同一个 label 再回一次响应（协议违规，Windows 会断开 AVCTP）。
+         * 其余 PDU（GET_ELEMENT_ATTRIBUTES / PLAYBACK_STATUS / 其它事件注册等）
+         * 完全不受影响，照旧交给 Java TG。 */
+        if (u2_sink_policy_rc_enabled() &&
+            u2_sink_rc_take_metamsg_cmd(pmeta_msg, &avrc_command))
+        {
+            BTIF_TRACE_EVENT("%s: pdu=0x%02x consumed by U2 sink AVRCP TG (absolute volume)",
+                             __FUNCTION__, avrc_command.cmd.pdu);
+            return;
+        }
+
         /* if RegisterNotification, add it to our registered queue */
 
         if (avrc_command.cmd.pdu == AVRC_PDU_REGISTER_NOTIFICATION)
@@ -994,34 +1163,26 @@ void handle_rc_metamsg_cmd (tBTA_AV_META_MSG *pmeta_msg)
 
 /***************************************************************************
 **
-** Function         u2_sink_rc_metamsg_cmd        （P1d，本项目自有代码）
+** Function         u2_sink_rc_metamsg_cmd        （P1d/P1d2，本项目自有代码）
 **
-** Description      native-only A2DP SINK 场景下的**最小 AVRCP TG 实现**。
+** Description      native-only A2DP SINK 场景下的**最小 AVRCP TG 入口**
+**                  （btif_rc_handler 派发器的第三支：bt_rc_callbacks 与
+**                   bt_rc_ctrl_callbacks 都是 NULL 时才会走到这里）。
 **
-**                  为什么需要：本机是纯 native 接收器，Java 的 AvrcpTargetService 与
-**                  AvrcpControllerService 都没起，于是 bt_rc_callbacks 与
-**                  bt_rc_ctrl_callbacks **都是 NULL**（真机 logcat 实锤：
-**                  "### ASSERT : btif_rc.c line 466 Callback is NULL ###"）。
-**                  原厂 btif_rc_handler 的 BTA_AV_META_MSG_EVT 派发在这种情况下只打印
-**                  "Neither CTRL, nor TG is up, drop meta commands" 就把命令丢掉，
-**                  连 AVRC_Ctrl_ParsCommand() 都不执行 —— 对端既拿不到 interim
-**                  也拿不到 accept。
+**                  P1d2 起协议处理已抽到共享的 u2_sink_rc_take_metamsg_cmd()，
+**                  第一支（Java AvrcpTargetService 在跑 = 本机实际配置）与第三支
+**                  共用同一套逻辑，不再保留两份容易走样的副本。本函数只剩三件事：
+**                    1. 入口条件过滤（vendor command，非 response）
+**                    2. AVRC_Ctrl_ParsCommand() 解析（CT-only 解析器，
+**                       只认 SET_ABSOLUTE_VOLUME / REGISTER_NOTIFICATION，
+**                       并已用 AVRC_MAX_VOLUME 掩掉保留位）
+**                    3. 未被消费的 PDU -> reject(BAD_CMD)，与原厂 TG 的 default 一致
 **
-**                  实测后果：Android 判定绝对音量不可用 → 回退软件音量 → 听感正常；
-**                  Windows 只认绝对音量 → 音量滑块完全无效（本阶段要修的就是这个）。
-**
-**                  只实现两个 PDU（其余一律 reject，与原厂 TG 的 default 分支一致）：
-**                    AVRC_PDU_REGISTER_NOTIFICATION + AVRC_EVT_VOLUME_CHANGE
-**                        → 记 label、置 rc_notif[].bNotify，回 **INTERIM**（当前音量）
-**                    AVRC_PDU_SET_ABSOLUTE_VOLUME
-**                        → 交给策略层落增益，回 **ACCEPT**
-**
-**                  BTA 层无需改动：因为注册的是 SINK，bta_av_api_register() 已选中
-**                  bta_avk_cfg，其 p_meta_evt_ids = {AVRC_EVT_VOLUME_CHANGE}
-**                  （产物二进制实测 0x0d），所以 GetCapabilities 会如实广告、
-**                  RegisterNotification 也能过 bta_av_chk_notif_evt_id() 校验并被上报到这里。
-**                  GetCapabilities 本身更是根本到不了 btif —— bta_av_proc_meta_cmd()
-**                  在 BTA 层就地应答了。
+**                  ★ 真机取证（P1d2）：本机 Java AvrcpTargetService 是起来的
+**                    （logcat `get_profile_interface avrcp`），所以**这一支是死代码**；
+**                    真正生效的是第一支里的截获。保留它的意义在于：一旦换成
+**                    不含 AvrcpTargetService 的 Bluetooth.apk（或做 native-only 对照
+**                    实验），绝对音量仍然可用。
 **
 ** Returns          void
 **
@@ -1030,7 +1191,6 @@ void handle_rc_metamsg_cmd (tBTA_AV_META_MSG *pmeta_msg)
 static void u2_sink_rc_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg)
 {
     tAVRC_COMMAND  avrc_cmd = {0};
-    tAVRC_RESPONSE avrc_rsp = {0};
     tAVRC_STS      status;
 
     if (pmeta_msg == NULL || pmeta_msg->p_msg == NULL)
@@ -1039,8 +1199,6 @@ static void u2_sink_rc_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg)
         return;
     }
 
-    /* 只处理 vendor command（与 handle_avk_rc_metamsg_cmd 相同的入口条件）。
-     * response 方向的包不属于 TG 职责，忽略。 */
     if ((AVRC_OP_VENDOR != pmeta_msg->p_msg->hdr.opcode) ||
         (pmeta_msg->code > AVRC_CMD_GEN_INQ))
     {
@@ -1049,9 +1207,6 @@ static void u2_sink_rc_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg)
         return;
     }
 
-    /* AVRC_Ctrl_ParsCommand → avrc_ctrl_pars_vendor_cmd()：
-     * 只认 SET_ABSOLUTE_VOLUME 与 REGISTER_NOTIFICATION，其余 pdu 返回 BAD_CMD；
-     * 并且它已把 volume 与 AVRC_MAX_VOLUME(0x7F) 相与，脏高位漏不进来。 */
     status = AVRC_Ctrl_ParsCommand(pmeta_msg->p_msg, &avrc_cmd);
     if (status != AVRC_STS_NO_ERROR)
     {
@@ -1061,82 +1216,12 @@ static void u2_sink_rc_metamsg_cmd(tBTA_AV_META_MSG *pmeta_msg)
         return;
     }
 
-    switch (avrc_cmd.pdu)
-    {
-    case AVRC_PDU_REGISTER_NOTIFICATION:
-    {
-        UINT8 event_id = avrc_cmd.reg_notif.event_id;
-        BTIF_TRACE_EVENT("%s: RegisterNotification event_id=0x%02x(%s) label=%d",
-                         __FUNCTION__, event_id, dump_rc_notification_event_id(event_id),
-                         pmeta_msg->label);
+    if (u2_sink_rc_take_metamsg_cmd(pmeta_msg, &avrc_cmd))
+        return;
 
-        /* 边界检查：MAX_RC_NOTIFICATIONS == AVRC_EVT_VOLUME_CHANGE(13) → rc_notif[]
-         * 只有 13 个元素、合法下标 0..12，而写入用的是 [event_id-1]（VOLUME_CHANGE
-         * 恰好落在最后一个合法下标 12）。BTA 层已按 caps 过滤过（我们只广告
-         * VOLUME_CHANGE），这里再挡一次：越界写会踩坏 btif_rc_cb_t 的后续成员。 */
-        if ((event_id != AVRC_EVT_VOLUME_CHANGE) ||
-            (event_id < 1) || (event_id > MAX_RC_NOTIFICATIONS))
-        {
-            BTIF_TRACE_WARNING("%s: 只支持 VOLUME_CHANGED，event_id=0x%02x -> reject",
-                               __FUNCTION__, event_id);
-            send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label,
-                                 avrc_cmd.pdu, AVRC_STS_BAD_PARAM);
-            return;
-        }
-
-        /* 与原厂 TG 路径（handle_rc_metamsg_cmd）一致地登记：send_metamsg_rsp 的
-         * CHANGED 分支要靠 rc_notif[].bNotify/label 才能把变更通知发出去。 */
-        btif_rc_cb.rc_notif[event_id - 1].bNotify = TRUE;
-        btif_rc_cb.rc_notif[event_id - 1].label = pmeta_msg->label;
-        btif_rc_cb.rc_vol_label = pmeta_msg->label;
-
-        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
-        avrc_rsp.reg_notif.opcode = AVRC_OP_VENDOR;
-        avrc_rsp.reg_notif.pdu = AVRC_PDU_REGISTER_NOTIFICATION;
-        avrc_rsp.reg_notif.status = AVRC_STS_NO_ERROR;
-        avrc_rsp.reg_notif.event_id = AVRC_EVT_VOLUME_CHANGE;
-        avrc_rsp.reg_notif.param.volume = u2_sink_policy_rc_get_abs_vol();
-
-        /* AVRC_CMD_NOTIF → send_metamsg_rsp 内部映射成 AVRC_RSP_INTERIM。
-         * 事务不释放：后续音量变化还要用同一个 label 发 CHANGED（P1e 会用到）。 */
-        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_NOTIF, &avrc_rsp);
-        BTIF_TRACE_EVENT("%s: VOLUME_CHANGED registered, interim abs_vol=%d/127",
-                         __FUNCTION__, (int)avrc_rsp.reg_notif.param.volume);
-        break;
-    }
-
-    case AVRC_PDU_SET_ABSOLUTE_VOLUME:
-    {
-        UINT8 vol = (UINT8)(avrc_cmd.volume.volume & AVRC_MAX_VOLUME);
-        BTIF_TRACE_EVENT("%s: SetAbsoluteVolume abs_vol=%d/127 label=%d",
-                         __FUNCTION__, (int)vol, pmeta_msg->label);
-
-        /* 落增益 + 记状态都在策略层。若此刻 AudioTrack 还没创建
-         * （Windows 常在连接时就下发音量），策略层会存下来，
-         * 由 u2_sink_policy_rc_on_track_created() 在 track 建好后重放。 */
-        u2_sink_policy_rc_set_abs_vol(vol);
-        btif_rc_cb.rc_volume = vol;
-        btif_rc_cb.rc_vol_label = pmeta_msg->label;
-
-        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
-        avrc_rsp.volume.opcode = AVRC_OP_VENDOR;
-        avrc_rsp.volume.pdu = AVRC_PDU_SET_ABSOLUTE_VOLUME;
-        avrc_rsp.volume.status = AVRC_STS_NO_ERROR;
-        avrc_rsp.volume.volume = vol;
-
-        /* AVRC_CMD_CTRL → send_metamsg_rsp 内部映射成 AVRC_RSP_ACCEPT */
-        send_metamsg_rsp(pmeta_msg->rc_handle, pmeta_msg->label, AVRC_CMD_CTRL, &avrc_rsp);
-        break;
-    }
-
-    default:
-        /* 其余 pdu 与原厂 TG 的 default 分支行为一致：reject(BAD_CMD)。 */
-        BTIF_TRACE_DEBUG("%s: pdu=0x%02x 未实现 -> reject(BAD_CMD)",
-                         __FUNCTION__, avrc_cmd.pdu);
-        send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label,
-                             avrc_cmd.pdu, AVRC_STS_BAD_CMD);
-        break;
-    }
+    BTIF_TRACE_DEBUG("%s: pdu=0x%02x 未实现 -> reject(BAD_CMD)", __FUNCTION__, avrc_cmd.pdu);
+    send_reject_response(pmeta_msg->rc_handle, pmeta_msg->label,
+                         avrc_cmd.pdu, AVRC_STS_BAD_CMD);
 }
 #endif /* AVRC_CTLR_INCLUDED */
 
@@ -1268,9 +1353,14 @@ void btif_rc_handler(tBTA_AV_EVT event, tBTA_AV *p_data)
             else if (u2_sink_policy_rc_enabled())
             {
                 /* P1d（本项目）：native-only sink —— 两个 Java 回调都是 NULL。
-                 * 原厂在这里直接丢弃命令，导致 Windows 的绝对音量完全无效。
-                 * 改为交给我们自己的最小 TG 处理（只实现 VOLUME_CHANGED 注册与
-                 * SetAbsoluteVolume，其余 reject）。开关关掉即回到原厂行为。 */
+                 * 原厂在这里直接丢弃命令，改为交给我们自己的最小 TG 处理。
+                 *
+                 * P1d2 更正：真机取证表明本机 Bluetooth.apk 的 AvrcpTargetService
+                 * **是起来的**（logcat `get_profile_interface avrcp`），
+                 * bt_rc_callbacks != NULL → 命令永远走上面的**第一支**，
+                 * 这一支在当前配置下是**死代码**。真正修好 Windows 音量的是
+                 * handle_rc_metamsg_cmd() 里的 u2_sink_rc_take_metamsg_cmd() 截获。
+                 * 保留本支只为 native-only 对照实验/将来换 APK 时不失效。 */
 #if (AVRC_CTLR_INCLUDED == TRUE)
                 BTIF_TRACE_DEBUG("%s no Java RC callbacks -> native sink TG handler "
                                  "(code:%d label:%d len:%d handle:%d)", __FUNCTION__,

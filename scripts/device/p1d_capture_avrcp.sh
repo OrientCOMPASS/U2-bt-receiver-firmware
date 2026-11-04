@@ -67,7 +67,7 @@ echo "--- 7. Q1 证据：AVDTP/AV 连接与 start ---"
 grep -m 80 -e "bta_av" -e "AVDT" -e "avdt" -e "SET_CONFIG" -e "setconfig" -e "bta_av_co" /data/local/tmp/.p1d_all
 
 echo "--- 8. Q2 证据：AVRCP 命令落点（四种情形见脚本头注释）---"
-grep -m 80 -e "Neither CTRL" -e "drop meta commands" -e "handle_avk_rc_metamsg_cmd" -e "btif_rc_upstreams_evt" -e "Abs Volume" -e "Register notification" -e "register_notification" -e "BTA_AV_META_MSG_EVT" -e "AVRCP" -e "avrcp" -e "btif_rc" /data/local/tmp/.p1d_all
+grep -m 120 -e "Neither CTRL" -e "drop meta commands" -e "drop passthrough" -e "handle_avk_rc_metamsg_cmd" -e "handle_rc_metamsg_cmd" -e "btif_rc_upstreams_evt" -e "u2_sink_rc_metamsg_cmd" -e "SetAbsoluteVolume" -e "Abs Volume" -e "Register notification" -e "register_notification" -e "RegisterNotification" -e "VOLUME_CHANGED" -e "interim" -e "BTA_AV_META_MSG_EVT" -e "AVRCP" -e "avrcp" -e "btif_rc" -e "u2_sink_policy" -e "set gain" -e "SetAudioTrackGain" -e "bta_av_rc_opened" -e "rc_features" /data/local/tmp/.p1d_all
 
 echo "--- 9. Java AVRCP 服务是否存在（决定 bt_rc_callbacks 是否为 NULL）---"
 pm list packages -f > /data/local/tmp/.p1d_pkgs 2>&1

@@ -110,6 +110,24 @@ typedef struct
         BT_HDR hdr;
         UINT8 focus_state;
 } tBTIF_MEDIA_SINK_FOCUS_UPDATE;
+
+/* U2（本项目，P1d2）：AVRCP 绝对音量 → AudioTrack 增益请求。
+ *
+ * 为什么必须投递到 media task 执行，而不是就地调用：
+ * btif_media_cb.audio_track 的**创建与销毁都在 media task**
+ * （decoder_reset 里 BtifAvrcpAudioTrackCreate / CLEAR_TRACK 里 Close 并置 NULL），
+ * 而 AVRCP 命令到达在 **btif task**、Java 的 update_audio_track_gain() 更在 **binder 线程**。
+ * r36 原版 btif_a2dp_set_audio_track_gain() 直接跨线程解引用该指针：
+ * 若恰好在 media task 关闭 track 的窗口内进来，就是对已释放对象的
+ * AudioTrack::setVolume() → SIGSEGV tombstone（R5 明确要求 72h 零 tombstone）。
+ * 投递到 media task 后，指针的读写与生命周期管理同线程，竞态消失。
+ * 代价只是几毫秒延迟（音量 UI 拖动感知不到），以及一次小对象分配
+ * —— 与 focus state 的做法一致，且不在音频热路径上（每次滑块变化才一次）。 */
+typedef struct
+{
+        BT_HDR hdr;
+        float  gain;
+} tBTIF_MEDIA_SINK_TRACK_GAIN;
 #endif
 
 /*******************************************************************************

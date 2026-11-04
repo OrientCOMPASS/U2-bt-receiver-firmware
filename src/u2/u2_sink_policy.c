@@ -288,9 +288,15 @@ static void u2_rc_canary_check(const char *who)
  *
  * 为什么用线性而不是 dB：AVRCP 绝对音量在规范里就是"0..127 的线性百分比"，
  * AudioTrack::setVolume 也是线性幅度；对端 UI 的滑块行为与之一致。
- * 若实测听感觉得低端太陡，再考虑加一条 0.5 次幂曲线（属调音，不属本阶段）。 */
+ * vol==0 → gain 0.0 → 全静音，正好满足 Microsoft 的
+ * "shall fully mute the speaker when the AVRCP volume is 0"。
+ * 若实测听感觉得低端太陡，再考虑加一条 0.5 次幂曲线（属调音，不属本阶段）。
+ *
+ * 线程：本函数在 btif task（SetAbsoluteVolume）或 media task（track 重放）上调用，
+ * 但**不直接碰 AudioTrack** —— btif_a2dp_set_audio_track_gain() 会把请求投递到
+ * media task 执行（P1d2，避免与 track 生命周期竞态）。 */
 #if (U2_AVRCP_TG_ABSVOL == 1)
-static void u2_rc_apply_gain_locked(const char *why)
+static void u2_rc_apply_gain(const char *why)
 {
     float gain;
 
@@ -331,7 +337,7 @@ void u2_sink_policy_rc_set_abs_vol(unsigned char vol)
     u2_rc_vol.set_count++;
     LOG_INFO(U2_TAG, "SetAbsoluteVolume: abs_vol=%u/127 (第 %u 次)",
              (unsigned int)vol, u2_rc_vol.set_count);
-    u2_rc_apply_gain_locked("set_abs_vol");
+    u2_rc_apply_gain("set_abs_vol");
 #else
     (void)vol;
 #endif
@@ -345,7 +351,7 @@ void u2_sink_policy_rc_on_track_created(void)
     /* 关键：Windows 常在还没开流（audio_track==NULL）时就下发音量，
      * 那次调用会被 BtifAvrcpSetAudioTrackGain 的 NULL 检查静默吞掉，
      * 所以 track 一建好就把保存的值重放一次。 */
-    u2_rc_apply_gain_locked("track_created");
+    u2_rc_apply_gain("track_created");
 #endif
 }
 

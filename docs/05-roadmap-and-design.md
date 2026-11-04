@@ -261,15 +261,23 @@ r36 的问题分两层，**真正的丢弃点在 btif 派发器**（详见 WORKL
   其 `p_meta_evt_ids = {AVRC_EVT_VOLUME_CHANGE}`、`num_evt_ids = 1`、
   `num_co_ids = 2`、`co_id = 0x1958(AVRC_CO_METADATA)`（已在**产物二进制**里 dump 核对）。
   `RegisterNotification(VOLUME_CHANGED)` 也能通过 `bta_av_chk_notif_evt_id()` 校验并上报 btif。
-- **btif 层把它丢了**：`btif_rc.c:1069-1116` 的 `BTA_AV_META_MSG_EVT` 三分支派发
+- **btif 层把它丢了**：`btif_rc.c` 的 `BTA_AV_META_MSG_EVT` 三分支派发
   ```c
   if (bt_rc_callbacks != NULL)                     → handle_rc_metamsg_cmd()     /* Java AvrcpTarget */
   else if (bt_rc_ctrl_callbacks != NULL)           → handle_avk_rc_metamsg_cmd() /* Sink+CT+TG(absvol) */
   else                                             → "Neither CTRL, nor TG is up, drop meta commands"
   ```
-  我们两个回调**都是 NULL** → 命中第三支，命令**连 `AVRC_Ctrl_ParsCommand()` 都没执行就被丢弃**，
-  一个字节都不回。（早先记录的"`handle_avk_rc_metamsg_cmd` 转发给 NULL 的
-  `bt_rc_ctrl_callbacks`"只描述了第二支，而第二支我们根本进不去。）
+
+  ★**P1d 的判断在这里错了，P1d2 用 17.6MB 真机 snoop 推翻**：本机 Bluetooth.apk 的
+  `AvrcpTargetService` 是**起来了**的（logcat `get_profile_interface avrcp`），
+  所以 `bt_rc_callbacks != NULL` → 命令走**第一支** `handle_rc_metamsg_cmd()`
+  → `btif_rc_upstreams_evt()`；而后者**没有 `AVRC_PDU_SET_ABSOLUTE_VOLUME` 的 case**，
+  落到 `default: send_reject_response(..., AVRC_STS_BAD_CMD)`。
+  于是"命令被静默丢弃"其实是"命令被**明确拒绝**"——snoop 里每拖一次滑块就有一条
+  `tx RSP ctype=REJECTED SET_ABSOLUTE_VOLUME`，而 `RegisterNotification(VOLUME_CHANGED)`
+  则是**一个响应都没有**（Java TG 侧不实现音量事件的 TG 语义）。
+  P1d 新加的第三支在当前配置下是**死代码**（真机零条相关日志）。
+
 
 可直接复用的现成 TG 应答函数（r36 里就有，本来是给 Java 调的）：
 `set_volume_rsp(bd_addr, abs_vol, label)` → ACCEPT；
@@ -281,16 +289,32 @@ r36 的问题分两层，**真正的丢弃点在 btif 派发器**（详见 WORKL
 - Android 拿不到 interim response → 认为绝对音量不可用 → **回退软件音量**（编码前缩放）→ 正常
 - Windows 不做软件缩放、只认绝对音量 → **滑块无效**，仅 0 值时静音
 
-P1d 修复（纯 native，不引入 Java 服务）：
-0. 在派发器第三支（`Neither CTRL, nor TG is up`）里改为先交给
-   `u2_sink_policy_rc_metamsg_cmd()`：`AVRC_Ctrl_ParsCommand()` 解出 pdu 后分派；
-1. `RegisterNotification(VOLUME_CHANGED)` → 立刻回 **interim**（当前增益映射到 0–127），
+P1d2 修复（纯 native，不引入 Java 服务；**修点在第一支内部**）：
+0. 协议处理抽成共享函数 `u2_sink_rc_take_metamsg_cmd(pmeta_msg, pavrc_cmd)`
+   （入参是**已解析**的 `tAVRC_COMMAND`），返回 TRUE 表示"已就地应答、调用者别再管"；
+1. 在**第一支** `handle_rc_metamsg_cmd()` 解析成功后立刻调用它；命中就 `return`，
+   **不再上报 Java**（否则同一 label 会被应答两次 = 协议违规）。
+   其余 PDU（GET_ELEMENT_ATTRIBUTES / 播放状态 / 其它事件注册）完全不受影响；
+2. `RegisterNotification(VOLUME_CHANGED)` → 回 **INTERIM**（当前 0–127 音量），
    记 label 并置 `rc_notif[AVRC_EVT_VOLUME_CHANGE-1].bNotify = TRUE`，**不释放事务**；
-2. `SetAbsoluteVolume(vol)` → `btif_a2dp_set_audio_track_gain((float)vol / 127.0f)` + 回 accept；
-3. 本地音量变化（P1e 的音量键）→ 主动对所有已注册 VOLUME_CHANGED 的对端发 **changed**，
-   保持手机 UI 与实机音量同步（否则用户以为手机能控、实际不能）。
-4. 状态量集中放在 `src/u2/u2_sink_policy.c` 的独立结构里（热路径零新增分配），
-   避免与 vendor 二进制共享的结构体布局发生任何变化。
+3. `SetAbsoluteVolume(vol)` → `u2_sink_policy_rc_set_abs_vol(vol)`（gain = vol/127）+ 回 **ACCEPT**；
+   **刻意不回发 CHANGED**（Microsoft 明确要求，AVRCP 1.6.2 §6.13.3，否则形成回声）；
+4. 顺手修 r36 上游 bug：`stack/avrc/avrc_pars_tg.c` 的 `avrc_pars_vendor_cmd()`
+   解析 `SET_ABSOLUTE_VOLUME` 时**只校验长度、不取音量字节** → TG 侧 volume 恒为 0
+   （表现为"一拖滑块就静音"）。按同文件 `AVRC_Ctrl_ParsCommand()` 的写法补上
+   `BE_STREAM_TO_UINT8` + `AVRC_MAX_VOLUME` 掩码；
+5. **不碰** `rc_vol_label` / `rc_volume`：那是 **CT** 侧机制的字段
+   （`handle_rc_features()` 会用它们向对端 TG 注册音量变化，`handle_avk_rc_metamsg_rsp()`
+   还会拿 `rc_vol_label` 去 `release_transaction()`），TG 侧写它们会造成跨角色串扰。
+   （P1d 写过了，P1d2 删除。）
+6. 状态量集中在 `src/u2/u2_sink_policy.c` 的独立结构里（热路径零新增分配 + canary），
+   不与 vendor 共享结构体布局发生任何变化；
+7. 增益落地改为**投递到 media task**（`BTIF_MEDIA_AUDIO_SINK_SET_TRACK_GAIN`）：
+   原版 `btif_a2dp_set_audio_track_gain()` 在 btif/binder 线程直接解引用
+   `btif_media_cb.audio_track`，而该指针的创建/销毁/置 NULL 全在 media task →
+   track 关闭窗口内就是 use-after-free（R5 要求 72h 零 tombstone）；
+8. 本地音量变化 → 发 **CHANGED** 的路径**暂缺**（本机尚无本机音量 UI：硬件音量键改的是
+   AudioFlinger 的 stream volume，我们观测不到）。簿记已就位，P1e 线控接入时补上。
 
 **(B) 我们作为 CT（Controller）—— 线控控制手机播放（P1e）**
 

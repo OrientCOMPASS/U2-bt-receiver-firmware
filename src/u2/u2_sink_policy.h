@@ -84,15 +84,41 @@ void u2_sink_policy_force_scan_mode(tBTA_DM_DISC *disc_mode, tBTA_DM_CONN *conn_
  *     bt_rc_callbacks != NULL        → handle_rc_metamsg_cmd()      (Java AvrcpTarget)
  *     bt_rc_ctrl_callbacks != NULL   → handle_avk_rc_metamsg_cmd()  (Java AvrcpController)
  *     else                           → "Neither CTRL, nor TG is up, drop meta commands"
- * 我们是 native-only，两个回调**都是 NULL**（真机 logcat 实锤：
- * `### ASSERT : btif_rc.c line 466 Callback is NULL ###`）→ 命中第三支，
- * SetAbsoluteVolume / RegisterNotification(VOLUME_CHANGED) **连解析都没做就被丢弃**。
- * 后果：Android 回退软件音量所以听感正常；Windows 只认绝对音量，滑块完全无效。
+ *
+ * ★ P1d 的判断（"两个回调都是 NULL、命中第三支"）被 **P1d2 的 snoop 取证推翻**：
+ *   本机 Bluetooth.apk 的 AvrcpTargetService 其实起来了（logcat `get_profile_interface avrcp`），
+ *   所以 bt_rc_callbacks != NULL → 命令走**第一支** handle_rc_metamsg_cmd()
+ *   → btif_rc_upstreams_evt()，而后者**没有** AVRC_PDU_SET_ABSOLUTE_VOLUME 的 case，
+ *   落到 `default: send_reject_response(..., AVRC_STS_BAD_CMD)`。
+ *   17.6MB 真机 snoop（Windows 拖动滑块）逐帧实锤：
+ *     [486] rx GET_CAPABILITIES(EVENTS) → [487] tx events=[0x0d]        ✔ 已正确广告
+ *     [496] rx REGISTER_NOTIFICATION(VOLUME_CHANGED) → 无任何响应        ✘ 应回 INTERIM
+ *     [786][833][879][925][972][1018] tx RSP **REJECTED** SET_ABS_VOL    ✘ 每拖一次一条
+ *   （[516]/[6145] 是我们自己以 CT 身份发出的 REGISTER_NOTIFICATION，被 [6150] REJECTED，
+ *     来自 handle_rc_features() 的 register_volumechange()，与音量滑块无关。）
+ *   P1d 加的第三支在当前配置下是**死代码**（真机零条 u2_sink_rc_metamsg_cmd 日志）。
+ *
+ * P1d2 的修法：把两条 PDU 的处理抽成 btif_rc.c 的共享函数
+ * u2_sink_rc_take_metamsg_cmd()，在**第一支**里截获（截获后直接 return，
+ * 不再上报 Java，否则同一 label 会被应答两次），第三支复用同一函数。
+ * 同时修了 r36 上游一个真 bug：avrc_pars_tg.c 的 avrc_pars_vendor_cmd()
+ * 解析 SET_ABSOLUTE_VOLUME 时**只校验长度、没取音量字节**（volume 恒为 0）。
  *
  * 分工：AVRCP 协议编解码留在 btif_rc.c（要用它的 static send_metamsg_rsp /
  * send_reject_response 与 btif_rc_cb），本模块**只持有音量状态**并负责把增益落到
- * AudioTrack。线程：全部在 btif task（与 r36 里 Java 调 HAL update_audio_track_gain
- * 的路径等价，AudioTrack::setVolume 经 proxy 写共享内存，跨线程安全）。
+ * AudioTrack。线程：写入在 btif task（AVRCP 命令）与 media task（track 创建后重放）；
+ * 增益的实际施加由 media task 执行（见 btif_media.h 的 tBTIF_MEDIA_SINK_TRACK_GAIN）。
+ *
+ * 语义边界（Microsoft《Bluetooth Classic audio accessories》AVRCP–Volume）：
+ *   ✔ "shall adjust audible speaker volume when receiving SetAbsoluteVolume" → gain=vol/127
+ *   ✔ "shall fully mute the speaker when the AVRCP volume is 0"              → setVolume(0)
+ *   ✔ "shall properly support receiving the GetCapabilities PDU"             → BTA 层已答 0x0d
+ *   ✘ "shall complete the Volume Change Notification when the volume changes
+ *      locally on the speaker accessory" —— **本机尚无本机音量 UI**（硬件音量键改的是
+ *      AudioFlinger 的 stream volume，我们观测不到），故暂无 CHANGED 上报路径；
+ *      簿记（rc_notif[].bNotify/label）已就位，P1e 线控音量接入时补上即可。
+ *   ✔ "when Windows changes volume remotely with SetAbsoluteVolume, accessories
+ *      shall not complete the Volume Change Notification" → 截获函数刻意不回 CHANGED。
  * ========================================================================= */
 
 /* P1d 总开关（默认开；置 0 则整条绝对音量路径回到原厂行为，便于对照实验）。
@@ -117,12 +143,13 @@ void u2_sink_policy_rc_set_abs_vol(unsigned char vol);
 
 /* AudioTrack 刚创建好时调用：把已保存的音量重放一次。
  *
- * 必须有的原因（源码级）：btif_a2dp_set_audio_track_gain() →
- * BtifAvrcpSetAudioTrackGain(btif_media_cb.audio_track, gain)，而该函数在
- * handle==NULL 时只打一条 DEBUG 就返回。Windows 常在**连接时**（还没开流、
- * audio_track 仍为 NULL）就下发 SetAbsoluteVolume，那次设置会被静默丢掉。
+ * 必须有的原因（源码级）：btif_a2dp_set_audio_track_gain() 把增益**投递到 media task**
+ * （P1d2 起，避免跨线程解引用 audio_track 的 use-after-free），而 media task 的
+ * BtifAvrcpSetAudioTrackGain() 在 handle==NULL 时只打一条 DEBUG 就返回。
+ * Windows 常在**连接时**（还没开流、audio_track 仍为 NULL）就下发 SetAbsoluteVolume，
+ * 那次设置会被静默丢掉。
  * 调用点：btif_media_task.c 的 btif_media_task_aa_handle_decoder_reset()，
- *         BtifAvrcpAudioTrackCreate() 成功之后。 */
+ *         BtifAvrcpAudioTrackCreate() 成功之后（本函数运行在 media task）。 */
 void u2_sink_policy_rc_on_track_created(void);
 
 /* RC 断开时清状态（音量恢复到默认，注册标记清零），避免跨连接串味。 */

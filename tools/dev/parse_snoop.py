@@ -204,11 +204,82 @@ def dec_categories(b: bytes) -> list:
     return out
 
 
+def l2cap_cid_maps(recs):
+    """扫描 L2CAP 信令，建立**按方向分开**的 CID→PSM 映射。
+
+    为什么必须分方向（P1d2 踩到的坑）：L2CAP 数据包里的 CID 字段是"目的 CID"，
+    于是同一个数值在两个方向上属于**不同的命名空间**：
+        tx 帧里的 CID = 对端的本地 CID
+        rx 帧里的 CID = 我方的本地 CID
+    真机 snoop 实例：我方给 AVCTP 分配的本地 CID 是 0x0043（[287] tx ConnRsp
+    dcid=0x0043），而对端给它自己的 SDP 通道也分配了 0x0043（[307] rx ConnRsp
+    dcid=0x0043）。用一张扁平表就会互相覆盖 —— 覆盖后所有 rx 方向的 AVCTP 帧
+    都被当成 SDP 丢掉（现象：只解出 tx 响应、一条 rx 命令都没有）。
+
+    返回 (in_map, out_map, sig_lines)：
+        in_map  我方本地 CID → (PSM, learned_idx)   （用于 rx 帧）
+        out_map 对端本地 CID → (PSM, learned_idx)   （用于 tx 帧）
+        sig_lines [(idx, text)]      ConnReq/ConnRsp 的可读行（供 --l2cap 输出）
+
+    ★必须带 learned_idx：CID 数值会被复用（例如 Windows 先把它自己 SDP 通道
+      的 CID 设为 0x0042，之后又把 AVDTP 通道的 CID 设为 0x0042），预扫描得到的
+      映射若不加"何时生效"的约束，就会把更早的 SDP 帧误判成 AVDTP 信令。
+      调用方应只在 rec["idx"] >= learned_idx 时使用该映射。
+    """
+    in_map, out_map = {}, {}
+    pend_out, pend_in = {}, {}          # ident -> psm（分别对应我方发起 / 对端发起）
+    sig_lines = []
+    for r in recs:
+        d = r["data"]
+        if not d or d[0] != 2 or len(d) < 9:
+            continue
+        pb = (d[2] >> 4) & 0x3
+        if pb != 2:                     # 只看 L2CAP PDU 的第一个分片
+            continue
+        l2len = d[5] | (d[6] << 8)
+        cid = d[7] | (d[8] << 8)
+        if cid != 0x0001:               # 只看信令通道
+            continue
+        pay = d[9:9 + l2len]
+        if len(pay) < 4:
+            continue
+        rx = bool(r["flags"] & 1)
+        dirn = "rx" if rx else "tx"
+        code, ident, plen = pay[0], pay[1], pay[2] | (pay[3] << 8)
+        body = pay[4:4 + plen]
+        if code == 0x02 and len(body) >= 4:                    # Connection Request
+            psm, scid = body[0] | (body[1] << 8), body[2] | (body[3] << 8)
+            if rx:
+                out_map[scid] = (psm, r["idx"])   # 对端 CID，出现在我们的 tx 帧里
+                pend_in[ident] = psm              # 等我们的 ConnRsp 学到我方 CID
+            else:
+                in_map[scid] = (psm, r["idx"])    # 我方 CID，出现在 rx 帧里
+                pend_out[ident] = psm             # 等对端的 ConnRsp 学到对端 CID
+            sig_lines.append((r["idx"], f"L2CAP {dirn} ConnReq id={ident} "
+                                        f"PSM=0x{psm:04X} scid=0x{scid:04X}"))
+        elif code == 0x03 and len(body) >= 4:                  # Connection Response
+            dcid = body[0] | (body[1] << 8)
+            scid = body[2] | (body[3] << 8)
+            result = body[4] if len(body) > 4 else 0
+            if rx and ident in pend_out:                       # 回给"我方发起"的连接
+                if result == 0 and dcid:
+                    out_map[dcid] = (pend_out[ident], r["idx"])
+            elif (not rx) and ident in pend_in:                # 我们回给"对端发起"的连接
+                if result == 0 and dcid:
+                    in_map[dcid] = (pend_in[ident], r["idx"])
+            sig_lines.append((r["idx"], f"L2CAP {dirn} ConnRsp id={ident} dcid=0x{dcid:04X} "
+                                        f"scid=0x{scid:04X} result={result}"
+                                        f"{'  ← 被拒绝!' if result else ''}"))
+    return in_map, out_map, sig_lines
+
+
+
 def avdtp_decode(recs):
     """按 L2CAP 信令建立 CID↔PSM 映射，然后解码 AVDTP signaling（PSM 0x19）"""
-    cid2psm = {}          # 本端 CID -> psm（由对端发来的 conn req/resp 学到）
-    pend = {}             # identifier -> (psm, scid)
-    lines = []
+    in_map, out_map, sig_lines = l2cap_cid_maps(recs)
+    lines = list(sig_lines)
+    rtp_n = 0
+    rtp_bytes = 0
     for r in recs:
         d = r["data"]
         if not d or d[0] != 2 or len(d) < 9:
@@ -219,28 +290,19 @@ def avdtp_decode(recs):
         pay = d[9:9 + l2len]
         rx = bool(r["flags"] & 1)
         dirn = "rx" if rx else "tx"
-        if pb == 2 and cid == 0x0001 and len(pay) >= 4:
-            code, ident, plen = pay[0], pay[1], pay[2] | (pay[3] << 8)
-            body = pay[4:4 + plen]
-            if code == 0x02 and len(body) >= 4:          # Connection Request
-                psm, scid = body[0] | (body[1] << 8), body[2] | (body[3] << 8)
-                pend[ident] = (psm, scid)
-                lines.append((r["idx"], f"L2CAP {dirn} ConnReq id={ident} "
-                                        f"PSM=0x{psm:04X} scid=0x{scid:04X}"))
-            elif code == 0x03 and len(body) >= 4:         # Connection Response
-                dcid, scid, result = body[0] | (body[1] << 8), body[2] | (body[3] << 8), body[4] if len(body) > 4 else 0
-                if ident in pend:
-                    psm, _ = pend[ident]
-                    # 对端 CID=scid ↔ 我方 CID=dcid
-                    cid2psm[scid] = psm
-                    if dcid:
-                        cid2psm[dcid] = psm
-                lines.append((r["idx"], f"L2CAP {dirn} ConnRsp id={ident} dcid=0x{dcid:04X} "
-                                        f"scid=0x{scid:04X} result={result}"
-                                        f"{'  ← 被拒绝!' if result else ''}"))
+        if pb == 2 and cid == 0x0001:
+            continue                     # 信令通道已由 l2cap_cid_maps() 处理
+        # 数据通道：只看 AVDTP signaling（PSM 0x19），**按方向**查表
+        _m = (in_map if rx else out_map).get(cid)
+        psm = _m[0] if (_m and r["idx"] >= _m[1]) else None
+        if pb != 2 or psm != 0x19 or len(pay) < 2:
             continue
-        # 数据通道：只看 AVDTP signaling
-        if pb != 2 or cid not in cid2psm or cid2psm[cid] != 0x19 or len(pay) < 2:
+        # AVDTP 的 media 通道与 signaling 通道**共用 PSM 0x19**（各自一条 L2CAP 通道），
+        # 所以这里会混进 RTP 媒体包（首字节 version=2 → 0x80..0xBF，PT 常为 96=0x60）。
+        # 不当信令解，只计数，否则 P2/P3 看 codec 协商时会被上万行噪声淹没。
+        if (pay[0] >> 6) == 2 and len(pay) >= 12:
+            rtp_n += 1
+            rtp_bytes += len(pay)
             continue
         o0, o1 = pay[0], pay[1]
         label, pkt_t, msg_t, sig = o0 >> 4, (o0 >> 2) & 0x3, o0 & 0x3, o1 & 0x3F
@@ -280,6 +342,8 @@ def avdtp_decode(recs):
                 extra = f" service_category={AVDT_CAT.get(rest[0], hex(rest[0]))}"
         lines.append((r["idx"], f"AVDTP {dirn} {name} {mt} label={label}{extra}"
                                 f"   raw={pay[:24].hex()}"))
+    if rtp_n:
+        lines.append((-1, f"AVDTP media(RTP) 帧 {rtp_n} 个 / {rtp_bytes} 字节（已折叠，不当信令解）"))
     return lines
 
 
@@ -342,6 +406,128 @@ def hci_events_decode(recs, interesting=None):
     return out
 
 
+# ============================================================================
+# AVCTP / AVRCP 解码（P1d 排障主力：绝对音量到底发没发、我们怎么答的）
+#
+# AVCTP 头（stack/avct/avct_defs.h + AVCTP 1.4 规范）：
+#   octet0: label[7:4] | packet_type[3:2] | C/R[1] | IPID[0]     (C/R: 0=command 1=response)
+#   octet1-2: ProfileID(BE)  —— AV/C Remote Control = 0x110E，AVCTP browsing = 0x110C
+# 随后是 AV/C 消息：
+#   octet3: ctype（命令：0 CTRL/1 STATUS/2 SPEC_INQ/3 GEN_INQ；
+#                  应答：8 NOT_IMPL/9 ACCEPT/10 REJ/11 IN_TRANS/12 IMPL_STBL/13 CHANGED/15 INTERIM）
+#   octet4: subunit（0x48 = PANEL）
+#   octet5: opcode（0x00 VENDOR_DEPENDENT / 0x7C PASS_THROUGH / 0x30 UNIT_INFO / 0x31 SUBUNIT_INFO）
+#   VENDOR: octet6-8 CompanyID(BE, 0x001958=BT SIG) octet9 PDU octet10 pkt_type octet11-12 param_len(BE)
+#   PASS_THROUGH: octet6 operation_id, octet7 state_flag(0x80=released), octet8 data_len
+# ============================================================================
+AVCTP_CTYPE = {0: "CONTROL", 1: "STATUS", 2: "SPEC_INQ", 3: "GEN_INQ",
+               8: "NOT_IMPL", 9: "ACCEPTED", 10: "REJECTED", 11: "IN_TRANSITION",
+               12: "IMPL_STABLE", 13: "CHANGED", 15: "INTERIM"}
+AVRC_PDU_NAME = {0x10: "GET_CAPABILITIES", 0x11: "LIST_PLAYER_APP_ATTR",
+                 0x12: "LIST_PLAYER_APP_VALUES", 0x13: "GET_CUR_PLAYER_APP_VALUE",
+                 0x14: "SET_PLAYER_APP_VALUE", 0x15: "GET_PLAYER_APP_ATTR_TEXT",
+                 0x16: "GET_PLAYER_APP_VALUE_TEXT", 0x17: "INFORM_DISPLAY_CHARSET",
+                 0x18: "INFORM_BATTERY_STAT", 0x20: "GET_ELEMENT_ATTR",
+                 0x30: "GET_PLAY_STATUS", 0x31: "REGISTER_NOTIFICATION",
+                 0x40: "REQ_CONTINUATION_RSP", 0x41: "ABORT_CONTINUATION_RSP",
+                 0x50: "SET_ABSOLUTE_VOLUME", 0x60: "SET_ADDRESSED_PLAYER",
+                 0x70: "SET_BROWSED_PLAYER"}
+AVRC_EVT_NAME = {0x01: "PLAYBACK_STATUS_CHANGED", 0x02: "TRACK_CHANGED",
+                 0x05: "PLAYBACK_POS_CHANGED", 0x08: "APP_SETTING_CHANGED",
+                 0x09: "NOW_PLAYING_CHANGED", 0x0a: "AVAILABLE_PLAYERS_CHANGED",
+                 0x0b: "ADDRESSED_PLAYER_CHANGED", 0x0c: "UIDS_CHANGED",
+                 0x0d: "VOLUME_CHANGED"}
+AVRC_CAP_NAME = {0x01: "COMPANY_ID", 0x02: "PLAYER_APP_SETTINGS", 0x03: "EVENTS_SUPPORTED"}
+PASS_THRU_NAME = {0x40: "POWER", 0x41: "VOLUME_UP", 0x42: "VOLUME_DOWN", 0x43: "MUTE",
+                  0x44: "PLAY", 0x45: "STOP", 0x46: "PAUSE", 0x47: "RECORD",
+                  0x48: "REWIND", 0x49: "FAST_FORWARD", 0x4A: "EJECT", 0x4B: "FORWARD",
+                  0x4C: "BACKWARD", 0x7E: "VENDOR_UNIQUE"}
+AVRC_STS_NAME = {0x00: "NO_ERROR", 0x01: "BAD_CMD", 0x02: "BAD_PARAM", 0x03: "NOT_FOUND",
+                 0x04: "INTERNAL_ERR", 0x25: "UID_CHANGED", 0x29: "ATT_DIR_NOT_FOUND",
+                 0x31: "BAD_SCOPE", 0x32: "RANGE_OUT_OF_BOUNDS"}
+
+
+def avrcp_decode(recs, only_vol=False):
+    """返回 AVCTP/AVRCP 信令行；only_vol=True 时只留与音量有关的（绝对音量/音量键/事件注册）"""
+    in_map, out_map, _sig = l2cap_cid_maps(recs)
+    out = []
+    for r in recs:
+        d = r["data"]
+        if not d or d[0] != 2 or len(d) < 9:
+            continue
+        pb = (d[2] >> 4) & 0x3
+        l2len = d[5] | (d[6] << 8)
+        cid = d[7] | (d[8] << 8)
+        pay = d[9:9 + l2len]
+        rx = bool(r["flags"] & 1)
+        dirn = "rx" if rx else "tx"
+        if pb == 2 and cid == 0x0001:
+            continue
+        _m = (in_map if rx else out_map).get(cid)
+        psm = _m[0] if (_m and r["idx"] >= _m[1]) else None
+        if pb != 2 or psm != 0x17 or len(pay) < 6:
+            continue
+            continue
+        o0 = pay[0]
+        label, pkt_t, cr, ipid = o0 >> 4, (o0 >> 2) & 3, (o0 >> 1) & 1, o0 & 1
+        prof = (pay[1] << 8) | pay[2]
+        ctype = pay[3]
+        subunit = pay[4]
+        opcode = pay[5]
+        role = "RSP" if cr else "CMD"
+        head = (f"AVCTP {dirn} {role} label={label} prof=0x{prof:04X} "
+                f"ctype={AVCTP_CTYPE.get(ctype, hex(ctype))}")
+        rest = pay[6:]
+        line = None
+        if opcode == 0x7C and len(rest) >= 2:                  # PASS THROUGH
+            oid, st = rest[0] & 0x7F, rest[1]
+            line = (f"{head} PASS_THROUGH id={PASS_THRU_NAME.get(oid, '0x%02X' % oid)} "
+                    f"{'released' if st & 0x80 else 'pressed'}")
+        elif opcode == 0x00 and len(rest) >= 7:                 # VENDOR DEPENDENT
+            co_id = (rest[0] << 16) | (rest[1] << 8) | rest[2]
+            pdu, ptype = rest[3], rest[4]
+            plen = (rest[5] << 8) | rest[6] if len(rest) >= 7 else 0
+            par = rest[7:7 + plen]
+            pname = AVRC_PDU_NAME.get(pdu, "PDU 0x%02X" % pdu)
+            det = f"{head} VENDOR co=0x{co_id:06X} {pname} pkt_type={ptype} plen={plen}"
+            if pdu == 0x31:                                     # REGISTER_NOTIFICATION
+                if par:
+                    eid = par[0]
+                    det += (f" event={AVRC_EVT_NAME.get(eid, hex(eid))}"
+                            f"{(' operand=' + str(int.from_bytes(par[1:5], 'big'))) if len(par) >= 5 else ''}")
+                    if len(par) >= 5 and eid == 0x0d:
+                        det = det.rsplit(" operand=", 1)[0] + f" volume={par[4]}/127"
+                if ctype == 10 and par and len(par) >= 2:       # REJECTED 带 event+error
+                    det += f" error={AVRC_STS_NAME.get(par[1], hex(par[1]))}"
+            elif pdu == 0x50:                                   # SET_ABSOLUTE_VOLUME
+                if par:
+                    det += f" volume={par[0] & 0x7F}/127"
+            elif pdu == 0x10:                                   # GET_CAPABILITIES
+                if par and ctype in (0, 1, 2, 3):
+                    det += f" cap={AVRC_CAP_NAME.get(par[0], hex(par[0]))}"
+                elif len(par) >= 2:
+                    n = par[1]
+                    if par[0] == 0x03:
+                        det += " events=" + str([hex(x) for x in par[2:2 + n]])
+                    else:
+                        det += f" count={n} ids={[hex(x) for x in par[2:2 + n * 4]]}"
+            if ctype == 10 and len(par) >= 1 and pdu != 0x31:   # REJECTED
+                det += f" error={AVRC_STS_NAME.get(par[0], hex(par[0]))}"
+            line = det
+        elif opcode in (0x30, 0x31):
+            line = f"{head} {'UNIT_INFO' if opcode == 0x30 else 'SUBUNIT_INFO'}"
+        if line is None:
+            continue
+        if only_vol:
+            k = line
+            if not ("ABSOLUTE_VOLUME" in k or "VOLUME_UP" in k or "VOLUME_DOWN" in k
+                    or "MUTE" in k or "VOLUME_CHANGED" in k or "EVENTS_SUPPORTED" in k
+                    or "REJECTED" in k):
+                continue
+        out.append((r["idx"], line))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snoop")
@@ -350,6 +536,8 @@ def main():
     ap.add_argument("--l2cap", action="store_true", help="列出 L2CAP 连接请求的 PSM（已修 off-by-two）")
     ap.add_argument("--avdtp", action="store_true", help="解码 AVDTP 信令：GET_CAPS/SET_CONFIG/START 及其 codec 参数")
     ap.add_argument("--events", action="store_true", help="解码 HCI 事件（连接/断开原因/远端名/COD/加密）")
+    ap.add_argument("--avrcp", action="store_true", help="解码 AVCTP/AVRCP：绝对音量、音量键、事件注册与应答码")
+    ap.add_argument("--vol-only", action="store_true", help="与 --avrcp 同用：只留音量相关的信令")
     ap.add_argument("--all-cmds", action="store_true", help="打印所有 HCI 命令 opcode")
     ap.add_argument("--max", type=int, default=400)
     args = ap.parse_args()
@@ -409,6 +597,14 @@ def main():
         if not evs:
             print("  （无）")
         for idx, line in evs[-args.max:]:
+            print(f"  [{idx:5d}] {line}")
+
+    if args.avrcp:
+        print("\n=== AVCTP / AVRCP 信令 ===")
+        lines = avrcp_decode(body, only_vol=args.vol_only)
+        if not lines:
+            print("  （没有 AVCTP 信令：对端没建 AVCTP 通道，或 CID↔PSM 映射没学到）")
+        for idx, line in lines[-args.max:]:
             print(f"  [{idx:5d}] {line}")
 
     if args.avdtp:
