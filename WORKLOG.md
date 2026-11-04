@@ -1025,3 +1025,75 @@ canary 自检段**全空**；tombstones **0**。
    无害噪声，但可以在 `u2_sink_policy_rc_enabled()` 时抑制 `register_volumechange()`（P1e 一并考虑，
    因为 P1e 才真正需要我们当 CT）。
 4. 路线图不变：**P1e 线控（CT passthrough）→ P1f HFP → P2 AAC → P3 LDAC → P4 multipoint → P5 soak**。
+
+---
+
+## 2026-11-04（三续）P1d2 归档推送 + Release + 手机侧验证现场准备 + P2 侦察
+
+### 1. 推送与 Release（R6 归档完成）
+
+- `17624ae`（P1d2）已推送到远端 `main`：`8babda8..17624ae`。
+- Release：**`p1d2-windows-abs-volume-20261104`**（id `433820043`），
+  <https://github.com/OrientCOMPASS/U2-bt-receiver-firmware/releases/tag/p1d2-windows-abs-volume-20261104>
+  附件 `bluetooth.default.so` 1,772,608 B，**md5 `ced7ee9dd15428c9c3ce4c8f6dba030b`**
+  （与设备 `/system/lib/hw/bluetooth.default.so` 一致，已双向核对）。
+- 用户指令更新：**以后仓库操作（push / Release）不再征求确认，直接做**。
+
+### 2. 本轮新入册的坑（docs/04：G1/G2/G3、H1）
+
+- **G1 ★ Release 创建时 tag 不存在 → `HTTP 500`（空 body）**。`POST /repos/{r}/releases`
+  带一个尚未存在的 `tag_name` 时，本仓库端点稳定返回 500（连最小载荷也 500，
+  `x-ratelimit-remaining` 仍 4995，排除限流）。**解法：先 `git push origin <sha>:refs/tags/<tag>`
+  把 tag 推上去，再 create → 201 一次通过。** 以后打 Release 一律「先推 tag」。
+- **G2 `git push` 偶发 `(Internal Server Error)`**：与 G1 同源的服务端瞬时故障，**重试即通**
+  （本次第 2 次尝试成功）。不要因此改提交内容。
+- **G3 提交作者身份是硬规则**：作者非 `u2-fw <fw@localhost>` → `remote: fatal error in
+  commit_refs_rules` + `remote rejected`。`git commit -c user.name=... user.email=...` 或
+  `--amend --reset-author` 都可以，但**第一次就用对**，省一轮往返。
+- **H1 ★ 工作区快照排除 `.git/` 以及任何名为 `build`/`out`/`dist` 的目录**（第二次踩）。
+  本次 ~8h 空闲后 `.git/`、`bld/out/`、`/tmp/{build,ndk,devlibs,protoc_build}` 全丢。
+  恢复流程（已验证有效）：
+  1. `git clone` 远端仓库到临时目录 → 把 `.git` 移回 `repo/` → `git reset`（保留工作区改动）；
+  2. 被快照删掉的**已跟踪**文件用 `git checkout -- src/build tools/build` 找回；
+  3. 构建产物从设备捞回：`adb pull /data/local/tmp/bt_new.so`（或 `/system/lib/hw/bluetooth.default.so`），
+     md5 核对后再当 Release 附件；
+  4. `ln -sfn <workspace>/devlibs /tmp/devlibs`（`bld/env.json` 写死了这个路径）；
+  5. `bash tools/build/setup_env.sh --all`（apt + NDK r21e + AOSP r36 头文件树 + host protoc 2.6.1）。
+  **结论：工具目录一律用不在排除表里的名字（`bld/`、`tools/dev/`），Release 附件放 `assets/`。**
+
+### 3. 手机侧验证的现场准备（`scripts/device/p1d2_phone_prep.sh`，已跑）
+
+要让「双重衰减」这种问题可判定，必须让证据只包含本次测试：
+
+- 日志阈值 8 个 tag 全部置 `V`（**必须在刺激之前**），`logcat -G 16M` + `logcat -c`；
+- **snoop 轮转**：旧包 `mv` 到 `/data/local/tmp/btsnoop_prev_p1d2.bin`，`kill com.android.bluetooth`
+  让 BT 重建全新 snoop（pid `1554 → 2769`）。新包 header 校验 = `btsnoop\0` + version 1 +
+  **datalink 1002（H4 with pseudo-header）**，空闲 12s 不增长（正常，无连接时无流量）；
+- 旧 snoop 已涨到 **1.36 GB**，取证结论早已归档，故删除 → `/data` 从 45% 降到 **10%（余 3.4 GB）**；
+- 基线：在机 `.so` md5 = `ced7ee9d…` 与 `bt_want.txt` 一致；`bluetooth_on=1`、`STATE_ON`、
+  `/data/tombstones` 为空；`u2_sink_policy` 启动自检 8 行正常，含
+  「adapter ON：设为 GENERAL_DISCOVERABLE + CONNECTABLE（接收器常驻可发现）」；
+- bonded 设备：`10:68:38:BA:30:84 DEVELOPEROS`（Windows）、`50:AF:4D:D7:EE:4C HQC nubia Z40`（手机）。
+
+判定口径（不靠人耳）：手机按键 → snoop 里应出现 `rx CMD SET_ABSOLUTE_VOLUME` + `tx ACCEPTED`
+（**且 `CHANGED=0`**，AVRCP 1.6.2 §6.13.3）；logcat `u2_sink_policy` 出现 `rc gain: abs_vol=NN/127
+→ AudioTrack gain=0.xxx`；`dumpsys media.audio_flinger` 的 `L dB/R dB` 反算出的线性增益应与
+`gain` 相符。**若 Android 走的是软件音量而非绝对音量，snoop 里就不会有 SET_ABSOLUTE_VOLUME** ——
+那本身就是结论（说明需要 CHANGED 上报/或该机型不进绝对音量模式）。
+
+### 4. P2（AAC 48kHz）侦察结论 —— 用户已选定 P2 为下一阶段（P1e/P1f 推迟）
+
+- **r36 vendored `src/` 里 AAC 支持为零**：`grep -rl -e AVDT_CODEC_TYPE_MPEG_2_4_AAC -e a2dp_aac
+  -e fdk src` 无命中，只有 `bta/av/bta_av_aact.c` 文件名带 aac（实为 `aact` = A2DP action，与 AAC 无关）。
+- **android12 蓝本齐全**：`stack/a2dp/a2dp_aac{,_decoder,_encoder}.cc`、
+  `stack/include/a2dp_aac{,_constants,_decoder,_encoder}.h`、`build/secondary/third_party/aac`。
+  `a2dp_aac_constants.h` 已含 48k：`A2DP_AAC_SAMPLING_FREQ_48000 (0x80<<8)`、
+  `A2DP_AAC_OBJECT_TYPE_MPEG4_LC 0x40`、`A2DP_AAC_CHANNEL_MODE_STEREO 0x04`、
+  `A2DP_AAC_VARIABLE_BIT_RATE_*`、23-bit 位率字段、`A2DP_AAC_CODEC_LEN 8`。
+- 因此 P2 = **移植（不是抄文件，按任务书要求重写以适配 r36 的 C 代码风格与结构体）**：
+  1. AVDTP 层：`avdt_defs.h` 加 `AVDT_CODEC_TYPE_MPEG_2_4_AAC`，能力集解析/组装支持 8 字节 AAC codec info；
+  2. SINK **第二个 SEP**（AAC）——一个 SEP 只能带一种 codec，SBC SEP 必须原样保留（R1 不能破）；
+  3. vendor `external/fdk-aac`（源码静态链接，无闭源 blob），按 RFC 3640 AU-header 拆包后喂 `aacDecoder_*`；
+  4. `btif_media_task.c` sink 侧按 codec type 分派解码；**AudioTrack 采样率 = 协商值（48000），绝不重采样**；
+  5. 验收：snoop 看到 AAC SET_CONFIGURATION（48k/stereo）+ 稳定出声 + 无 tombstone。
+- 构建环境已重建完毕（NDK r21e / AOSP r36 头文件树 / host protoc 2.6.1 / devlibs 50 个 .so / env.json 全部 OK）。
